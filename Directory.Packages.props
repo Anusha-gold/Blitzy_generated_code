@@ -1,0 +1,23 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+  <ItemGroup Label="API and data">
+    <PackageVersion Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="[8.0.34]" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="[8.0.34]" />
+    <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="[8.0.11]" />
+  </ItemGroup>
+  <ItemGroup Label="Transitive pins">
+    <!-- Raises the Npgsql provider's EF Core floor of 8.0.11 to 8.0.34 so it matches Microsoft.EntityFrameworkCore.Design. -->
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="[8.0.34]" />
+    <!-- ADO.NET driver beneath the Npgsql provider, held at the newest 8.x patch. -->
+    <PackageVersion Include="Npgsql" Version="[8.0.9]" />
+  </ItemGroup>
+  <ItemGroup Label="Tests">
+    <PackageVersion Include="xunit.v3" Version="[4.0.3]" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="[4.0.1]" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="[18.12.0]" />
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="[8.0.34]" />
+  </ItemGroup>
+</Project>
