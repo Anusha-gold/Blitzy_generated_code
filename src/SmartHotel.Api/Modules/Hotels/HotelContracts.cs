@@ -125,7 +125,8 @@ public sealed record HotelDetailResponse(
 /// <param name="StayTotal">
 /// The price of the whole stay in USD, a JSON number with two decimals: <c>PriceCalculator.Total</c>, which rounds
 /// to two places, applied to <paramref name="NightlyPrice"/> and the stay's nights. It is the same function that
-/// computes a booking's <c>totalPrice</c>, so the figure shown equals the total charged when the room is booked.
+/// computes a booking's <c>totalPrice</c>, so the figure shown equals the total recorded on the booking when the
+/// room is booked.
 /// </param>
 public sealed record RoomTypeAvailabilityResponse(
     int Id,

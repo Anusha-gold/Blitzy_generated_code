@@ -1,3 +1,6 @@
+using System.Buffers;
+using System.Text;
+
 using Microsoft.EntityFrameworkCore;
 
 using SmartHotel.Api.Common.Stays;
@@ -68,11 +71,13 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
 
     /// <summary>
     /// Finds the hotels in a city that can host the party for the stay, each with its lowest qualifying nightly price,
-    /// in one SQL query.
+    /// in at most one SQL query.
     /// </summary>
     /// <remarks>
     /// A hotel qualifies when at least one of its room types hosts at least <paramref name="guests"/> guests and has
-    /// at least one room free for the whole stay. Only those room types contribute to the lowest price.
+    /// at least one room free for the whole stay. Only those room types contribute to the lowest price. A city that
+    /// contains U+0000 or an unpaired surrogate cannot equal any stored city, so it gets the empty list without a
+    /// query.
     /// </remarks>
     /// <param name="normalizedCity">
     /// The requested city, already trimmed and folded with <see cref="string.ToLowerInvariant"/> by the caller. It is
@@ -83,7 +88,7 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// <param name="cancellationToken">A token that cancels the database query.</param>
     /// <returns>
     /// The qualifying hotels ordered by lowest nightly price, then name, then identifier. The list is empty when the
-    /// city is unknown or no hotel qualifies.
+    /// city is unknown or cannot match a stored city, or no hotel qualifies.
     /// </returns>
     public async Task<IReadOnlyList<HotelAvailability>> SearchHotelsAsync(
         string normalizedCity,
@@ -91,34 +96,70 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
         int guests,
         CancellationToken cancellationToken)
     {
+        // PostgreSQL text cannot hold U+0000, and Npgsql cannot encode an unpaired surrogate as UTF-8, so such a city
+        // matches no stored hotel. Sending it would fault the query instead of finding nothing.
+        if (!IsStorableText(normalizedCity))
+        {
+            return [];
+        }
+
         IQueryable<Booking> blocking = db.Bookings.Where(StayRules.ConfirmedOverlap(period));
 
+        // The query starts from the room types of the city's hotels, keeps only the qualifying ones and groups them by
+        // hotel, so the database computes each hotel's minimum once, over qualifying types only. A hotel without a
+        // qualifying type forms no group and is not listed. The rooms are reached through the navigation as a
+        // queryable, so Queryable.Any translates to an EXISTS correlated on the composite key, with the booking
+        // NOT EXISTS inside it.
         // ToLower translates to lower("City"), the expression IX_Hotels_City_Lower indexes. The StringComparison
-        // overload that CA1862 suggests would not translate to SQL. The rows are projected to an anonymous type
-        // first, because filtering and ordering on a record constructor would not translate either.
-        var rows = await db.Hotels
+        // overload that CA1862 suggests would not translate to SQL. The groups are projected to an anonymous type
+        // first, because ordering on a record constructor would not translate.
+        var rows = await db.RoomTypes
             .AsNoTracking()
-            .Where(h => h.City.ToLower() == normalizedCity)
-            .Select(h => new
+            .Where(t => t.Hotel.City.ToLower() == normalizedCity
+                && t.MaxGuests >= guests
+                && t.Rooms.AsQueryable().Any(r => !blocking.Any(b => b.RoomId == r.Id)))
+            .GroupBy(t => new { t.Hotel.Id, t.Hotel.Name, t.Hotel.City, t.Hotel.Address })
+            .Select(g => new
             {
-                h.Id,
-                h.Name,
-                h.City,
-                h.Address,
-                LowestNightlyPrice = h.RoomTypes
-                    .Where(t => t.MaxGuests >= guests && t.Rooms.Any(r => !blocking.Any(b => b.RoomId == r.Id)))
-                    .Min(t => (decimal?)t.NightlyPrice),
+                g.Key.Id,
+                g.Key.Name,
+                g.Key.City,
+                g.Key.Address,
+                LowestNightlyPrice = g.Min(t => t.NightlyPrice),
             })
-            .Where(x => x.LowestNightlyPrice != null)
             .OrderBy(x => x.LowestNightlyPrice)
             .ThenBy(x => x.Name)
             .ThenBy(x => x.Id)
             .ToListAsync(cancellationToken);
 
-        // The query keeps only hotels whose minimum exists, so every materialized price has a value.
         return rows
-            .Select(x => new HotelAvailability(x.Id, x.Name, x.City, x.Address, x.LowestNightlyPrice!.Value))
+            .Select(x => new HotelAvailability(x.Id, x.Name, x.City, x.Address, x.LowestNightlyPrice))
             .ToList();
+    }
+
+    /// <summary>
+    /// Tells whether PostgreSQL text can hold the string, as it must for the string to equal a stored value.
+    /// </summary>
+    /// <param name="value">The string to check.</param>
+    /// <returns>
+    /// <see langword="false"/> when the string contains U+0000, which PostgreSQL text cannot hold, or an unpaired
+    /// surrogate, which has no UTF-8 encoding; otherwise <see langword="true"/>.
+    /// </returns>
+    private static bool IsStorableText(string value)
+    {
+        ReadOnlySpan<char> remaining = value;
+        while (!remaining.IsEmpty)
+        {
+            if (Rune.DecodeFromUtf16(remaining, out Rune rune, out int consumed) != OperationStatus.Done
+                || rune.Value == 0)
+            {
+                return false;
+            }
+
+            remaining = remaining[consumed..];
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -169,8 +210,10 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     {
         IQueryable<Booking> blocking = db.Bookings.Where(StayRules.ConfirmedOverlap(period));
 
-        // Room numbers are ordered as text. Every seeded number has three digits (101 to 410), and digit strings of
-        // equal length sort in numeric order under any collation, so this picks the numerically lowest free room.
+        // Room numbers are ordered as text under the database's default collation. Every seeded number is a
+        // three-digit ASCII label (101 to 410), and labels of that fixed width compare digit by digit, so this picks
+        // the numerically lowest free room. A label of another length or with non-digit characters would follow text
+        // order instead of numeric order: "1000" would sort before "999".
         return await db.Rooms
             .AsNoTracking()
             .Where(r => r.RoomTypeId == roomTypeId && !blocking.Any(b => b.RoomId == r.Id))

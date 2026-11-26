@@ -136,8 +136,8 @@ export interface RoomTypeAvailability {
   availableRooms: number;
   /**
    * The price of the whole stay in USD: the nightly price multiplied by the
-   * nights, computed on the server. It equals the total a booking of this room
-   * type is charged, and the client never computes it.
+   * nights, computed on the server. It equals the total recorded on a booking
+   * of this room type, its `totalPrice`, and the client never computes it.
    */
   stayTotal: number;
 }

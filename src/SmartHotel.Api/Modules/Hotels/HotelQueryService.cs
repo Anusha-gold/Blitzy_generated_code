@@ -17,8 +17,9 @@ namespace SmartHotel.Api.Modules.Hotels;
 /// onto the Hotels contracts, so the Availability module's records never reach the Hotels JSON.
 /// </para>
 /// <para>
-/// The search issues one SQL query. The detail issues two: the hotel with its room types, then the per-type counts.
-/// Neither writes, opens a transaction or tracks entities.
+/// The search issues at most one SQL query, and none when the city cannot match any stored hotel, for example one
+/// containing U+0000. The detail issues two: the hotel with its room types, then the per-type counts. Neither writes,
+/// opens a transaction or tracks entities.
 /// </para>
 /// <para>
 /// Registered scoped, beside the request's <see cref="SmartHotelDbContext"/> and <see cref="AvailabilityQueries"/>.
