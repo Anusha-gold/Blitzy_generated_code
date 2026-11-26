@@ -7,3 +7,7 @@ dist
 test-results
 playwright-report
 blob-report
+
+# Local dotenv files can hold credentials and never enter the image build.
+# **/ matches them at any depth; .env.example is not matched.
+**/.env

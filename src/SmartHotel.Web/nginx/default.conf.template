@@ -1,12 +1,34 @@
 # SmartHotel.Web: nginx server for the Angular SPA.
-# Rendered at container start by the nginx image from
+# Rendered at container start by the nginx image's template mechanism from
 # /etc/nginx/templates/default.conf.template to /etc/nginx/conf.d/default.conf.
-# Only defined environment variables are substituted:
+# The renderer substitutes every defined environment variable this file names,
+# nginx variables included, unless NGINX_ENVSUBST_FILTER limits it. The
+# SmartHotel web image limits it to the two inputs:
 #   API_BASE_URL     becomes "apiBaseUrl" in /config.json
 #   WEB_ENVIRONMENT  becomes "environment" in /config.json
-# An undefined one is served as an empty string (see /config.json below).
-# nginx variables are written without braces and stay untouched.
+# Before rendering, the image clears an input that holds a single quote, a
+# dollar sign or a backslash, or is longer than 1000 characters, because nginx
+# cannot read such a value in this file.
 # Static files only: this server never proxies the API.
+
+# "environment" is Development only for exactly that value. Every other value,
+# an empty or undefined one included, is served as Production, the SPA's strict
+# mode. The key is a case-sensitive regular expression because plain map keys
+# match case-insensitively, and \z keeps a trailing newline from matching.
+map '${WEB_ENVIRONMENT}' $smarthotel_environment {
+  default            Production;
+  '~^Development\z'  Development;
+}
+
+# "apiBaseUrl" is the input only when it needs no escaping in a JSON string: no
+# double quote, backslash or control character. Any other value, an empty or
+# undefined one included, is served as an empty string, which the SPA rejects
+# with its boot-error state.
+map '${API_BASE_URL}' $smarthotel_api_base_url {
+  default                          '';
+  '~^([^"\\\\\x00-\x1F\x7F]+)\z'   $1;
+}
+
 server {
   listen 80;
   server_name _;
@@ -14,20 +36,29 @@ server {
   root /usr/share/nginx/html;
   index index.html;
 
+  # No access log: the image's default format records the request line with
+  # its query string, the referrer, the user agent and the client and
+  # forwarded-for addresses. nginx appends the client address, request line,
+  # host and referrer to every error raised while serving a request, so this
+  # site keeps only emergency-level messages. nginx's own start-up and
+  # configuration errors still reach the main error log on stderr.
+  access_log off;
+  error_log stderr emerg;
+
   # Runtime configuration fetched by the SPA before bootstrap.
   location = /config.json {
-    # envsubst leaves an undefined input as its literal placeholder, which nginx
-    # reads as the same-named nginx variable (names are case-insensitive) and
-    # would refuse to start on. These declarations render such an input as "",
-    # so the SPA shows its boot-error state for a missing API base URL and runs
-    # in strict mode for a missing environment; no default value is supplied.
-    # Keep them lower-case: envsubst matches names case-sensitively, so it never
-    # rewrites them.
+    # The renderer leaves an undefined input as its literal placeholder, which
+    # nginx reads as the same-named nginx variable (names are case-insensitive)
+    # and would refuse to start on. These declarations give such an input the
+    # value "", which the maps above serve as an empty API base URL and as
+    # Production; no default value is supplied. Their lower-case names stay out
+    # of the renderer only because envsubst matches names case-sensitively and
+    # the image limits substitution to the two upper-case inputs.
     set $api_base_url "";
     set $web_environment "";
     default_type application/json;
     add_header Cache-Control "no-store" always;
-    return 200 '{"apiBaseUrl":"${API_BASE_URL}","environment":"${WEB_ENVIRONMENT}"}';
+    return 200 '{"apiBaseUrl":"$smarthotel_api_base_url","environment":"$smarthotel_environment"}';
   }
 
   # SPA fallback so deep links load index.html.
