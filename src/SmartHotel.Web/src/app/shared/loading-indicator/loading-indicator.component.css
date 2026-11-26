@@ -1,0 +1,39 @@
+/* Global request indicator: a slim banner fixed over the top of the page. */
+.loading-indicator {
+  position: fixed;
+  inset-block-start: 0;
+  inset-inline: 0;
+  z-index: 1000;
+  /* It overlays the nav bar while requests run, so it must never take clicks. */
+  pointer-events: none;
+  padding: 0.25rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-align: center;
+  color: var(--sh-color-on-accent);
+  background-color: var(--sh-color-accent);
+}
+
+/* Decorative sweep along the bottom edge; it moves only without a reduced-motion preference. */
+.loading-indicator__bar {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: 0;
+  block-size: 3px;
+  background: linear-gradient(90deg, transparent, var(--sh-color-on-accent), transparent) 0 0 / 40% 100% no-repeat;
+  /* Named here, not in the media query: Angular renames scoped @keyframes
+     references only in top-level rules of the minified component CSS. */
+  animation: loading-indicator-sweep 1s ease-in-out infinite alternate paused;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .loading-indicator__bar {
+    animation-play-state: running;
+  }
+}
+
+@keyframes loading-indicator-sweep {
+  to {
+    background-position: 100% 0;
+  }
+}
