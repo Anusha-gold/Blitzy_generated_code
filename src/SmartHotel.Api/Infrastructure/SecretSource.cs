@@ -8,9 +8,10 @@ namespace SmartHotel.Api.Infrastructure;
 /// Supplies the API's secrets: the database connection string and the JWT signing key.
 /// </summary>
 /// <remarks>
-/// Implementations read secrets from the process environment only, never from <c>appsettings*.json</c>,
-/// command-line arguments or any other configuration provider. Secret values must never be logged,
-/// written to the console, placed in exception messages or returned in a response.
+/// Where the values come from is up to each implementation: the production one, <see cref="EnvironmentSecretSource"/>,
+/// reads the process environment, while a replacement registered in its place, such as one holding test credentials
+/// in memory, supplies its own. Whatever the source, secret values must never be logged, written to the console,
+/// placed in exception messages or returned in a response.
 /// </remarks>
 public interface ISecretSource
 {
@@ -32,9 +33,16 @@ public interface ISecretSource
 /// </summary>
 /// <remarks>
 /// <para>
-/// The database connection string is <c>ConnectionStrings__SmartHotel</c> when that variable is set and not blank.
-/// Otherwise it is assembled from <c>DB_HOST</c>, <c>DB_PORT</c> (default 5432), <c>DB_NAME</c>, <c>DB_USER</c>
-/// and <c>DB_PASSWORD</c>, and it is <see langword="null"/> when <c>DB_HOST</c> is missing or blank.
+/// It reads only process environment variables, never <c>appsettings*.json</c>, command-line arguments or any other
+/// configuration provider.
+/// </para>
+/// <para>
+/// The database connection string is <c>ConnectionStrings__SmartHotel</c>, unchanged, when that variable is set and
+/// not blank; it must parse as an Npgsql connection string, set a non-blank <c>Password</c> and leave <c>Passfile</c>
+/// unset. Otherwise it is assembled from <c>DB_HOST</c>, <c>DB_PORT</c> (default 5432), <c>DB_NAME</c>,
+/// <c>DB_USER</c> and <c>DB_PASSWORD</c>, which must then be set and not blank; it is <see langword="null"/> when
+/// <c>DB_HOST</c> is missing or blank. Either way the database password comes from these variables and nowhere else:
+/// Npgsql falls back to a password file or <c>PGPASSWORD</c> only when a connection string has no password.
 /// The signing key is <c>Jwt__SigningKey</c>, unaltered; its length is validated with the JWT options.
 /// </para>
 /// <para>
@@ -58,8 +66,10 @@ public sealed class EnvironmentSecretSource : ISecretSource
     /// process environment.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// <c>DB_PORT</c> is set but is not an integer between 1 and 65535, and the connection string is being
-    /// assembled from its parts.
+    /// <c>ConnectionStrings__SmartHotel</c> is set but is not a valid Npgsql connection string, sets <c>Passfile</c>,
+    /// or has no non-blank <c>Password</c>; or the connection string is being assembled from its parts and
+    /// <c>DB_PORT</c> is set but is not an integer between 1 and 65535, or <c>DB_PASSWORD</c> is missing or blank.
+    /// The message names the variable or setting only, never a value.
     /// </exception>
     public EnvironmentSecretSource()
     {
@@ -80,6 +90,8 @@ public sealed class EnvironmentSecretSource : ISecretSource
         string? connectionString = Environment.GetEnvironmentVariable(ConnectionStringVariable);
         if (!string.IsNullOrWhiteSpace(connectionString))
         {
+            // Validated, then used whole: the variable's own text, not a rebuilt form, reaches the provider.
+            ValidateConnectionStringOverride(connectionString);
             return connectionString;
         }
 
@@ -109,13 +121,48 @@ public sealed class EnvironmentSecretSource : ISecretSource
             builder.Username = username;
         }
 
-        string? password = ReadNonEmpty(PasswordVariable);
-        if (password is not null)
+        // Npgsql looks for a password in a password file (the Passfile setting, PGPASSFILE or ~/.pgpass) and in
+        // PGPASSWORD only when the connection string carries none, so requiring DB_PASSWORD keeps the credential to
+        // this variable. The value is assigned unaltered, because surrounding spaces can belong to a password.
+        string? password = Environment.GetEnvironmentVariable(PasswordVariable);
+        if (string.IsNullOrWhiteSpace(password))
         {
-            builder.Password = password;
+            // The message names the variable only; the rejected value is never echoed.
+            throw new InvalidOperationException("DB_PASSWORD must be set to a non-blank value when DB_HOST is set.");
         }
 
+        builder.Password = password;
+
         return builder.ConnectionString;
+    }
+
+    private static void ValidateConnectionStringOverride(string connectionString)
+    {
+        NpgsqlConnectionStringBuilder builder;
+        try
+        {
+            builder = new NpgsqlConnectionStringBuilder(connectionString);
+        }
+        catch (ArgumentException)
+        {
+            // Npgsql reports every parse failure as an ArgumentException whose message, or inner exception, can quote
+            // a keyword or value from the string, and so part of a password. Neither is carried forward.
+            throw new InvalidOperationException(
+                "ConnectionStrings__SmartHotel is not a valid Npgsql connection string.");
+        }
+
+        // Npgsql consults a password file, and PGPASSWORD, only when the string carries no password, so a string that
+        // names a password file or has no password could take the credential from outside this variable. The
+        // messages name the setting only.
+        if (!string.IsNullOrEmpty(builder.Passfile))
+        {
+            throw new InvalidOperationException("ConnectionStrings__SmartHotel must not set Passfile.");
+        }
+
+        if (string.IsNullOrWhiteSpace(builder.Password))
+        {
+            throw new InvalidOperationException("ConnectionStrings__SmartHotel must set a non-blank Password.");
+        }
     }
 
     private static int ReadPort()

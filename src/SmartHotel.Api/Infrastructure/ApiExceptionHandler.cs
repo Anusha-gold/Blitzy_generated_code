@@ -1,6 +1,7 @@
 using System.Diagnostics;
 
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using Npgsql;
 
@@ -11,6 +12,7 @@ namespace SmartHotel.Api.Infrastructure;
 /// handler middleware, which writes a generic 500 problem through <see cref="IProblemDetailsService"/>.
 /// </summary>
 /// <remarks>
+/// <para>
 /// The event carries only the trace identifier, the request method, the matched route template (or
 /// "unmatched"), the type names of the exception and of its inner exceptions, their stack frames reduced to
 /// type and method names, two truncation flags and, for the first <see cref="PostgresException"/> among all
@@ -27,13 +29,38 @@ namespace SmartHotel.Api.Infrastructure;
 /// collected, whose frames are not described. Exception messages, <see cref="Exception.Data"/>, the formatted
 /// stack trace, the path, route and query values, headers, the body, claims and connection details are never
 /// logged, because any of them can carry personal data or secrets.
+/// </para>
+/// <para>
+/// Some exceptions never reach this handler or leave the request pipeline without a problem response: the
+/// middleware passes no exception to its handlers once the response has started, it rethrows the original
+/// exception when writing the problem fails, and the server runs the response-starting and
+/// response-completed callbacks itself. Kestrel reports each of these exceptions on its own, and
+/// <see cref="ServerErrorLogBridge"/> translates every such report into the same sanitized event. In
+/// Development the framework's exception page answers an exception that reaches it before the response
+/// starts, whether the middleware rethrew it or it was thrown outside the middleware;
+/// <see cref="DeveloperPageProblemFilter"/> writes the generic problem in its place, so the page never
+/// renders the exception's message, its stack trace or the request headers.
+/// </para>
+/// <para>
+/// Each exception is logged once per request: a report of an exception already logged for the request, or
+/// reachable from one through inner exceptions, writes nothing. The framework's own records of these
+/// exceptions, from the exception handler middleware, the Development exception page and Kestrel's general
+/// category, carry the raw exception and are filtered out by <c>appsettings.json</c>. A rule of the bridge's
+/// own lets it alone receive Kestrel's records, and it forwards neither their exception nor their message, so
+/// this event is the only one written.
+/// </para>
 /// </remarks>
+/// <param name="logger">The logger that receives the sanitized event.</param>
 public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger) : IExceptionHandler
 {
     private const int MaxInspections = 65_536;
     private const int MaxListedExceptions = 256;
     private const int MaxStackFrames = 200;
     private const string UnmatchedRoute = "unmatched";
+    private const string UnknownMethod = "unknown";
+
+    // The Items entry under this key lists the exceptions already logged for the request.
+    private static readonly object ReportedExceptionsKey = new();
 
     /// <summary>
     /// Writes the sanitized Error event for <paramref name="exception"/> and declines to handle it, so the
@@ -51,11 +78,148 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
         ArgumentNullException.ThrowIfNull(httpContext);
         ArgumentNullException.ThrowIfNull(exception);
 
+        // When writing the problem fails, the middleware rethrows this same exception and the server reports it;
+        // the record kept for the request stops that report from logging it a second time.
+        LogUnlessReported(logger, httpContext, exception, fallbackTraceId: null);
+
+        return ValueTask.FromResult(false);
+    }
+
+    // Writes the sanitized event unless this exception, or one it is reachable from, is already logged for the
+    // request. A report without a request is still written, identified by the server's request id.
+    private static void LogUnlessReported(
+        ILogger logger,
+        HttpContext? httpContext,
+        Exception exception,
+        string? fallbackTraceId)
+    {
+        if (httpContext is null)
+        {
+            // The shared resolver decides which identifier is published, and a stand-in context carries the
+            // server's request id as its fallback. Neither the method nor the route is known.
+            var standIn = new DefaultHttpContext();
+            if (fallbackTraceId is not null)
+            {
+                standIn.TraceIdentifier = fallbackTraceId;
+            }
+
+            WriteEvent(
+                logger,
+                ProblemDetailsSetup.ResolveTraceId(standIn),
+                UnknownMethod,
+                UnmatchedRoute,
+                exception);
+            return;
+        }
+
+        var reported = GetReportedExceptions(httpContext);
+        if (IsReported(reported, exception))
+        {
+            return;
+        }
+
+        reported.Add(exception);
+        LogSanitized(logger, httpContext, exception);
+    }
+
+    private static List<Exception> GetReportedExceptions(HttpContext httpContext)
+    {
+        if (httpContext.Items.TryGetValue(ReportedExceptionsKey, out var item) && item is List<Exception> reported)
+        {
+            return reported;
+        }
+
+        var created = new List<Exception>();
+        httpContext.Items[ReportedExceptionsKey] = created;
+        return created;
+    }
+
+    // An exception is covered when it is a logged one or reachable from one through InnerException and
+    // AggregateException items, because the logged event already names its type and frames. The visited set
+    // stops cycles and repeats. The search spends the same budget of MaxInspections references as the chain
+    // collection, so its work is bounded however wide or deep the logged graphs are; an exception the budget
+    // leaves unexamined counts as not yet logged and gets its own event.
+    private static bool IsReported(List<Exception> reported, Exception exception)
+    {
+        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        var pending = new Stack<Exception>();
+        var remaining = MaxInspections;
+
+        foreach (var logged in reported)
+        {
+            if (!Inspect(logged))
+            {
+                break;
+            }
+        }
+
+        while (pending.TryPop(out var current))
+        {
+            if (ReferenceEquals(current, exception))
+            {
+                return true;
+            }
+
+            if (current.InnerException is { } inner)
+            {
+                Inspect(inner);
+            }
+
+            if (current is AggregateException aggregate)
+            {
+                foreach (var item in aggregate.InnerExceptions)
+                {
+                    if (!Inspect(item))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        return false;
+
+        bool Inspect(Exception candidate)
+        {
+            if (remaining == 0)
+            {
+                return false;
+            }
+
+            remaining--;
+            if (visited.Add(candidate))
+            {
+                pending.Push(candidate);
+            }
+
+            return true;
+        }
+    }
+
+    private static void LogSanitized(ILogger logger, HttpContext httpContext, Exception exception)
+    {
         // The middleware clears the request's endpoint and route values before it calls handlers and keeps the
-        // matched endpoint on the feature. The raw route template holds no request values.
-        var endpoint = httpContext.Features.Get<IExceptionHandlerFeature>()?.Endpoint as RouteEndpoint;
+        // matched endpoint on the feature. An exception that left the pipeline without reaching the handlers
+        // still has its endpoint on the request. The raw route template holds no request values.
+        var endpoint = (httpContext.Features.Get<IExceptionHandlerFeature>()?.Endpoint ?? httpContext.GetEndpoint())
+            as RouteEndpoint;
         var routeTemplate = endpoint?.RoutePattern.RawText ?? UnmatchedRoute;
 
+        WriteEvent(
+            logger,
+            ProblemDetailsSetup.ResolveTraceId(httpContext),
+            httpContext.Request.Method,
+            routeTemplate,
+            exception);
+    }
+
+    private static void WriteEvent(
+        ILogger logger,
+        string traceId,
+        string method,
+        string routeTemplate,
+        Exception exception)
+    {
         var (chain, typesTruncated) = CollectExceptionChain(exception);
         var exceptionTypes = DescribeExceptionTypes(chain);
         var postgresException = chain.OfType<PostgresException>().FirstOrDefault();
@@ -66,8 +230,8 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
         // PostgresException: its message, detail, hint and query text can contain key values.
         LogUnhandledException(
             logger,
-            ProblemDetailsSetup.ResolveTraceId(httpContext),
-            httpContext.Request.Method,
+            traceId,
+            method,
             routeTemplate,
             exceptionTypes,
             typesTruncated,
@@ -75,8 +239,6 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
             postgresException?.ConstraintName,
             stackFrames,
             framesTruncated);
-
-        return ValueTask.FromResult(false);
     }
 
     // Breadth-first over InnerException and every AggregateException item. Each reference examined spends one
@@ -218,4 +380,199 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
         string? constraintName,
         string[] stackFrames,
         bool stackFramesTruncated);
+
+    /// <summary>
+    /// Answers, in Development, an exception that reaches the framework's developer exception page with the
+    /// generic problem instead of the page, which would publish the exception's message, its stack trace and
+    /// the request headers.
+    /// </summary>
+    /// <remarks>
+    /// The page receives an exception the exception handler middleware rethrows because handling it failed
+    /// before the response started, and one thrown outside that middleware, such as by routing. By then the
+    /// page has cleared the response and set its status, so the problem written here carries only the shared
+    /// defaults. The rest of the filter chain is never invoked, because it ends in the page itself.
+    /// </remarks>
+    /// <param name="logger">The logger that receives the sanitized event.</param>
+    /// <param name="problemDetailsService">The service that writes the generic problem.</param>
+    internal sealed class DeveloperPageProblemFilter(
+        ILogger<ApiExceptionHandler> logger,
+        IProblemDetailsService problemDetailsService) : IDeveloperPageExceptionFilter
+    {
+        /// <summary>
+        /// Writes the sanitized event for the exception unless the request has already logged it, then writes
+        /// the generic problem. A failure to write propagates: the page then rethrows the original exception to
+        /// the server, whose report of it writes nothing more, because the exception is already logged.
+        /// </summary>
+        /// <param name="errorContext">The request and the exception the page received.</param>
+        /// <param name="next">The rest of the filter chain, which is never invoked.</param>
+        /// <returns>A task that completes once the problem has been written.</returns>
+        public Task HandleExceptionAsync(ErrorContext errorContext, Func<ErrorContext, Task> next)
+        {
+            ArgumentNullException.ThrowIfNull(errorContext);
+
+            LogUnlessReported(logger, errorContext.HttpContext, errorContext.Exception, fallbackTraceId: null);
+
+            return problemDetailsService
+                .WriteAsync(new ProblemDetailsContext { HttpContext = errorContext.HttpContext })
+                .AsTask();
+        }
+    }
+
+    /// <summary>
+    /// A log provider that turns each unhandled exception Kestrel reports into the sanitized event, so an
+    /// exception that never reaches <see cref="TryHandleAsync"/>, or leaves the pipeline after it, is still
+    /// diagnosed.
+    /// </summary>
+    /// <remarks>
+    /// Kestrel logs an exception that escapes the request pipeline, a failed response-starting or
+    /// response-completed callback and a response that breaks its declared length under its general category,
+    /// one record per exception, while the request is still in progress. This provider reads only those
+    /// records and forwards neither their exception nor their formatted message. It ignores every other
+    /// category, the handler's own included, so the event it writes never comes back to it.
+    /// </remarks>
+    /// <param name="services">
+    /// The root service provider. The handler's logger is resolved from it on first use, because the logger
+    /// factory that creates that logger also constructs this provider.
+    /// </param>
+    /// <param name="httpContextAccessor">The accessor that yields the request a record belongs to.</param>
+    internal sealed class ServerErrorLogBridge(IServiceProvider services, IHttpContextAccessor httpContextAccessor)
+        : ILoggerProvider
+    {
+        /// <summary>
+        /// The category of Kestrel's general records, under which it reports application errors.
+        /// </summary>
+        internal const string KestrelCategory = "Microsoft.AspNetCore.Server.Kestrel";
+
+        private const int ApplicationErrorEventId = 13;
+        private const string ApplicationErrorEventName = "ApplicationError";
+        private const string TraceIdentifierKey = "TraceIdentifier";
+
+        private ILogger? _logger;
+        private volatile bool _disposed;
+
+        /// <summary>
+        /// Returns the translating logger for Kestrel's general category and a logger that is never enabled for
+        /// any other category.
+        /// </summary>
+        /// <param name="categoryName">The category the logger factory asks for.</param>
+        /// <returns>The logger for <paramref name="categoryName"/>.</returns>
+        public ILogger CreateLogger(string categoryName)
+        {
+            return string.Equals(categoryName, KestrelCategory, StringComparison.Ordinal)
+                ? new ApplicationErrorTranslator(this)
+                : NullLogger.Instance;
+        }
+
+        /// <summary>
+        /// Stops translating, because the services the event is written to are being disposed.
+        /// </summary>
+        public void Dispose()
+        {
+            _disposed = true;
+        }
+
+        private void Translate<TState>(TState state, Exception exception)
+        {
+            var logger = ResolveLogger();
+            if (logger is null)
+            {
+                return;
+            }
+
+            LogUnlessReported(logger, httpContextAccessor.HttpContext, exception, ReadTraceIdentifier(state));
+        }
+
+        // Resolving the logger in the constructor would make the logger factory depend on itself. Once the host
+        // has disposed its services, there is nothing left to write the event to.
+        private ILogger? ResolveLogger()
+        {
+            if (_disposed)
+            {
+                return null;
+            }
+
+            try
+            {
+                return _logger ??= services.GetRequiredService<ILogger<ApiExceptionHandler>>();
+            }
+            catch (ObjectDisposedException)
+            {
+                return null;
+            }
+        }
+
+        // The record's state lists its template values, and the server's request id is one of them.
+        private static string? ReadTraceIdentifier<TState>(TState state)
+        {
+            if (state is IReadOnlyList<KeyValuePair<string, object?>> values)
+            {
+                foreach (var (key, value) in values)
+                {
+                    if (string.Equals(key, TraceIdentifierKey, StringComparison.Ordinal))
+                    {
+                        return value as string;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The logger behind Kestrel's general category. It acts on application errors only.
+        /// </summary>
+        /// <param name="bridge">The provider that translates the records.</param>
+        private sealed class ApplicationErrorTranslator(ServerErrorLogBridge bridge) : ILogger
+        {
+            /// <summary>
+            /// Opens no scope: scope values never reach the sanitized event.
+            /// </summary>
+            /// <typeparam name="TState">The type of the scope state.</typeparam>
+            /// <param name="state">The scope state, which is not read.</param>
+            /// <returns>Always <see langword="null"/>.</returns>
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull
+            {
+                return null;
+            }
+
+            /// <summary>
+            /// Reports whether <paramref name="logLevel"/> is the level of Kestrel's application errors.
+            /// </summary>
+            /// <param name="logLevel">The level of the record.</param>
+            /// <returns><see langword="true"/> for <see cref="LogLevel.Error"/> only.</returns>
+            public bool IsEnabled(LogLevel logLevel)
+            {
+                return logLevel == LogLevel.Error;
+            }
+
+            /// <summary>
+            /// Writes the sanitized event for an application error that carries its exception, and ignores every
+            /// other record. Neither the exception nor the formatted message is forwarded.
+            /// </summary>
+            /// <typeparam name="TState">The type of the record's state.</typeparam>
+            /// <param name="logLevel">The level of the record.</param>
+            /// <param name="eventId">The record's event, which identifies an application error.</param>
+            /// <param name="state">The record's template values, from which only the request id is read.</param>
+            /// <param name="exception">The exception the server reports.</param>
+            /// <param name="formatter">The message formatter, which is never invoked.</param>
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                if (exception is null
+                    || !IsEnabled(logLevel)
+                    || eventId.Id != ApplicationErrorEventId
+                    || !string.Equals(eventId.Name, ApplicationErrorEventName, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                bridge.Translate(state, exception);
+            }
+        }
+    }
 }

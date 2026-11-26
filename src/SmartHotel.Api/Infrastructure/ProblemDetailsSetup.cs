@@ -2,7 +2,9 @@ using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace SmartHotel.Api.Infrastructure;
 
@@ -20,9 +22,23 @@ public static class ProblemDetailsSetup
     private const string ErrorsKey = "errors";
 
     /// <summary>
-    /// Adds ProblemDetails support with <see cref="ApplyDefaults"/> as its customization step and registers
-    /// <see cref="ApiProblemDetailsWriter"/> ahead of every framework writer.
+    /// Adds ProblemDetails support with <see cref="ApplyDefaults"/> as its customization step, registers
+    /// <see cref="ApiProblemDetailsWriter"/> ahead of every framework writer, wires the sanitized diagnostics
+    /// for unhandled exceptions that the exception handler cannot answer, and keeps the Development exception
+    /// page from rendering exception data.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The diagnostics wiring adds the HTTP context accessor and
+    /// <see cref="ApiExceptionHandler.ServerErrorLogBridge"/> as a log provider, with a filter rule of its own
+    /// that lets it receive the Error records of Kestrel's general category, which <c>appsettings.json</c>
+    /// keeps away from every other provider.
+    /// </para>
+    /// <para>
+    /// <see cref="ApiExceptionHandler.DeveloperPageProblemFilter"/> answers every exception that reaches the
+    /// Development exception page with the generic problem in place of the page.
+    /// </para>
+    /// </remarks>
     /// <param name="services">The API host's service collection.</param>
     /// <returns>The same service collection, for chaining.</returns>
     public static IServiceCollection AddApiProblemDetails(this IServiceCollection services)
@@ -37,6 +53,24 @@ public static class ProblemDetailsSetup
         // MVC's ProblemDetails factory invokes this routine on every problem it builds, and
         // ApiProblemDetailsWriter invokes it explicitly, so both error paths share it.
         services.AddProblemDetails(options => options.CustomizeProblemDetails = ApplyDefaults);
+
+        // Kestrel reports exceptions that escape the pipeline or its response callbacks only to its general log
+        // category, whose records carry the raw exception. The bridge alone receives them, through a rule for
+        // its own provider type, and finds the request they belong to through the accessor.
+        services.AddHttpContextAccessor();
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<ILoggerProvider, ApiExceptionHandler.ServerErrorLogBridge>());
+        services.Configure<LoggerFilterOptions>(options =>
+            options.AddFilter<ApiExceptionHandler.ServerErrorLogBridge>(
+                ApiExceptionHandler.ServerErrorLogBridge.KestrelCategory,
+                LogLevel.Error));
+
+        // In Development the framework's exception page answers what the exception handler could not, and it
+        // would publish the exception's message, stack trace and the request headers. The filter writes the
+        // generic problem in its place.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<
+            IDeveloperPageExceptionFilter,
+            ApiExceptionHandler.DeveloperPageProblemFilter>());
 
         return services;
     }
