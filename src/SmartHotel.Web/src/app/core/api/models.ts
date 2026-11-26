@@ -69,21 +69,6 @@ export interface LoginResponse {
   expiresAt: string;
 }
 
-/** Query of `GET /api/hotels`. */
-export interface HotelSearchQuery {
-  /** The city to search; required, not blank, at most 100 characters. */
-  city: string;
-  /** The first night of the stay, `yyyy-MM-dd`, not earlier than today (UTC). */
-  checkIn: string;
-  /**
-   * The departure day, `yyyy-MM-dd`, 1 to 30 nights after `checkIn`. It is the
-   * exclusive end of the stay and is not occupied.
-   */
-  checkOut: string;
-  /** The party size, an integer of at least 1. */
-  guests: number;
-}
-
 /** Query of `GET /api/hotels/{id}`: the stay the room types are priced for. */
 export interface StayQuery {
   /** The first night of the stay, `yyyy-MM-dd`, not earlier than today (UTC). */
@@ -95,6 +80,15 @@ export interface StayQuery {
   checkOut: string;
   /** The party size, an integer of at least 1. */
   guests: number;
+}
+
+/**
+ * Query of `GET /api/hotels`: the stay criteria shared with
+ * `GET /api/hotels/{id}`, plus the city to search.
+ */
+export interface HotelSearchQuery extends StayQuery {
+  /** The city to search; required, not blank, at most 100 characters. */
+  city: string;
 }
 
 /**

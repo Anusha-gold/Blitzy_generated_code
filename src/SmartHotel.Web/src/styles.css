@@ -6,6 +6,7 @@
   --sh-color-bg: #ffffff;
   --sh-color-accent: #0b57d0;
   --sh-color-accent-strong: #0a4aa8;
+  --sh-color-accent-pressed: #083b86;
   --sh-color-on-accent: #ffffff;
   --sh-color-control-border: #616e7c;
   --sh-color-rule: #d5dbe1;
@@ -106,6 +107,17 @@ button {
     border-color: var(--sh-color-accent-strong);
     background-color: var(--sh-color-accent-strong);
   }
+}
+
+/* After hover so a press wins. */
+a:active {
+  color: var(--sh-color-accent-pressed);
+  text-decoration-thickness: 2px;
+}
+
+button:not(:disabled):active {
+  border-color: var(--sh-color-accent-pressed);
+  background-color: var(--sh-color-accent-pressed);
 }
 
 /* No pointer-events: none here (disabled already blocks activation), so the
