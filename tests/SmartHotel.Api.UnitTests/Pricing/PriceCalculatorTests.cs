@@ -26,7 +26,9 @@ public sealed class PriceCalculatorTests
         { 0.0025m, 2, 0.01m },
     };
 
-    // A collection expression, unlike the multi-value rows above, because IDE0028 flags new() { ... } here.
+    /// <summary>
+    /// Prices outside the 0 to 99,999.99 bound.
+    /// </summary>
     public static TheoryData<decimal> OutOfRangePrices =>
     [
         -0.01m,
@@ -64,6 +66,16 @@ public sealed class PriceCalculatorTests
     {
         var ex = Assert.Throws<ArgumentOutOfRangeException>(() => PriceCalculator.Total(nightlyPrice, 2));
         Assert.Equal("nightlyPrice", ex.ParamName);
+    }
+
+    [Fact]
+    public void Total_SignedZeroPrice_ReturnsZero()
+    {
+        // Built at run time: the literal -0m folds to positive zero, and a theory row could lose the sign bit.
+        decimal signedZero = decimal.Negate(0m);
+        Assert.True(decimal.IsNegative(signedZero));
+
+        Assert.Equal(0m, PriceCalculator.Total(signedZero, 2));
     }
 
     [Fact]

@@ -46,13 +46,13 @@ public static class PriceCalculator
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="nights"/> is less than 1 or greater than <see cref="StayRules.MaxNights"/>; or
-    /// <paramref name="nightlyPrice"/> is negative or greater than <see cref="MaxNightlyPrice"/>.
+    /// <paramref name="nightlyPrice"/> is less than 0 or greater than <see cref="MaxNightlyPrice"/>.
     /// </exception>
     public static decimal Total(decimal nightlyPrice, int nights)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(nights, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(nights, StayRules.MaxNights);
-        ArgumentOutOfRangeException.ThrowIfNegative(nightlyPrice);
+        ArgumentOutOfRangeException.ThrowIfLessThan(nightlyPrice, 0m);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(nightlyPrice, MaxNightlyPrice);
 
         return Math.Round(nightlyPrice * nights, 2, MidpointRounding.AwayFromZero);
