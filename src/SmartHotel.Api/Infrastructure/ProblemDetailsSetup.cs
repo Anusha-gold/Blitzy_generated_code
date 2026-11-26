@@ -1,4 +1,6 @@
+using System.Collections;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 
 using Microsoft.AspNetCore.WebUtilities;
 
@@ -41,9 +43,13 @@ public static class ProblemDetailsSetup
 
     /// <summary>
     /// Completes a problem with the API's defaults: its status, an RFC 9110 <c>type</c>, the reason phrase as
-    /// <c>title</c>, a fixed <c>detail</c> sentence, the <c>traceId</c> and, on a 400 that carries no validation
-    /// dictionary, an empty <c>errors</c> object. A <c>type</c>, <c>title</c> or <c>detail</c> the problem
-    /// already holds is kept.
+    /// <c>title</c>, a fixed <c>detail</c> sentence, the <c>traceId</c> and, on a 400, exactly one <c>errors</c>
+    /// object: a field-message dictionary, which maps string keys to collections of message strings. A
+    /// <c>type</c>, <c>title</c> or <c>detail</c> the problem already holds is kept. A plain 400 keeps an
+    /// <c>errors</c> extension of that shape and has any other value replaced by an empty dictionary. A validation
+    /// problem's <c>Errors</c> member is its <c>errors</c> object: when null, it takes the messages of a
+    /// field-message <c>errors</c> extension or else becomes empty, and no <c>errors</c> extension is written
+    /// beside it.
     /// </summary>
     /// <param name="context">The problem being produced and the request it answers.</param>
     public static void ApplyDefaults(ProblemDetailsContext context)
@@ -67,8 +73,9 @@ public static class ProblemDetailsSetup
             problem.Title = string.IsNullOrEmpty(reasonPhrase) ? FallbackTitle : reasonPhrase;
         }
 
-        // The detail depends on the status alone. context.Exception and context.AdditionalMetadata are never
-        // read, so no exception or request data can reach a response body.
+        // The default detail is a fixed sentence chosen by the status alone. context.Exception and
+        // context.AdditionalMetadata are never read, so no exception or request data enters a default. A detail
+        // the caller or MVC already set is kept as it is.
         if (string.IsNullOrEmpty(problem.Detail))
         {
             problem.Detail = DetailFor(status);
@@ -76,19 +83,33 @@ public static class ProblemDetailsSetup
 
         problem.Extensions[TraceIdKey] = ResolveTraceId(httpContext);
 
-        // Every 400 carries errors. MVC's ValidationProblemDetails derives from HttpValidationProblemDetails
-        // and already has them.
-        if (status == StatusCodes.Status400BadRequest
-            && problem is not HttpValidationProblemDetails
-            && !problem.Extensions.ContainsKey(ErrorsKey))
+        // Every 400 carries exactly one errors object, a field-message dictionary: string keys mapped to
+        // collections of message strings. A plain 400 keeps an errors extension of that shape as it is and
+        // replaces any other value with an empty dictionary. On a validation problem, MVC's
+        // ValidationProblemDetails included, the typed Errors member is that object: a null one takes the messages
+        // of a field-message errors extension or else becomes empty. The extension is then removed, because beside
+        // the typed member it would serialize as a second errors member.
+        if (status == StatusCodes.Status400BadRequest)
         {
-            problem.Extensions[ErrorsKey] = new Dictionary<string, string[]>();
+            if (problem is HttpValidationProblemDetails validation)
+            {
+                validation.Errors ??= problem.Extensions.TryGetValue(ErrorsKey, out object? extension)
+                    && TryReadFieldMessages(extension, out Dictionary<string, string[]>? messages)
+                    ? messages
+                    : new Dictionary<string, string[]>(StringComparer.Ordinal);
+                problem.Extensions.Remove(ErrorsKey);
+            }
+            else if (!problem.Extensions.TryGetValue(ErrorsKey, out object? errors)
+                || !TryReadFieldMessages(errors, out _))
+            {
+                problem.Extensions[ErrorsKey] = new Dictionary<string, string[]>();
+            }
         }
     }
 
     /// <summary>
-    /// Returns the identifier that correlates a response with its log events: the current activity's id when
-    /// one exists, otherwise the request's trace identifier.
+    /// Returns the identifier that correlates a response with its log events: the current activity's id when that
+    /// activity uses the W3C format, otherwise the request's server-generated trace identifier.
     /// </summary>
     /// <param name="httpContext">The request being answered.</param>
     /// <returns>The value written as <c>traceId</c>.</returns>
@@ -96,7 +117,60 @@ public static class ProblemDetailsSetup
     {
         ArgumentNullException.ThrowIfNull(httpContext);
 
-        return Activity.Current?.Id ?? httpContext.TraceIdentifier;
+        // A W3C id is built only from validated hexadecimal trace and span ids. A hierarchical id embeds the text
+        // of an incoming Request-Id or unparseable traceparent header, which must never reach a response or a log.
+        return Activity.Current is { IdFormat: ActivityIdFormat.W3C, Id: { } activityId }
+            ? activityId
+            : httpContext.TraceIdentifier;
+    }
+
+    // A field-message dictionary is what System.Text.Json writes as an object of message-string arrays: string
+    // keys, each mapped to a non-null collection of strings. Its entries are copied under ordinal keys. A string
+    // is a character sequence and a list of key-value pairs is written as an array, so neither qualifies.
+    private static bool TryReadFieldMessages(
+        object? value,
+        [NotNullWhen(true)] out Dictionary<string, string[]>? messages)
+    {
+        messages = null;
+        Dictionary<string, string[]> copy = new(StringComparer.Ordinal);
+        IEnumerable<KeyValuePair<string, string[]>>? typedEntries = value switch
+        {
+            IDictionary<string, string[]> dictionary => dictionary,
+            IReadOnlyDictionary<string, string[]> readOnlyDictionary => readOnlyDictionary,
+            _ => null,
+        };
+
+        if (typedEntries is not null)
+        {
+            foreach (KeyValuePair<string, string[]> entry in typedEntries)
+            {
+                if (entry.Value is null)
+                {
+                    return false;
+                }
+
+                copy[entry.Key] = entry.Value;
+            }
+        }
+        else if (value is IDictionary untypedEntries)
+        {
+            foreach (DictionaryEntry entry in untypedEntries)
+            {
+                if (entry.Key is not string field || entry.Value is not IEnumerable<string> fieldMessages)
+                {
+                    return false;
+                }
+
+                copy[field] = fieldMessages.ToArray();
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        messages = copy;
+        return true;
     }
 
     // Every client and server error status that RFC 9110 defines links to its own section, which agrees with

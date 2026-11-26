@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text.RegularExpressions;
 
 using Microsoft.AspNetCore.Mvc;
 
@@ -17,14 +18,21 @@ namespace SmartHotel.Api.Modules.Auth;
 /// bounds that depend on the trimmed values. Error messages are fixed sentences that never echo the input.
 /// </summary>
 /// <param name="Email">
-/// Required. After trimming: printable ASCII only (U+0021 to U+007E), a valid address with exactly one
-/// <c>@</c> that is neither first nor last, and at most 254 characters (the RFC 5321 path limit).
+/// Required. After trimming: printable ASCII only (U+0021 to U+007E), at most 254 characters (the RFC 5321 path
+/// limit), and an RFC 5321 mailbox: a local part of at most 64 characters, either dot-separated atoms or a quoted
+/// string, then <c>@</c>, then either a domain name whose dot-separated labels are letters, digits and inner
+/// hyphens of at most 63 characters each, or an RFC 5321 address literal: an IPv4 address such as
+/// <c>user@[192.0.2.1]</c> or a tagged IPv6 address such as <c>user@[IPv6:2001:db8::1]</c>. The check is syntax
+/// only; the domain is never resolved or contacted.
 /// </param>
 /// <param name="Password">
 /// Required, 8 to 128 characters, and not trimmed. A whitespace-only value is rejected as missing.
 /// </param>
-/// <param name="FullName">Required. After trimming: not blank and at most 200 characters.</param>
-public sealed record RegisterRequest(
+/// <param name="FullName">
+/// Required. After trimming: not blank, at most 200 characters, and free of the null character (U+0000), which
+/// PostgreSQL text cannot store.
+/// </param>
+public sealed partial record RegisterRequest(
     [ModelBinder(Name = RegisterRequest.EmailMember)]
     [Required(ErrorMessage = "email is required.")]
     string? Email,
@@ -38,7 +46,11 @@ public sealed record RegisterRequest(
     : IValidatableObject
 {
     private const int MaxEmailLength = 254;
+    private const int MaxLocalPartLength = 64;
     private const int MaxFullNameLength = 200;
+
+    // The IPv6-address-literal tag, compared without regard to case.
+    private const string IPv6Tag = "IPv6:";
 
     // The camelCase JSON names. They key both the attribute errors (through ModelBinder) and the Validate
     // errors, whose member names MVC uses verbatim.
@@ -48,8 +60,7 @@ public sealed record RegisterRequest(
 
     private const string EmailMessage = "email must be a valid ASCII email address of at most 254 characters.";
     private const string FullNameMessage = "fullName must not be blank and must be at most 200 characters.";
-
-    private static readonly EmailAddressAttribute EmailFormat = new();
+    private const string FullNameNulMessage = "fullName must not contain the null character (U+0000).";
 
     /// <summary>
     /// Applies the email and full-name bounds to the trimmed values, yielding at most one error per field.
@@ -71,17 +82,131 @@ public sealed record RegisterRequest(
             {
                 yield return new ValidationResult(FullNameMessage, [FullNameMember]);
             }
+            else if (trimmed.Contains('\0'))
+            {
+                // JSON can carry U+0000, but PostgreSQL text cannot store it, so the insert would fail.
+                yield return new ValidationResult(FullNameNulMessage, [FullNameMember]);
+            }
         }
     }
 
     private static bool IsAcceptableEmail(string trimmed)
     {
         // Internationalized addresses are outside v1: only printable ASCII is accepted, which keeps the
-        // single lower-case fold in AuthService.NormalizeEmail exact under every globalization mode.
-        return trimmed.Length <= MaxEmailLength
-            && !trimmed.AsSpan().ContainsAnyExceptInRange('!', '~')
-            && EmailFormat.IsValid(trimmed);
+        // single lower-case fold in AuthService.NormalizeEmail exact under every globalization mode. The cheap
+        // checks run first, so the patterns only ever see at most 254 printable ASCII characters. RFC 5321 section
+        // 4.1.2 Mailbox = Local-part "@" ( Domain / address-literal ). The last @ separates the parts, because a
+        // quoted local part may contain @ and neither form of the part after it can.
+        if (trimmed.Length > MaxEmailLength || trimmed.AsSpan().ContainsAnyExceptInRange('!', '~'))
+        {
+            return false;
+        }
+
+        int at = trimmed.LastIndexOf('@');
+        if (at < 1 || at > MaxLocalPartLength)
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> domain = trimmed.AsSpan(at + 1);
+        return LocalPart().IsMatch(trimmed.AsSpan(0, at))
+            && (DomainName().IsMatch(domain) || IsAddressLiteral(domain));
     }
+
+    // RFC 5321 section 4.1.3 address-literal: "[" ( IPv4-address-literal / IPv6-address-literal /
+    // General-address-literal ) "]". A General-address-literal (Standardized-tag ":" dcontent) needs a tag
+    // registered with IANA, and IPv6 is the only registered tag, so every other tagged literal is rejected. The
+    // check is syntax only: the address is never resolved or contacted.
+    private static bool IsAddressLiteral(ReadOnlySpan<char> domain)
+    {
+        if (domain.Length < 2 || domain[0] != '[' || domain[^1] != ']')
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> address = domain[1..^1];
+        if (address.StartsWith(IPv6Tag, StringComparison.OrdinalIgnoreCase))
+        {
+            // ABNF strings are case-insensitive, so the lower-case form that NormalizeEmail stores is the same tag.
+            return IsIPv6Address(address[IPv6Tag.Length..]);
+        }
+
+        return IPv4Address().IsMatch(address);
+    }
+
+    // RFC 5321 section 4.1.3 IPv6-addr: eight hex groups (IPv6-full), or six followed by ":" and an IPv4 address
+    // (IPv6v4-full). Either may instead use one "::", which stands for at least two zero groups, leaving at most six
+    // explicit groups (IPv6-comp), or at most four before the IPv4 address (IPv6v4-comp). Zone ids ("%") and empty
+    // groups other than the one "::" are not part of the grammar.
+    private static bool IsIPv6Address(ReadOnlySpan<char> address)
+    {
+        int lastColon = address.LastIndexOf(':');
+        if (lastColon < 0)
+        {
+            return false;
+        }
+
+        // Only an embedded IPv4 address contains dots, and it follows the last colon.
+        ReadOnlySpan<char> tail = address[(lastColon + 1)..];
+        if (!tail.Contains('.'))
+        {
+            return HasHexGroups(address, 8);
+        }
+
+        // When the last colon closes the "::", the "::" stays with the groups, as in ::192.0.2.1 or ffff::192.0.2.1;
+        // otherwise it is the separator before the IPv4 address, as in ::ffff:192.0.2.1.
+        ReadOnlySpan<char> groups = lastColon > 0 && address[lastColon - 1] == ':'
+            ? address[..(lastColon + 1)]
+            : address[..lastColon];
+        return IPv4Address().IsMatch(tail) && HasHexGroups(groups, 6);
+    }
+
+    // Whether groups is exactly groupCount hex groups, or one "::" with at most groupCount - 2 explicit groups
+    // around it. The pattern rejects a second "::", a lone leading or trailing colon and an over-long group.
+    private static bool HasHexGroups(ReadOnlySpan<char> groups, int groupCount)
+    {
+        int compressed = groups.IndexOf("::", StringComparison.Ordinal);
+        if (compressed < 0)
+        {
+            return IPv6Groups().IsMatch(groups) && groups.Count(':') == groupCount - 1;
+        }
+
+        ReadOnlySpan<char> before = groups[..compressed];
+        ReadOnlySpan<char> after = groups[(compressed + 2)..];
+        if ((!before.IsEmpty && !IPv6Groups().IsMatch(before)) || (!after.IsEmpty && !IPv6Groups().IsMatch(after)))
+        {
+            return false;
+        }
+
+        int explicitGroups = (before.IsEmpty ? 0 : before.Count(':') + 1) + (after.IsEmpty ? 0 : after.Count(':') + 1);
+        return explicitGroups <= groupCount - 2;
+    }
+
+    // RFC 5321 section 4.1.2 Local-part: a Dot-string of atext atoms joined by single dots, or a Quoted-string of
+    // qtextSMTP and quoted-pairSMTP (its space is already excluded by the repertoire check). \z rather than $ in
+    // every pattern, so a trailing newline can never match.
+    [GeneratedRegex(
+        @"\A(?:[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*|""(?:[ !#-\[\]-~]|\\[ -~])*"")\z",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex LocalPart();
+
+    // RFC 5321 section 4.1.2 Domain: dot-separated labels of letters, digits and inner hyphens, at most 63 characters
+    // each (RFC 1035), with no trailing dot.
+    [GeneratedRegex(
+        @"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\z",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex DomainName();
+
+    // RFC 5321 section 4.1.3 IPv4-address-literal without brackets: four dot-separated Snum, each one to three
+    // digits with a value of 0 to 255, leading zeros included.
+    [GeneratedRegex(
+        @"\A(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]{1,2})(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]{1,2})){3}\z",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex IPv4Address();
+
+    // RFC 5321 section 4.1.3 IPv6-hex groups of one to four hex digits, joined by single colons.
+    [GeneratedRegex(@"\A[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*\z", RegexOptions.CultureInvariant)]
+    private static partial Regex IPv6Groups();
 
     /// <summary>Returns the type name with every member redacted.</summary>
     /// <returns>A description that carries no member value.</returns>
@@ -139,8 +264,14 @@ public sealed record LoginResponse(string Token, DateTime ExpiresAt)
 }
 
 /// <summary>
-/// Outcome of a registration attempt. The private constructor limits the cases to the nested records.
+/// Outcome of a registration attempt. <see cref="AuthService.RegisterAsync(RegisterRequest, CancellationToken)"/>
+/// produces only the two nested cases, <see cref="Created"/> and <see cref="EmailTaken"/>.
 /// </summary>
+/// <remarks>
+/// The private constructor stops code from deriving through the parameterless constructor, but the protected copy
+/// constructor that the record synthesizes still lets other derived records exist. Code that switches on a result
+/// therefore keeps a default arm that rejects an unrecognized case.
+/// </remarks>
 public abstract record RegisterResult
 {
     private RegisterResult()

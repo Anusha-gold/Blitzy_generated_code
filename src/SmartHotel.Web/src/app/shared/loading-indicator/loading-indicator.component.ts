@@ -3,9 +3,15 @@ import { NgIf } from '@angular/common';
 import { LoadingService } from '../../core/http/loading.service';
 
 /**
- * The app-wide request indicator (`role="progressbar"`,
- * `data-testid="loading-indicator"`), rendered only while
- * {@link LoadingService.isLoading} is `true` and absent from the DOM otherwise.
+ * The app-wide request status, a slot between the nav bar and the page. The
+ * host keeps the banner's height even while idle, so the banner never covers
+ * the navigation and the page never shifts when loading starts or ends.
+ *
+ * The indicator (`role="progressbar"`, `data-testid="loading-indicator"`) is
+ * rendered only while {@link LoadingService.isLoading} is `true` and is absent
+ * from the DOM otherwise. A visually hidden polite status region stays rendered
+ * throughout and reads "Loading…" or "Loading complete.", so screen readers
+ * announce the start and end of loading without moving focus.
  *
  * `loadingInterceptor` drives that state for every `HttpClient` request, so
  * the component only reads it and never changes it. Reading a signal in the

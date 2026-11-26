@@ -6,8 +6,9 @@ import { Injectable, computed, signal } from '@angular/core';
  * `loadingInterceptor` is its only writer: it calls {@link LoadingService.begin}
  * when a request starts and {@link LoadingService.end} when it completes, errors
  * or is cancelled. `LoadingIndicatorComponent` reads {@link LoadingService.isLoading}.
- * The state changes synchronously, with no debounce or delay, so even a short
- * request shows the indicator and the last completion hides it at once.
+ * The counter updates synchronously, with no debounce or delay. The indicator
+ * template reflects it on Angular's next render, so a request that begins and
+ * ends between two renders may never be painted.
  */
 @Injectable({ providedIn: 'root' })
 export class LoadingService {
