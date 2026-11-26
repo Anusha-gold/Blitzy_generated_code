@@ -1,0 +1,33 @@
+# .NET build and test output
+bin/
+obj/
+TestResults/
+*.trx
+.vs/
+*.user
+*.suo
+*.rsuser
+
+# Node / Angular (src/SmartHotel.Web)
+node_modules/
+dist/
+.angular/
+npm-debug.log*
+
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+# A pattern with an inner slash is anchored to this directory; **/ matches it at any depth.
+**/playwright/.cache/
+
+# Local environment: the optional Compose override file holding
+# SMARTHOTEL_DB_PASSWORD and SMARTHOTEL_JWT_SIGNING_KEY.
+# Matched exactly so .env.example and deploy/acceptance.env stay tracked.
+.env
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

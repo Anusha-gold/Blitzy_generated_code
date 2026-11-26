@@ -1,0 +1,9 @@
+# Build context for the web image. Host-installed packages, earlier build output,
+# the Angular cache and Playwright artifacts stay out, so the image's `npm ci` and
+# `ng build` always run from the current sources.
+node_modules
+dist
+.angular
+test-results
+playwright-report
+blob-report
