@@ -28,10 +28,13 @@
 #   image's working directory, /app: exec makes the API the container's main
 #   process, so `docker stop` signals reach it.
 #
-# A missing or unreadable file is reported on stderr by its path, and the
-# variable is left as it was. The script does not stop there:
-# ConnectionStrings__SmartHotel may legitimately replace DB_PASSWORD, and the
-# API's own startup validation reports a missing signing key.
+# When a file is missing, is not a readable regular file, or holds an empty
+# value or any byte outside that set, a trailing newline or a NUL byte
+# included, its variable is left unset and one stderr line names the file
+# and the variable, never the directory or the content. The script does
+# not stop there: ConnectionStrings__SmartHotel may legitimately replace
+# DB_PASSWORD, and the API's own startup validation reports a missing
+# signing key.
 #
 # Never enable shell tracing or print a variable's value here: either would
 # expose the secrets in the container log.
@@ -42,30 +45,56 @@ log() {
     printf 'docker-entrypoint: %s\n' "$*" >&2
 }
 
-if [ -n "${SMARTHOTEL_SECRETS_DIR:-}" ]; then
-    db_password_file="$SMARTHOTEL_SECRETS_DIR/db_password"
-    jwt_signing_key_file="$SMARTHOTEL_SECRETS_DIR/jwt_signing_key"
-
-    # Each value is assigned and exported separately so a failing cat still
-    # stops the script under set -e. Command substitution strips only
-    # trailing newlines, which the secret files never contain, so each value
-    # equals its file exactly.
-    if [ -z "${DB_PASSWORD:-}" ]; then
-        if [ -r "$db_password_file" ]; then
-            DB_PASSWORD="$(cat "$db_password_file")"
-            export DB_PASSWORD
-        else
-            log "$db_password_file not found or not readable; leaving DB_PASSWORD unset"
-        fi
+# export_secret_file NAME VARIABLE
+# Exports VARIABLE from $SMARTHOTEL_SECRETS_DIR/NAME when that is a readable
+# regular file holding exactly a non-empty value made only of the allowed
+# characters. Otherwise VARIABLE is unset and one line naming only NAME and
+# VARIABLE is logged. The directory is deployment input and is never
+# printed, so the messages of cat, wc and the shell, which would print it,
+# are discarded. Callers pass fixed names only. Command substitution drops
+# trailing newlines, and BusyBox ash drops NUL bytes too, so the value read
+# can be shorter than the file. Once the character check has passed the
+# value is ASCII and ${#} counts its bytes, so the value equals the file
+# only when the file's size, which wc pads with blanks on some systems,
+# equals that count; any other file, a failing wc included, is malformed.
+export_secret_file() {
+    _name=$1
+    _variable=$2
+    _file="$SMARTHOTEL_SECRETS_DIR/$_name"
+    if [ ! -f "$_file" ] || [ ! -r "$_file" ] ||
+        ! _value=$(cat "$_file" 2>/dev/null); then
+        _value=
+        unset "$_variable"
+        log "$_name in SMARTHOTEL_SECRETS_DIR is missing or unreadable;" \
+            "leaving $_variable unset"
+        return 0
     fi
+    _valid=1
+    case $_value in
+        '' | *[!A-Za-z0-9._~+/=-]*) _valid=0 ;;
+    esac
+    if [ "$_valid" -eq 1 ] &&
+        [ "$({ wc -c < "$_file"; } 2>/dev/null | tr -d ' \t')" != \
+            "${#_value}" ]; then
+        _valid=0
+    fi
+    if [ "$_valid" -eq 0 ]; then
+        _value=
+        unset "$_variable"
+        log "$_name in SMARTHOTEL_SECRETS_DIR is empty or malformed;" \
+            "leaving $_variable unset"
+        return 0
+    fi
+    export "$_variable=$_value"
+    _value=
+}
 
+if [ -n "${SMARTHOTEL_SECRETS_DIR:-}" ]; then
+    if [ -z "${DB_PASSWORD:-}" ]; then
+        export_secret_file db_password DB_PASSWORD
+    fi
     if [ -z "${Jwt__SigningKey:-}" ]; then
-        if [ -r "$jwt_signing_key_file" ]; then
-            Jwt__SigningKey="$(cat "$jwt_signing_key_file")"
-            export Jwt__SigningKey
-        else
-            log "$jwt_signing_key_file not found or not readable; leaving Jwt__SigningKey unset"
-        fi
+        export_secret_file jwt_signing_key Jwt__SigningKey
     fi
 fi
 
