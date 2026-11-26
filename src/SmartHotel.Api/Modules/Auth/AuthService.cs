@@ -44,8 +44,10 @@ public sealed partial class AuthService(
 
     // One hash of a random secret per process, verified against when no account can match, so that every rejected
     // login costs one PBKDF2 verification. Every host in the process configures the same iteration count, so
-    // sharing it across instances keeps the cost equal to a real account's.
+    // sharing it across instances keeps the cost equal to a real account's. The lock makes concurrent first use
+    // compute the hash once rather than merely publish one of several computed results.
     private static string? s_dummyHash;
+    private static object? s_dummyHashLock;
 
     /// <summary>
     /// Folds an email address into its stored form: trimmed, then lower-cased with the invariant culture.
@@ -133,8 +135,9 @@ public sealed partial class AuthService(
     /// <remarks>
     /// <para>
     /// The response does not reveal whether an account exists. A <see langword="null"/> or blank email or password,
-    /// an unknown email and a wrong password all return <see langword="null"/>, which the controller maps to one
-    /// fixed 401. When no account can match, the password (or an empty string in place of <see langword="null"/>)
+    /// an email that no stored address can match because it holds a character outside printable ASCII, an unknown
+    /// email and a wrong password all return <see langword="null"/>, which the controller maps to one fixed 401.
+    /// When no account can match, the password (or an empty string in place of <see langword="null"/>)
     /// is still verified against a dummy hash made with the same settings, so every rejection performs one PBKDF2
     /// verification. That makes the hashing work comparable, not the timing constant: the database lookup can
     /// still take different times.
@@ -160,6 +163,15 @@ public sealed partial class AuthService(
         }
 
         string email = NormalizeEmail(request.Email);
+
+        // Stored addresses are printable ASCII only: registration accepts nothing else and CK_Guests_Email_Normalized
+        // enforces it. A value with any other character can never match an account, and some (U+0000) cannot even
+        // be sent as PostgreSQL text, so it takes the no-account path without a query.
+        if (email.AsSpan().ContainsAnyExceptInRange('!', '~'))
+        {
+            return RejectWithoutAccount(request.Password);
+        }
+
         Guest? guest = await db.Guests.FirstOrDefaultAsync(g => g.Email == email, cancellationToken);
         if (guest is null)
         {
@@ -198,6 +210,7 @@ public sealed partial class AuthService(
     {
         return LazyInitializer.EnsureInitialized(
             ref s_dummyHash,
+            ref s_dummyHashLock,
             () => passwordHasher.HashPassword(new Guest(), Guid.NewGuid().ToString("N")));
     }
 

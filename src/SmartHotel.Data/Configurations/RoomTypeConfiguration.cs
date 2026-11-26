@@ -19,8 +19,9 @@ namespace SmartHotel.Data.Configurations;
 /// </para>
 /// <para>
 /// Booking creation locks a row with <c>SELECT * FROM "RoomTypes" WHERE "Id" = @id FOR UPDATE</c> and
-/// materializes it as a <see cref="RoomType"/>, so the table and column names here must stay EF's defaults and no
-/// column may be added.
+/// materializes it as a <see cref="RoomType"/>. The statement names the table and its key column literally, so
+/// renaming either means rewriting it. Its result must return every column this mapping reads, under the mapped
+/// name; extra columns are ignored, so a column may be added once the schema has it.
 /// </para>
 /// </remarks>
 internal sealed class RoomTypeConfiguration : IEntityTypeConfiguration<RoomType>
@@ -31,7 +32,7 @@ internal sealed class RoomTypeConfiguration : IEntityTypeConfiguration<RoomType>
         builder.ToTable("RoomTypes", t =>
         {
             t.HasCheckConstraint("CK_RoomTypes_MaxGuests", "\"MaxGuests\" >= 1");
-            t.HasCheckConstraint("CK_RoomTypes_NightlyPrice", "\"NightlyPrice\" >= 0");
+            t.HasCheckConstraint("CK_RoomTypes_NightlyPrice", "\"NightlyPrice\" >= 0 AND \"NightlyPrice\" <= 99999.99");
         });
 
         builder.HasKey(t => t.Id);
@@ -50,7 +51,8 @@ internal sealed class RoomTypeConfiguration : IEntityTypeConfiguration<RoomType>
         builder.Property(t => t.MaxGuests)
             .IsRequired();
 
-        // numeric(7,2) caps the price at 99,999.99, the bound PriceCalculator.MaxNightlyPrice enforces in the API.
+        // numeric(7,2) caps finite prices at 99,999.99, the bound PriceCalculator.MaxNightlyPrice enforces in the API.
+        // The check's upper bound also rejects NaN, which numeric admits and orders above every finite number.
         builder.Property(t => t.NightlyPrice)
             .IsRequired()
             .HasPrecision(7, 2);

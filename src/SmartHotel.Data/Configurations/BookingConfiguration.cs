@@ -19,8 +19,9 @@ namespace SmartHotel.Data.Configurations;
 /// The guarantee against double booking is the exclusion constraint <c>EX_Bookings_Room_NoOverlap</c>, a GiST
 /// constraint over <c>"RoomId"</c> and <c>daterange("CheckIn", "CheckOut", '[)')</c> that applies only to
 /// <c>Confirmed</c> rows. It is written by hand in the <c>InitialCreate</c> migration, because EF Core cannot model
-/// exclusion constraints, and it is deliberately not declared here. <c>CK_Bookings_Dates</c> must stay beside it: an
-/// empty range overlaps nothing, so a booking whose check-out does not follow its check-in would escape it.
+/// exclusion constraints, and it is deliberately not declared here. <c>CK_Bookings_Dates</c> must stay beside it,
+/// requiring check-out strictly after check-in: <c>daterange</c> already rejects reversed dates, but equal dates form
+/// an empty range, which overlaps nothing and would evade the exclusion constraint.
 /// </para>
 /// <para>
 /// <c>Status</c> is stored as the <see cref="BookingStatus"/> member name. The exclusion constraint's filter,

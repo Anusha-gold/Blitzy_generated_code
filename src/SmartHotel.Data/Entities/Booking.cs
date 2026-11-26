@@ -71,9 +71,11 @@ public sealed class Booking
     public BookingStatus Status { get; set; }
 
     /// <summary>
-    /// Gets or sets the creation instant in UTC, by which a guest's bookings are listed newest first. The value must
-    /// have <see cref="DateTimeKind.Utc"/>, because Npgsql rejects any other kind for
-    /// <c>timestamp with time zone</c>.
+    /// Gets or sets the creation instant in UTC, by which a guest's bookings are listed newest first. Callers must
+    /// assign a finite instant with <see cref="DateTimeKind.Utc"/>, taken from the injected
+    /// <see cref="TimeProvider"/>. Npgsql rejects a finite value of any other kind for
+    /// <c>timestamp with time zone</c>, but stores <see cref="DateTime.MinValue"/>, which an unassigned property
+    /// holds, as <c>-infinity</c> and <see cref="DateTime.MaxValue"/> as <c>infinity</c>, whatever their kind.
     /// </summary>
     public DateTime CreatedAt { get; set; }
 }

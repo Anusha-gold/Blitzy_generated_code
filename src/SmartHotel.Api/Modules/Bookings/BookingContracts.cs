@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text.Json.Serialization;
 
 using Microsoft.AspNetCore.Mvc;
 
@@ -10,18 +11,26 @@ namespace SmartHotel.Api.Modules.Bookings;
 // properties. The numeric members are int? so that a missing or null JSON property binds null and [Required]
 // reports it, instead of a silent 0 or an implicit required check with a different message.
 //
+// [JsonNumberHandling(Strict)] is there because MVC's JSON options start from JsonSerializerDefaults.Web, which
+// also reads a number from a quoted string: "1" would bind as 1 and pass [Required] and [Range]. Under strict
+// handling a quoted number is a wrong JSON type, so the input formatter rejects the body with a 400 keyed by its
+// JSON path (for example $.hotelId) before validation runs. A missing or null property still binds null for
+// [Required]. An attribute on the type takes precedence over the serializer options, so the host's JSON options
+// need no change.
+//
 // [ModelBinder(Name)] sets each parameter's key in the 400 errors object. For positional record parameters MVC
 // keys attribute errors by the CLR parameter name (HotelId) and ignores SystemTextJsonValidationMetadataProvider,
 // while the error contract keys them by the camelCase JSON name (hotelId). The name does not affect body binding.
 //
-// CheckIn and CheckOut are strings with no attributes. StayPeriod.TryCreate parses them through IsoDate, which
-// alone accepts exactly yyyy-MM-dd, and keys a missing or nonconforming date as checkIn or checkOut. DateOnly
-// members would let MVC and System.Text.Json accept looser forms.
+// CheckIn and CheckOut are strings with no attributes, so StayPeriod.TryCreate, through IsoDate, is the one parser
+// for every date input. It owns the validation order and reports a missing or nonconforming date under checkIn or
+// checkOut with the same messages as the hotel endpoints. A DateOnly member would instead reject a nonconforming
+// date in the input formatter, under $.checkIn and with the formatter's message.
 
 /// <summary>
 /// Body of <c>POST /api/bookings</c>. The request never carries a price: the server computes the total from the
 /// room type's nightly price and the number of nights. Error messages are fixed sentences that never echo the
-/// input.
+/// input. The numeric fields must be JSON numbers: a quoted number is a wrong JSON type and returns 400.
 /// </summary>
 /// <param name="HotelId">Required, at least 1, and the id of an existing hotel (otherwise 404).</param>
 /// <param name="RoomTypeId">
@@ -39,6 +48,7 @@ namespace SmartHotel.Api.Modules.Bookings;
 /// Required and at least 1, unlike the hotel endpoints, where <c>guests</c> defaults to 1. A value above the room
 /// type's maximum is a 400 keyed <c>guests</c>.
 /// </param>
+[JsonNumberHandling(JsonNumberHandling.Strict)]
 public sealed record CreateBookingRequest(
     [ModelBinder(Name = "hotelId")]
     [Required(ErrorMessage = "hotelId is required.")]
@@ -99,13 +109,14 @@ public sealed record BookingResponse(
     DateTime CreatedAt);
 
 /// <summary>
-/// Outcome of a booking-creation attempt. The private constructor limits the cases to the nested records.
+/// Outcome of a booking-creation attempt: one of the nested records below, which are its supported outcomes.
+/// Consumers map each nested record and keep an explicit fallback for any other value.
 /// </summary>
 /// <remarks>
-/// Beyond the five outcomes of the module plan, <see cref="InvalidStay"/> carries the stay-validation errors,
-/// because the service validates the stay before anything else and the controller makes one service call; and
-/// <see cref="CapacityExceeded"/> and <see cref="NoRoomAvailable"/> carry the values their error messages state,
-/// so the controller needs no second query to build them.
+/// <see cref="InvalidStay"/> carries the stay-validation errors, because the service validates the stay before
+/// anything else and the controller makes one service call. <see cref="CapacityExceeded"/> and
+/// <see cref="NoRoomAvailable"/> carry the values their error messages state, so the controller needs no second
+/// query to build them.
 /// </remarks>
 public abstract record CreateBookingResult
 {
@@ -145,7 +156,8 @@ public abstract record CreateBookingResult
 }
 
 /// <summary>
-/// Outcome of a cancellation attempt. The private constructor limits the cases to the nested records.
+/// Outcome of a cancellation attempt: one of the nested records below, which are its supported outcomes.
+/// Consumers map each nested record and keep an explicit fallback for any other value.
 /// </summary>
 public abstract record CancelResult
 {

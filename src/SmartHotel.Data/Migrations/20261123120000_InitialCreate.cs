@@ -66,7 +66,7 @@ namespace SmartHotel.Data.Migrations
                     table.PrimaryKey("PK_RoomTypes", x => x.Id);
                     table.UniqueConstraint("AK_RoomTypes_Id_HotelId", x => new { x.Id, x.HotelId });
                     table.CheckConstraint("CK_RoomTypes_MaxGuests", "\"MaxGuests\" >= 1");
-                    table.CheckConstraint("CK_RoomTypes_NightlyPrice", "\"NightlyPrice\" >= 0");
+                    table.CheckConstraint("CK_RoomTypes_NightlyPrice", "\"NightlyPrice\" >= 0 AND \"NightlyPrice\" <= 99999.99");
                     table.ForeignKey(
                         name: "FK_RoomTypes_Hotels_HotelId",
                         column: x => x.HotelId,
