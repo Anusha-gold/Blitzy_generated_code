@@ -1,0 +1,10 @@
+<div *ngIf="error as e" class="inline-error" role="alert" data-testid="inline-error">
+  <strong>{{ e.title }}</strong>
+  <p *ngIf="e.detail !== null">{{ e.detail }}</p>
+  <ul *ngIf="e.fieldErrors.length > 0">
+    <ng-container *ngFor="let fe of e.fieldErrors">
+      <li *ngFor="let message of fe.messages">{{ fe.field }}: {{ message }}</li>
+    </ng-container>
+  </ul>
+  <ng-content />
+</div>
