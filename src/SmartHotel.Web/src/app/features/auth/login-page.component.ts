@@ -34,11 +34,15 @@ const DEFAULT_RETURN_URL = '/search';
  * an absolute or protocol-relative URL, goes to `/search`. This prevents an
  * open redirect.
  *
- * Validation: there is none on the client. The form never blocks submission,
- * and the values are sent exactly as typed, so the server stays the single
- * authority and its 400 or 401 reaches the guest inline. Every 401 shows the
- * same "Email or password is incorrect.", so the page reveals no more than the
- * API about whether an account exists.
+ * Validation: the page adds no validators of its own and never gates
+ * submission on validity; the template's `required` attributes mark the
+ * fields and attach Angular's required validator, but nothing checks validity
+ * before sending, and Angular adds `novalidate`, so the browser does not block
+ * the submission either. The form sends its controls' current values
+ * unchanged, so the server stays the single authority on what it accepts and
+ * its 400 or 401 reaches the guest inline. Every 401 shows the same "Email or
+ * password is incorrect.", so the page reveals no more than the API about
+ * whether an account exists.
  */
 @Component({
   selector: 'app-login-page',
@@ -55,7 +59,12 @@ export class LoginPageComponent {
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
 
-  /** The credentials as typed; deliberately without validators. */
+  /**
+   * The credentials as the inputs report them; a `type="email"` input already
+   * drops surrounding whitespace. The group declares no validators of its own;
+   * the template's `required` attributes add Angular's required validator,
+   * which `submit` does not check.
+   */
   protected readonly form = this.fb.group({ email: '', password: '' });
 
   /** Whether the login request is in flight; disables the submit button. */
@@ -85,11 +94,18 @@ export class LoginPageComponent {
   }
 
   /**
-   * Sends the credentials as typed. On success, `AuthService` has stored the
-   * session and the guest continues to the safe return URL; on failure the
-   * error is shown inline.
+   * Sends the form controls' current values unchanged, whatever their
+   * validity. A submit while a login is already pending is ignored. On
+   * success, `AuthService` has stored the session and the guest continues to
+   * the safe return URL; on failure the error is shown inline.
    */
   protected submit(): void {
+    // The disabled submit button already blocks this; the guard keeps a second
+    // request from starting while one is in flight, whatever triggers submit.
+    if (this.pending()) {
+      return;
+    }
+
     this.error.set(null);
     this.pending.set(true);
     const { email, password } = this.form.getRawValue();

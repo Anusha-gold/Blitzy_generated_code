@@ -25,12 +25,15 @@ const EMAIL_TAKEN_TITLE = 'An account with this email already exists.';
  * land in the browser history, server logs and `Referer` headers. The returned
  * `guestId` is not used, and the guest is not signed in automatically.
  *
- * No client-side validation: the form has no validators and submission is
- * never gated on them. The server is the single authority on the email,
+ * Validation: the page adds no validators of its own and never gates
+ * submission on validity; the template's `required` attributes mark the
+ * fields and attach Angular's required validator, but nothing checks validity
+ * before sending, and Angular adds `novalidate`, so the browser does not block
+ * the submission either. The server is the single authority on the email,
  * password and full-name rules, and its 400 field errors render inline through
  * `ErrorMessageComponent`, so the client never repeats or contradicts them.
- * The form's values are sent unchanged; the server trims and normalizes its
- * own copy.
+ * The form sends its controls' current values unchanged; the server trims and
+ * normalizes its own copy.
  *
  * Errors: a 409 shows the fixed title "An account with this email already
  * exists." in place of the server's title and detail. Every other failure,
@@ -52,7 +55,12 @@ export class RegisterPageComponent {
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
 
-  /** The registration fields, deliberately without validators. */
+  /**
+   * The registration fields as the inputs report them; a `type="email"` input
+   * already drops surrounding whitespace. The group declares no validators of
+   * its own; the template's `required` attributes add Angular's required
+   * validator, which `submit` does not check.
+   */
   protected readonly form = this.fb.group({ email: '', password: '', fullName: '' });
 
   /** Whether the registration request is in flight; disables the submit button. */

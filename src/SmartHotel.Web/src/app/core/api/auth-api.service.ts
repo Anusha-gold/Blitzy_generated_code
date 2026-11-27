@@ -33,7 +33,8 @@ export class AuthApiService {
    * - 409 when the email is already registered, ignoring letter case;
    * - 415 when the body is not JSON.
    *
-   * @param req - The guest's email, password and full name, as entered.
+   * @param req - The guest's email, password and full name from the
+   *   registration form, sent unchanged.
    * @returns The 201 body, `{ guestId }`, the new guest's id.
    */
   register(req: RegisterRequest): Observable<RegisterResponse> {
@@ -43,12 +44,13 @@ export class AuthApiService {
   /**
    * Logs a guest in: `POST /api/auth/login`, anonymous.
    *
-   * Error: 401 when the credentials do not match. Its content is identical
-   * whether or not the account exists, so it never reveals one.
+   * Error: 401 when the credentials do not match. Its `type`, `title`,
+   * `status` and `detail` are identical whether or not the account exists, and
+   * only its per-request `traceId` differs, so it never reveals one.
    *
    * The caller, `AuthService`, keeps the returned token in memory only.
    *
-   * @param req - The email and password, as entered.
+   * @param req - The email and password from the login form, sent unchanged.
    * @returns The 200 body: `token`, a bearer token valid for 60 minutes, and
    *   `expiresAt`, its UTC expiry instant.
    */

@@ -14,7 +14,7 @@ export interface Session {
    * whole seconds, `yyyy-MM-ddTHH:mm:ssZ`.
    */
   expiresAt: string;
-  /** The email as the guest typed it at login, kept for display in the nav bar. */
+  /** The email from the login form, kept for display in the nav bar. */
   email: string;
 }
 
@@ -76,8 +76,9 @@ export class AuthService {
    * for wrong credentials, the 400 for an unbindable body or status 0 when the
    * API is unreachable, pass through unchanged for the page to show.
    *
-   * @param email - The email as entered. The server trims and folds its own copy.
-   * @param password - The password as entered.
+   * @param email - The email from the login form, sent unchanged. The server
+   *   trims and folds its own copy.
+   * @param password - The password from the login form, sent unchanged.
    * @returns The stored session.
    */
   login(email: string, password: string): Observable<Session> {
