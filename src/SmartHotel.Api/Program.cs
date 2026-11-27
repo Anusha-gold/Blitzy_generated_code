@@ -60,10 +60,25 @@ builder.Services.AddExceptionHandler<ApiExceptionHandler>();
 // is added and ReturnHttpNotAcceptable stays false, so every problem negotiates to application/problem+json, even
 // for Accept: application/xml. The enum converter has no naming policy: statuses are written "Confirmed" and
 // "Cancelled" exactly.
+//
+// A binding 400 echoes nothing the client sent and names nothing of the implementation. The JSON formatter keeps
+// System.Text.Json's exception messages, which quote .NET type names and payload positions, out of model state; the
+// binding messages that would quote an attempted value or a member name are fixed sentences; and the response for
+// invalid model state rebuilds the errors object under the JSON paths the body's contract defines. It is configured
+// after AddControllers, whose own ApiBehaviorOptions setup installs MVC's default response.
 builder.Services
     .AddControllers(static options =>
-        options.ModelMetadataDetailsProviders.Add(new SystemTextJsonValidationMetadataProvider()))
-    .AddJsonOptions(static options => options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+    {
+        options.ModelMetadataDetailsProviders.Add(new SystemTextJsonValidationMetadataProvider());
+        ProblemDetailsSetup.UseFixedBindingMessages(options.ModelBindingMessageProvider);
+    })
+    .AddJsonOptions(static options =>
+    {
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+        options.AllowInputFormatterExceptionMessages = false;
+    })
+    .ConfigureApiBehaviorOptions(static options =>
+        options.InvalidModelStateResponseFactory = ProblemDetailsSetup.CreateInvalidModelStateResponse);
 
 // The single-origin policy is built from the validated options when the policy provider first reads them, after
 // Build(). It allows no credentials.

@@ -68,11 +68,11 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
     }
 
     [Theory]
-    [InlineData("empty-body")]
-    [InlineData("malformed-json")]
-    [InlineData("json-array")]
-    [InlineData("email-is-number")]
-    public async Task Login_UnbindableJsonBody_Returns400(string caseLabel)
+    [InlineData("empty-body", "$")]
+    [InlineData("malformed-json", null)]
+    [InlineData("json-array", null)]
+    [InlineData("email-is-number", "$.email")]
+    public async Task Login_UnbindableJsonBody_Returns400(string caseLabel, string? expectedErrorKey)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
         ApiTestClient client = _factory.CreateApiClient();
@@ -80,9 +80,10 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         using StringContent content = new(BodyFor(caseLabel), Encoding.UTF8, JsonMediaType);
         using HttpResponseMessage response = await client.Http.PostAsync(LoginRoute, content, ct);
 
-        // Binding rejects the body before any credential check runs. The key the framework files the error under
-        // ("", "$" or "$.email") is not part of the contract, so only the presence of the errors object is checked.
-        await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.BadRequest, errorKey: null, ct);
+        // Binding rejects the body before any credential check runs. The errors object is keyed by JSON path: an
+        // empty body is the body itself, $, and a wrong-typed email is $.email. Malformed and non-object bodies are
+        // body-level failures that name no field, so only the presence of the errors object is checked for them.
+        await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.BadRequest, expectedErrorKey, ct);
 
         static string BodyFor(string label)
         {

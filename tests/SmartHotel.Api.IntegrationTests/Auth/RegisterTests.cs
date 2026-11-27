@@ -32,7 +32,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     [InlineData("email-non-ascii", "email")]
     [InlineData("password-too-short", "password")]
     [InlineData("fullname-missing", "fullName")]
-    [InlineData("empty-json-body", null)]
+    [InlineData("empty-json-body", "$")]
     [InlineData("malformed-json", null)]
     public async Task Register_InvalidInput_Returns400(string caseLabel, string? expectedErrorKey)
     {

@@ -1,17 +1,26 @@
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Abstractions;
+using Microsoft.AspNetCore.Mvc.Infrastructure;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
+using Microsoft.AspNetCore.Mvc.ModelBinding.Metadata;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
 namespace SmartHotel.Api.Infrastructure;
 
 /// <summary>
 /// Registers the API's ProblemDetails services and owns the single defaults routine that completes every
 /// error body, whether MVC's ProblemDetails factory builds it or <see cref="ApiProblemDetailsWriter"/> writes
-/// it for status-code pages and the exception handler.
+/// it for status-code pages and the exception handler. It also supplies MVC's model-binding messages and its
+/// invalid-model-state response, so a binding 400 carries only fixed messages under contract keys.
 /// </summary>
 public static class ProblemDetailsSetup
 {
@@ -20,6 +29,23 @@ public static class ProblemDetailsSetup
     private const string FallbackTitle = "Error";
     private const string TraceIdKey = "traceId";
     private const string ErrorsKey = "errors";
+
+    // The media types MVC's own invalid-model-state response offers. No XML formatter is registered, so content
+    // negotiation always settles on the JSON formatter's application/problem+json.
+    private const string ProblemJsonMediaType = "application/problem+json";
+    private const string ProblemXmlMediaType = "application/problem+xml";
+
+    // The JSON path of the request body itself, and the prefix of a path to one of its members.
+    private const string JsonRootPath = "$";
+    private const string JsonMemberPathPrefix = "$.";
+
+    // Binding messages are fixed sentences. None quotes an attempted value, a JSON fragment, a parser message or a
+    // .NET type or member name, because the error key already says which input failed.
+    private const string InvalidValueMessage = "The value is not valid.";
+    private const string MissingValueMessage = "A value is required.";
+    private const string NotANumberMessage = "The value must be a number.";
+    private const string InvalidJsonMemberMessage = "The JSON value is not valid.";
+    private const string InvalidBodyMessage = "The request body must be a valid JSON object.";
 
     /// <summary>
     /// Adds ProblemDetails support with <see cref="ApplyDefaults"/> as its customization step, registers
@@ -161,6 +187,83 @@ public static class ProblemDetailsSetup
             : httpContext.TraceIdentifier;
     }
 
+    /// <summary>
+    /// Replaces every model-binding message that takes an argument with a fixed sentence, so no binding error quotes
+    /// the attempted value, such as a query string's text, or a member name, which for a property is its .NET name.
+    /// A value that cannot be converted, or that must not be null, gets "The value is not valid."; a missing
+    /// <c>[BindRequired]</c> value gets "A value is required."; and the number check gets "The value must be a
+    /// number.". The messages that take no argument are fixed framework sentences already and are kept.
+    /// </summary>
+    /// <param name="messageProvider">MVC's provider, <see cref="MvcOptions.ModelBindingMessageProvider"/>.</param>
+    public static void UseFixedBindingMessages(DefaultModelBindingMessageProvider messageProvider)
+    {
+        ArgumentNullException.ThrowIfNull(messageProvider);
+
+        messageProvider.SetAttemptedValueIsInvalidAccessor(static (_, _) => InvalidValueMessage);
+        messageProvider.SetNonPropertyAttemptedValueIsInvalidAccessor(static _ => InvalidValueMessage);
+        messageProvider.SetUnknownValueIsInvalidAccessor(static _ => InvalidValueMessage);
+        messageProvider.SetValueIsInvalidAccessor(static _ => InvalidValueMessage);
+        messageProvider.SetValueMustNotBeNullAccessor(static _ => InvalidValueMessage);
+        messageProvider.SetMissingBindRequiredValueAccessor(static _ => MissingValueMessage);
+        messageProvider.SetValueMustBeANumberAccessor(static _ => NotANumberMessage);
+    }
+
+    /// <summary>
+    /// Builds the 400 that MVC returns when an <c>[ApiController]</c> action's model state is invalid, for use as
+    /// <see cref="ApiBehaviorOptions.InvalidModelStateResponseFactory"/>. The request's
+    /// <see cref="ProblemDetailsFactory"/> creates the <see cref="ValidationProblemDetails"/>, so
+    /// <see cref="ApplyDefaults"/> completes it as it does every MVC problem, and the result offers the same problem
+    /// media types as MVC's default response. The <c>errors</c> object comes from a sanitized copy of the model state
+    /// built from its keys and fixed messages; attempted values, raw values and exception text are never read.
+    /// </summary>
+    /// <remarks>
+    /// <para>For an action with a body parameter, the keys are the body's JSON paths:</para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// The input formatter files an error under the JSON path where reading stopped. The path is kept only when it
+    /// is <c>$</c> or names a member of the body type, <c>$.</c> followed by the member's serialized name, which is
+    /// then written in the contract's letter case. Any other path, through an unknown member, an array element or
+    /// a nested value, can quote member names the client invented and names nothing in the contract, so it becomes
+    /// <c>$</c>. A member path's message is "The JSON value is not valid." and the root's is "The request body must
+    /// be a valid JSON object.".
+    /// </description></item>
+    /// <item><description>
+    /// The body binder files its own error, such as "A non-empty request body is required." for an empty body,
+    /// under the empty key. It is filed under <c>$</c>, the body itself, with its message.
+    /// </description></item>
+    /// <item><description>
+    /// The required error filed under the body parameter's own name is dropped. That name belongs to the action's
+    /// signature, not to the JSON contract, and the body's own error already reports the failure. Should no other
+    /// error remain, <c>$</c> reports the body with the root's message.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// Every other key is kept with the messages that validation attributes and the binding message provider set,
+    /// and an error that carries only an exception gets "The value is not valid.". Each key lists a message once.
+    /// </para>
+    /// </remarks>
+    /// <param name="context">The action whose model state is invalid.</param>
+    /// <returns>The 400 object result that wraps the validation problem.</returns>
+    public static IActionResult CreateInvalidModelStateResponse(ActionContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        HttpContext httpContext = context.HttpContext;
+        ProblemDetailsFactory factory = httpContext.RequestServices.GetRequiredService<ProblemDetailsFactory>();
+        ValidationProblemDetails problem = factory.CreateValidationProblemDetails(
+            httpContext,
+            SanitizeModelState(context));
+
+        // As in MVC's default response, a 400 stays a BadRequestObjectResult.
+        ObjectResult result = problem.Status == StatusCodes.Status400BadRequest
+            ? new BadRequestObjectResult(problem)
+            : new ObjectResult(problem) { StatusCode = problem.Status };
+        result.ContentTypes.Add(ProblemJsonMediaType);
+        result.ContentTypes.Add(ProblemXmlMediaType);
+
+        return result;
+    }
+
     // Text is blank when it is null or holds only white space or U+FEFF. char.IsWhiteSpace does not count U+FEFF,
     // but JavaScript's String.prototype.trim strips it, so a browser client reads such text as empty.
     private static bool IsBlank([NotNullWhen(false)] string? text)
@@ -222,6 +325,151 @@ public static class ProblemDetailsSetup
         if (key is string field && value is IEnumerable<string> fieldMessages)
         {
             messages[field] = fieldMessages.Where(static message => message is not null).ToArray();
+        }
+    }
+
+    // A new model state that holds only error keys and fixed messages, as CreateInvalidModelStateResponse describes.
+    // The source's own error limit already bounds the copy, so the copy sets none: a limit would add an error of its
+    // own once reached.
+    private static ModelStateDictionary SanitizeModelState(ActionContext context)
+    {
+        // Model state keys ignore letter case, so the copy merges keys the same way.
+        Dictionary<string, List<string>> fields = new(StringComparer.OrdinalIgnoreCase);
+
+        // MVC binds at most one parameter from the body.
+        ParameterDescriptor? body = context.ActionDescriptor.Parameters.FirstOrDefault(
+            static parameter => parameter.BindingInfo?.BindingSource == BindingSource.Body);
+        string? bodyModelName = body is null ? null : body.BindingInfo?.BinderModelName ?? body.Name;
+        string[]? memberNames = null;
+        StringComparison memberComparison = StringComparison.Ordinal;
+        bool droppedBodyModelError = false;
+
+        foreach (KeyValuePair<string, ModelStateEntry> entry in context.ModelState)
+        {
+            ModelErrorCollection errors = entry.Value.Errors;
+            if (errors.Count == 0)
+            {
+                continue;
+            }
+
+            string key = entry.Key;
+            if (body is null)
+            {
+                AddModelErrorMessages(fields, key, errors, InvalidValueMessage);
+            }
+            else if (string.Equals(key, bodyModelName, StringComparison.OrdinalIgnoreCase))
+            {
+                droppedBodyModelError = true;
+            }
+            else if (key.Length == 0)
+            {
+                AddModelErrorMessages(fields, JsonRootPath, errors, InvalidBodyMessage);
+            }
+            else if (key.StartsWith(JsonRootPath, StringComparison.Ordinal))
+            {
+                if (memberNames is null)
+                {
+                    (memberNames, memberComparison) = ReadBodyMemberNames(context.HttpContext, body);
+                }
+
+                string path = ToContractPath(key, memberNames, memberComparison);
+                AddMessage(fields, path, path == JsonRootPath ? InvalidBodyMessage : InvalidJsonMemberMessage);
+            }
+            else
+            {
+                AddModelErrorMessages(fields, key, errors, InvalidValueMessage);
+            }
+        }
+
+        if (fields.Count == 0 && droppedBodyModelError)
+        {
+            AddMessage(fields, JsonRootPath, InvalidBodyMessage);
+        }
+
+        ModelStateDictionary sanitized = new(int.MaxValue);
+        foreach (KeyValuePair<string, List<string>> field in fields)
+        {
+            foreach (string message in field.Value)
+            {
+                sanitized.AddModelError(field.Key, message);
+            }
+        }
+
+        return sanitized;
+    }
+
+    // The serialized names of the body type's members under the JSON input formatter's serializer options, and the
+    // comparison its serializer uses to match a payload's member names with them.
+    private static (string[] Names, StringComparison Comparison) ReadBodyMemberNames(
+        HttpContext httpContext,
+        ParameterDescriptor body)
+    {
+        JsonSerializerOptions serializerOptions = httpContext.RequestServices
+            .GetRequiredService<IOptions<JsonOptions>>()
+            .Value
+            .JsonSerializerOptions;
+        StringComparison comparison = serializerOptions.PropertyNameCaseInsensitive
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+
+        try
+        {
+            JsonTypeInfo typeInfo = serializerOptions.GetTypeInfo(body.ParameterType);
+            return ([.. typeInfo.Properties.Select(static property => property.Name)], comparison);
+        }
+        catch (NotSupportedException)
+        {
+            // A type the serializer cannot describe has no member a path could name, so every path is the root.
+            return ([], comparison);
+        }
+    }
+
+    // $ itself, or $. followed by exactly one member name of the body type, written as the contract writes it. The
+    // serializer matches names without regard to case under the Web defaults, so the payload's spelling must not
+    // reach the key. Every other path becomes the root.
+    private static string ToContractPath(string path, string[] memberNames, StringComparison comparison)
+    {
+        if (path.StartsWith(JsonMemberPathPrefix, StringComparison.Ordinal))
+        {
+            ReadOnlySpan<char> member = path.AsSpan(JsonMemberPathPrefix.Length);
+            foreach (string name in memberNames)
+            {
+                if (member.Equals(name, comparison))
+                {
+                    return JsonMemberPathPrefix + name;
+                }
+            }
+        }
+
+        return JsonRootPath;
+    }
+
+    // Each error's own message, which on these keys is fixed text from a validation attribute or the binding message
+    // provider; an error with no message carries only an exception, which is never read, and gets the fallback.
+    private static void AddModelErrorMessages(
+        Dictionary<string, List<string>> fields,
+        string key,
+        ModelErrorCollection errors,
+        string fallbackMessage)
+    {
+        foreach (ModelError error in errors)
+        {
+            string message = string.IsNullOrWhiteSpace(error.ErrorMessage) ? fallbackMessage : error.ErrorMessage;
+            AddMessage(fields, key, message);
+        }
+    }
+
+    private static void AddMessage(Dictionary<string, List<string>> fields, string key, string message)
+    {
+        if (!fields.TryGetValue(key, out List<string>? messages))
+        {
+            messages = [];
+            fields.Add(key, messages);
+        }
+
+        if (!messages.Contains(message, StringComparer.Ordinal))
+        {
+            messages.Add(message);
         }
     }
 
