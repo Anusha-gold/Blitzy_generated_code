@@ -20,10 +20,35 @@
  * requests do not follow redirects, so a 3xx fails rather than standing in for
  * the direct `GET /api/hotels` response.
  *
+ * The remaining tests cover the two states the served page shows before
+ * Angular starts, which a successful boot passes through unseen. With
+ * `/config.json` held back in a route handler, the static boot-loading message
+ * from `index.html` is on screen and no part of the app shell is; once the
+ * stack's real response is let through, the search page replaces it. One
+ * parameterized test then fails the configuration in each way the SPA must
+ * survive: the request fails, the server answers 500, the body is not JSON,
+ * the configuration names a plain-http API on another host outside
+ * Development, or no answer arrives. The last case runs the page on a paused
+ * clock and moves it across the SPA's configuration deadline, checking that
+ * the page still shows boot-loading one millisecond before it. In every case
+ * the exact boot-error alert replaces boot-loading, Angular renders nothing,
+ * the browser sends nothing to the API or to the rejected host, and the app
+ * writes nothing to the console. The global stylesheet is blocked throughout,
+ * so the alert's colour, weight and padding must come from the host page
+ * itself.
+ *
  * API requests use absolute URLs from `apiUrl()`, because the configured
  * `baseURL` is the web origin.
  */
-import { test, expect, request, type APIRequestContext, type APIResponse } from '@playwright/test';
+import {
+  test,
+  expect,
+  request,
+  type APIRequestContext,
+  type APIResponse,
+  type Page,
+  type Route,
+} from '@playwright/test';
 
 import { apiUrl, utcDates } from './support/helpers';
 
@@ -72,6 +97,172 @@ const THRESHOLD_MS = 1_000;
 
 /** Request options that return a redirect as-is, so only the direct response is checked and timed. */
 const NO_REDIRECTS = { maxRedirects: 0 } as const;
+
+/** The exact text of the static boot-loading element in `src/index.html`. */
+const BOOT_LOADING_TEXT = 'Loading SmartHotel…';
+
+/** The exact text of the boot-error alert `src/main.ts` shows. */
+const BOOT_ERROR_TEXT =
+  'SmartHotel could not start: its configuration is unavailable. Reload to try again.';
+
+/**
+ * How long the SPA waits for `/config.json` before it shows the boot-error
+ * alert: `CONFIG_DEADLINE_MS` in `src/app/core/config/runtime-config.ts`,
+ * repeated here because that module imports Angular, which the test runner
+ * cannot load.
+ */
+const CONFIG_DEADLINE_MS = 10_000;
+
+/** The host the rejected configuration names; the browser must never contact it. */
+const REJECTED_API_HOST = 'evil.example.com';
+
+/**
+ * The computed style the host page's inline rules give the boot-error alert:
+ * the error colour token `#b00020`, weight 600 and 1rem of padding.
+ */
+const BOOT_ERROR_STYLE: ReadonlyArray<readonly [string, string]> = [
+  ['color', 'rgb(176, 0, 32)'],
+  ['font-weight', '600'],
+  ['padding-top', '16px'],
+];
+
+/**
+ * Where the never-answered case installs the page clock, before the page
+ * loads. An installed clock runs in real time until it is paused at
+ * {@link CLOCK_PAUSED_AT} by a separate call, so from the page's first script
+ * on no timer fires until the test moves it.
+ */
+const CLOCK_INSTALLED_AT = new Date('2026-06-01T08:00:00Z');
+
+/**
+ * Where the never-answered case pauses the page clock: a day after
+ * {@link CLOCK_INSTALLED_AT}. A clock cannot be paused at a time it has
+ * already passed, and the installed clock keeps running in real time until
+ * the pause call reaches the browser, so the gap is far longer than the whole
+ * test may take: however long scheduling delays that call, the target is
+ * still ahead. Both calls happen before the page loads, so no page timer
+ * exists to fire across the jump.
+ */
+const CLOCK_PAUSED_AT = new Date('2026-06-02T08:00:00Z');
+
+/** Matches the SPA's request for its runtime configuration. */
+function isConfigRequest(url: URL): boolean {
+  return url.pathname === '/config.json';
+}
+
+/** Matches the build's global stylesheet, `styles-<hash>.css`. */
+function isGlobalStylesheet(url: URL): boolean {
+  return /^\/styles-[A-Z0-9]+\.css$/.test(url.pathname);
+}
+
+/** A configuration the SPA accepts for the target stack, as a JSON document. */
+function acceptedConfigBody(): string {
+  return JSON.stringify({ apiBaseUrl: apiUrl(), environment: 'Development' });
+}
+
+/** The hold a route handler keeps on the page's `/config.json` request. */
+interface ConfigGate {
+  /** Settles once the request has reached the route handler. */
+  reached: Promise<void>;
+  /** Lets the held request go on to its answer; calling it again changes nothing. */
+  release(): void;
+}
+
+/**
+ * Holds every `/config.json` request of `page` in a route handler until the
+ * returned gate is released, and then answers it with `answer`. The test
+ * releases the gate and unroutes in cleanup, so no request stays held.
+ */
+async function holdConfigRequest(page: Page, answer: (route: Route) => Promise<void>): Promise<ConfigGate> {
+  let markReached = (): void => undefined;
+  let release = (): void => undefined;
+  const reached = new Promise<void>((resolve) => {
+    markReached = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(isConfigRequest, async (route) => {
+    markReached();
+    await released;
+    await answer(route);
+  });
+  return { reached, release };
+}
+
+/** Asserts that Angular has rendered no part of the app shell. */
+async function expectNoShell(page: Page): Promise<void> {
+  await expect(page.locator('app-nav-bar')).toHaveCount(0);
+  await expect(page.locator('main')).toHaveCount(0);
+}
+
+/**
+ * Records, from now on, every console message and uncaught error of `page`,
+ * and returns the list it fills. Chromium's own "Failed to load resource"
+ * notice for the configuration or the stylesheet, the requests a test fails
+ * on purpose, is left out: the browser writes it, not the app, and it names
+ * the failed request's URL as its location.
+ */
+function recordAppConsole(page: Page): string[] {
+  const output: string[] = [];
+  page.on('console', (message) => {
+    const location = new URL(message.location().url || 'about:blank');
+    const failedOnPurpose = isConfigRequest(location) || isGlobalStylesheet(location);
+    if (failedOnPurpose && message.text().startsWith('Failed to load resource:')) {
+      return;
+    }
+    output.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on('pageerror', (error) => {
+    output.push(`uncaught: ${error.message}`);
+  });
+  return output;
+}
+
+/** One way `/config.json` can fail, and how the test makes it fail. */
+interface ConfigFailure {
+  /** The failure, as the test name states it. */
+  name: string;
+  /**
+   * Answers the `/config.json` request with the failure. Absent when the
+   * request is never answered: the test then moves the page clock across the
+   * configuration deadline, and only cleanup aborts the held request.
+   */
+  answer?: (route: Route) => Promise<void>;
+}
+
+/** Every configuration failure the SPA must turn into the boot-error state. */
+const CONFIG_FAILURES: readonly ConfigFailure[] = [
+  {
+    name: 'the /config.json request fails',
+    answer: (route) => route.abort('failed'),
+  },
+  {
+    // The body is a configuration the SPA would accept, so only the status
+    // can reject it.
+    name: '/config.json answers HTTP 500',
+    answer: (route) =>
+      route.fulfill({ status: 500, contentType: 'application/json', body: acceptedConfigBody() }),
+  },
+  {
+    // An accepted configuration cut short before its closing brace.
+    name: '/config.json is not valid JSON',
+    answer: (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: acceptedConfigBody().slice(0, -1) }),
+  },
+  {
+    name: '/config.json names a plain-http API on another host outside Development',
+    answer: (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ apiBaseUrl: `http://${REJECTED_API_HOST}/api`, environment: 'Production' }),
+      }),
+  },
+  {
+    name: '/config.json does not answer within the configuration deadline',
+  },
+];
 
 /** Builds an absolute API URL with `query` encoded, so `New York` is safe. */
 function apiQueryUrl(path: string, query: Record<string, string>): string {
@@ -202,3 +393,102 @@ test('hotel search p95 within 1 second with 20 concurrent users', async () => {
     await Promise.all(contexts.map((ctx) => ctx.dispose()));
   }
 });
+
+test('boot-loading shows while /config.json is pending and the search page replaces it once the configuration arrives', async ({
+  page,
+}) => {
+  const config = await holdConfigRequest(page, (route) => route.continue());
+  try {
+    await page.goto('/search');
+    await config.reached;
+
+    const bootLoading = page.getByTestId('boot-loading');
+    await expect(bootLoading).toBeVisible();
+    await expect(bootLoading).toHaveText(BOOT_LOADING_TEXT);
+    await expect(page.getByTestId('boot-error')).toHaveCount(0);
+    await expectNoShell(page);
+    await expect(page.locator('app-root')).not.toHaveAttribute('ng-version');
+
+    // The stack's own server answers the released request.
+    config.release();
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel', exact: true })).toBeVisible();
+    await expect(bootLoading).toHaveCount(0);
+    await expect(page.getByTestId('boot-error')).toHaveCount(0);
+    await expect(page.locator('app-root')).toHaveAttribute('ng-version', /^\d+\./);
+    await expect(page).toHaveURL(/\/search$/);
+  } finally {
+    config.release();
+    await page.unrouteAll({ behavior: 'wait' });
+  }
+});
+
+for (const failure of CONFIG_FAILURES) {
+  test(`when ${failure.name}, the boot-error alert replaces boot-loading, styled by the host page alone, with no shell, API request or app console output`, async ({
+    page,
+  }) => {
+    const apiOrigin = new URL(apiUrl()).origin;
+    const forbiddenRequests: string[] = [];
+    page.on('request', (sent) => {
+      const url = new URL(sent.url());
+      if (url.origin === apiOrigin || url.hostname === REJECTED_API_HOST) {
+        forbiddenRequests.push(`${sent.method()} ${url.origin}${url.pathname}`);
+      }
+    });
+    const appConsole = recordAppConsole(page);
+
+    // The global stylesheet never arrives, so the alert's style can come only
+    // from the host page.
+    let blockedStylesheets = 0;
+    await page.route(isGlobalStylesheet, (route) => {
+      blockedStylesheets += 1;
+      return route.abort();
+    });
+
+    const { answer } = failure;
+    if (answer === undefined) {
+      await page.clock.install({ time: CLOCK_INSTALLED_AT });
+      await page.clock.pauseAt(CLOCK_PAUSED_AT);
+    }
+    const config = await holdConfigRequest(page, answer ?? ((route) => route.abort()));
+    try {
+      if (answer !== undefined) {
+        config.release();
+      }
+      await page.goto('/search');
+      await config.reached;
+
+      if (answer === undefined) {
+        // The request is held and the clock is paused, so only the deadline
+        // can end the wait: one millisecond short of it the page still shows
+        // boot-loading, and the last millisecond aborts the request.
+        const bootLoading = page.getByTestId('boot-loading');
+        await expect(bootLoading).toBeVisible();
+        await expect(bootLoading).toHaveText(BOOT_LOADING_TEXT);
+        await page.clock.runFor(CONFIG_DEADLINE_MS - 1);
+        await expect(bootLoading).toBeVisible();
+        await expect(page.getByTestId('boot-error')).toHaveCount(0);
+        await page.clock.runFor(1);
+      }
+
+      const alert = page.locator('[data-testid="boot-error"]');
+      await expect(alert).toHaveCount(1);
+      await expect(alert).toBeVisible();
+      await expect(alert).toHaveAttribute('role', 'alert');
+      await expect(alert).toHaveText(BOOT_ERROR_TEXT);
+      await expect(page.getByRole('alert')).toHaveCount(1);
+      for (const [property, value] of BOOT_ERROR_STYLE) {
+        await expect(alert).toHaveCSS(property, value);
+      }
+      expect(blockedStylesheets, 'global stylesheet requests blocked').toBeGreaterThan(0);
+
+      await expect(page.getByTestId('boot-loading')).toHaveCount(0);
+      await expectNoShell(page);
+      await expect(page.locator('app-root')).not.toHaveAttribute('ng-version');
+      expect(forbiddenRequests, 'requests to the API or the rejected host').toEqual([]);
+      expect(appConsole, 'app console output').toEqual([]);
+    } finally {
+      config.release();
+      await page.unrouteAll({ behavior: 'wait' });
+    }
+  });
+}

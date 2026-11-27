@@ -21,7 +21,8 @@ nav {
   padding-inline: 1rem;
 }
 
-/* Block padding gives each link a 44px-tall target. */
+/* Block padding around one line of text gives each link a target about
+   2.75rem tall at the body font size, and it scales with the text. */
 nav a {
   padding-block: 0.625rem;
   font-weight: 600;
@@ -71,7 +72,6 @@ nav .current:active {
    outranks its hover and press. */
 .account button {
   flex: none;
-  min-block-size: 2.75rem;
   padding-block: 0.25rem;
   padding-inline: 0.75rem;
   border-color: var(--sh-color-control-border);

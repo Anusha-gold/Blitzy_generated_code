@@ -38,6 +38,19 @@
  * they stayed on, without the app sending any API request, and focus left on
  * "Log out" must move to the "Log in" link that replaces it.
  *
+ * Request deadline: a login or registration the API never answers must end,
+ * once the faked clock passes the 30-second deadline, in the inline "The
+ * service is unreachable." with the loading indicator hidden and the submit
+ * button enabled again.
+ *
+ * Unusable success bodies: a 200 the page cannot read (a login body whose
+ * token is not a compact signed JWT or whose expiry is not a real UTC
+ * instant, a search body that is not a list of results or holds an id beyond
+ * the API's 32-bit integers, a detail body missing its fields or holding a
+ * date that is not a real calendar date) must show "The service sent an
+ * unexpected response." inline. The guest stays signed out on the login page,
+ * and no hotel renders.
+ *
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory.
  */
@@ -148,6 +161,103 @@ const RAW_CRITERIA_CASES: readonly RawCriteriaCase[] = [
  * each. The API's `{id:int}` route matches none of them.
  */
 const NON_INTEGER_HOTEL_IDS: readonly string[] = ['1.0', 'abc'];
+
+/** The inline title for a request that got no response, its deadline included. */
+const UNREACHABLE_TITLE = 'The service is unreachable.';
+
+/** The inline title for a 2xx response whose body the page cannot use. */
+const UNEXPECTED_RESPONSE_TITLE = 'The service sent an unexpected response.';
+
+/** A form whose POST the API never answers, so only the request deadline ends the wait. */
+interface DeadlineCase {
+  /** The page's route and the prefix of its form's test ids. */
+  form: 'login' | 'register';
+  /** The endpoint the form posts to. */
+  isEndpoint: (url: URL) => boolean;
+  /** Fills every field of the form, waiting for no outcome. */
+  fill: (page: Page) => Promise<void>;
+}
+
+/** The forms of the request-deadline test, one test each. */
+const DEADLINE_CASES: readonly DeadlineCase[] = [
+  {
+    form: 'login',
+    isEndpoint: isLoginApi,
+    fill: async (page) => {
+      await fillBound(page, 'login-email', uniqueEmail());
+      await fillBound(page, 'login-password', TEST_PASSWORD);
+    },
+  },
+  {
+    form: 'register',
+    isEndpoint: isRegisterApi,
+    fill: async (page) => {
+      await fillBound(page, 'register-email', uniqueEmail());
+      await fillBound(page, 'register-password', TEST_PASSWORD);
+      await fillBound(page, 'register-full-name', 'States Guest');
+    },
+  },
+];
+
+/** A 200 body the page cannot use, stubbed in place of the API's answer. */
+interface UnusableBodyCase {
+  /** What the body holds, for the test title. */
+  title: string;
+  /** The JSON text of the 200 body. */
+  body: string;
+}
+
+/** Login 200 bodies that carry no usable session, one test each. */
+const UNUSABLE_LOGIN_BODIES: readonly UnusableBodyCase[] = [
+  { title: 'a null body', body: 'null' },
+  { title: 'a blank token and an unparseable expiry', body: '{"token":"","expiresAt":"x"}' },
+  {
+    title: 'a token that is not a JWT',
+    body: '{"token":"not-a-jwt","expiresAt":"2099-01-01T00:00:00Z"}',
+  },
+  {
+    title: 'a JWT-shaped token and an expiry on 30 February',
+    body: '{"token":"header.payload.signature","expiresAt":"2099-02-30T00:00:00Z"}',
+  },
+];
+
+/** A deep link whose page receives a 200 body it cannot render. */
+interface UnusableReadCase extends UnusableBodyCase {
+  /** The page URL; `{stay}` stands for a valid `checkIn=…&checkOut=…` query. */
+  url: string;
+  /** The path of the page's `GET`, the hotel id included. */
+  apiPath: string;
+}
+
+/** The deep links of the unusable-read test, one test each. */
+const UNUSABLE_READ_CASES: readonly UnusableReadCase[] = [
+  {
+    title: 'a search answered with {}',
+    url: '/search?city=Seattle&{stay}',
+    apiPath: '/api/hotels',
+    body: '{}',
+  },
+  {
+    title: 'a hotel detail answered with {"id":1}',
+    url: '/hotels/1?{stay}',
+    apiPath: '/api/hotels/1',
+    body: '{"id":1}',
+  },
+  {
+    title: 'a search answered with a result id beyond the 32-bit range',
+    url: '/search?city=Seattle&{stay}',
+    apiPath: '/api/hotels',
+    body: '[{"id":2147483648,"name":"X","city":"Seattle","address":"Y","lowestNightlyPrice":100}]',
+  },
+  {
+    title: 'a hotel detail answered with checkIn 2099-02-30',
+    url: '/hotels/1?{stay}',
+    apiPath: '/api/hotels/1',
+    body:
+      '{"id":1,"name":"X","city":"Seattle","address":"Y","description":"Z",' +
+      '"checkIn":"2099-02-30","checkOut":"2099-03-02","nights":2,"guests":1,"roomTypes":[]}',
+  },
+];
 
 /**
  * Guest counts typed into the search form that only the server can judge, one
@@ -626,6 +736,81 @@ test('wrong password shows an inline 401', async ({ page }) => {
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
   });
 });
+
+for (const c of DEADLINE_CASES) {
+  test(`a ${c.form} the API never answers ends at the deadline as unreachable`, async ({ page }) => {
+    // Installed before the app loads, so the request deadline's timer runs on
+    // a clock the test can move past the 30 seconds.
+    await page.clock.install();
+    await page.route(c.isEndpoint, () => {
+      // Never fulfilled, continued or aborted: the POST stays pending as if
+      // the API had stopped answering.
+    });
+
+    await page.goto(`/${c.form}`);
+    await c.fill(page);
+    const submit = page.getByTestId(`${c.form}-submit`);
+    const indicator = page.getByTestId('loading-indicator');
+
+    await test.step('submit, and the request stays pending', async () => {
+      const sent = page.waitForRequest((r) => c.isEndpoint(new URL(r.url())) && r.method() === 'POST');
+      await submit.click();
+      await sent;
+      await expect(indicator).toBeVisible();
+      await expect(submit).toBeDisabled();
+    });
+
+    await test.step('past the deadline the wait ends with the error inline', async () => {
+      await page.clock.fastForward('00:31');
+      await expect(page.getByTestId('inline-error')).toContainText(UNREACHABLE_TITLE);
+      await expect(indicator).toBeHidden();
+      await expect(submit).toBeEnabled();
+      await expect(page).toHaveURL(new RegExp(`/${c.form}$`));
+    });
+  });
+}
+
+for (const c of UNUSABLE_LOGIN_BODIES) {
+  test(`a login 200 with ${c.title} shows inline and signs nobody in`, async ({ page }) => {
+    await page.route(isLoginApi, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: c.body }),
+    );
+
+    await page.goto('/login');
+    await fillBound(page, 'login-email', uniqueEmail());
+    await fillBound(page, 'login-password', TEST_PASSWORD);
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('login-submit').click();
+    expect((await login).status()).toBe(200);
+
+    await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+    await expect(page).toHaveURL(/\/login$/);
+    await expect(page.getByTestId('nav-login')).toHaveText('Log in');
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+}
+
+for (const c of UNUSABLE_READ_CASES) {
+  test(`${c.title} shows inline and renders no hotel`, async ({ page }) => {
+    await page.route(
+      (url) => url.pathname === c.apiPath,
+      (route) => route.fulfill({ status: 200, contentType: 'application/json', body: c.body }),
+    );
+
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const read = page.waitForResponse(
+      (r) => new URL(r.url()).pathname === c.apiPath && r.request().method() === 'GET',
+    );
+    await page.goto(c.url.replace('{stay}', `checkIn=${checkIn}&checkOut=${checkOut}`));
+    expect((await read).status()).toBe(200);
+
+    await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+    await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="hotel-name"]`)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+  });
+}
 
 test('opening My bookings while signed out redirects to login', async ({ page }) => {
   await page.goto('/search');

@@ -27,8 +27,8 @@ const BOOT_ERROR_MESSAGE =
  *
  * The alert is built with DOM APIs and `textContent` only, never parsed HTML.
  * It stays a direct child of `<app-root>` where that element exists, which is
- * where the global styles expect pre-bootstrap messages. Calling it again
- * changes nothing.
+ * where the host page's inline styles in `index.html` expect pre-bootstrap
+ * messages. Calling it again changes nothing.
  */
 function showBootError(): void {
   if (document.querySelector('[data-testid="boot-error"]')) {

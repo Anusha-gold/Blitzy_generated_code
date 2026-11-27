@@ -7,6 +7,11 @@
  * interceptors (the loading counter and bearer-token attachment) must never
  * handle `/config.json`.
  *
+ * Deadline: the request and the reading of its body are bounded together by
+ * {@link CONFIG_DEADLINE_MS}. A response that stalls before its headers, or
+ * after them while its body is still arriving, is aborted at the deadline, so
+ * the SPA reaches its boot-error state instead of loading forever.
+ *
  * Transport rule: the API base URL must use `https` in every environment.
  * Plain `http` is accepted only for `localhost` or `127.0.0.1`, and only when
  * `/config.json` declares `environment` exactly `Development`, which is how the
@@ -17,6 +22,15 @@
 import { InjectionToken } from '@angular/core';
 
 const API_PATH = '/api';
+
+/**
+ * How long, in milliseconds, {@link loadRuntimeConfig} waits for `/config.json`
+ * before it gives up: 10 seconds, from the request until its body has been
+ * read in full. The document is a few dozen bytes served by the web server
+ * that served the page, so only a server or network that has stopped
+ * answering reaches it.
+ */
+export const CONFIG_DEADLINE_MS = 10_000;
 
 /** The validated API boundary the SPA calls and attaches bearer tokens to. */
 export interface ApiConfig {
@@ -124,22 +138,44 @@ export function parseRuntimeConfig(raw: unknown): ApiConfig {
  * Fetches `/config.json`, bypassing the HTTP cache, and validates it with
  * {@link parseRuntimeConfig}.
  *
- * The promise rejects on a network failure, a non-2xx status, a body that is
- * not valid JSON, or a configuration the validation rejects. A network failure
- * propagates unchanged; the other rejections carry messages that name the
- * failed check and never quote the response body. `main.ts` turns any
- * rejection into the boot-error state and does not bootstrap Angular.
+ * The promise rejects on a network failure, a non-2xx status, a response whose
+ * headers or body have not fully arrived within {@link CONFIG_DEADLINE_MS}, a
+ * body that is not valid JSON, or a configuration the validation rejects. A
+ * network failure propagates unchanged; the other rejections carry messages
+ * that name the failed check, or the deadline, and never quote the response
+ * body. `main.ts` turns any rejection into the boot-error state and does not
+ * bootstrap Angular.
  *
  * @returns The validated API configuration.
  */
 export async function loadRuntimeConfig(): Promise<ApiConfig> {
-  const response = await fetch('/config.json', { cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(`Runtime configuration request failed with HTTP status ${response.status}.`);
+  // One signal bounds the whole exchange: aborting it rejects a pending
+  // request and also errors a body that is still being read. A plain timer
+  // arms it, rather than `AbortSignal.timeout`, so it is cleared as soon as
+  // the body is in and runs on the page's own timer clock.
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), CONFIG_DEADLINE_MS);
+  let text: string;
+  try {
+    const response = await fetch('/config.json', { cache: 'no-store', signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Runtime configuration request failed with HTTP status ${response.status}.`);
+    }
+    // The body is read before it is decoded, so a failure while reading it
+    // propagates unchanged instead of being reported as invalid JSON.
+    text = await response.text();
+  } catch (error) {
+    // Only the deadline aborts the signal, so an aborted signal means the
+    // failure is the deadline's, whatever error the browser raised for it.
+    if (controller.signal.aborted) {
+      throw new Error(
+        `Runtime configuration was not received within the ${CONFIG_DEADLINE_MS} ms deadline.`,
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(deadline);
   }
-  // The body is read before it is decoded, so a failure while reading it
-  // propagates unchanged instead of being reported as invalid JSON.
-  const text = await response.text();
   let body: unknown;
   try {
     body = JSON.parse(text);

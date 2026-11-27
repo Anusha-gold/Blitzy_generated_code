@@ -1,25 +1,24 @@
 /* Hotel detail page: the hotel facts and the room table. The table's width,
    collapsed borders, cell padding, row rules and start-aligned headers, the
-   disabled button and the :focus-visible outline are the global defaults in
-   src/styles.css, so they are not repeated here. */
+   buttons' 2.75rem minimum height, the disabled button, the in-content link
+   sizing ("Log in again" and the late-booking notice's links) and the
+   :focus-visible outline are the global defaults in src/styles.css, so they
+   are not repeated here. */
 :host {
   display: block;
 }
 
-/* The flex gap, not heading or paragraph margins, spaces the facts. */
+/* Each fact's 0.5rem top margin spaces the facts; below the heading it
+   collapses into the heading's larger global bottom margin, so the city sits
+   0.75rem under it, as content does on every screen. flow-root keeps the
+   heading's top margin inside the header. */
 .hotel-header {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
+  display: flow-root;
   margin-block-end: 1.5rem;
 }
 
-.hotel-header h1 {
-  margin-block-end: 0;
-}
-
 .hotel-header p {
-  margin-block: 0;
+  margin-block: 0.5rem 0;
 }
 
 /* Muted text on white is 6.4:1. */
@@ -49,11 +48,6 @@
   text-align: end;
 }
 
-/* A 44px touch target. */
-.actions button {
-  min-block-size: 2.75rem;
-}
-
 /* The notice for a booking answered after the page moved to another view. */
 .late-booking {
   margin-block-end: 1.5rem;
@@ -64,13 +58,4 @@
 
 .late-booking p {
   margin-block: 0;
-}
-
-/* The page's links ("Log in again" in an inline error, and the late-booking
-   notice's links): block padding gives each a 44px-tall target. */
-a {
-  display: inline-block;
-  padding-block: 0.625rem;
-  font-weight: 600;
-  text-underline-offset: 0.2em;
 }

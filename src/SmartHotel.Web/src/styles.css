@@ -67,6 +67,16 @@ a {
   color: var(--sh-color-accent);
 }
 
+/* In-content links. Block padding around one line of body text gives a target
+   about 2.75rem tall at the body font size, and it scales with the text. The
+   nav bar sits outside main and sizes its own links. */
+main a {
+  display: inline-block;
+  padding-block: 0.625rem;
+  font-weight: 600;
+  text-underline-offset: 0.2em;
+}
+
 :focus-visible {
   outline: 2px solid var(--sh-color-accent);
   outline-offset: 2px;
@@ -78,8 +88,11 @@ label {
   margin-block-end: 0.25rem;
 }
 
+/* Every control is at least 2.75rem tall (44px at a 16px root); it grows
+   with its text and with the user's font size. */
 input,
 button {
+  min-block-size: 2.75rem;
   font: inherit;
   border-radius: var(--sh-radius);
 }
@@ -169,15 +182,4 @@ td {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
-}
-
-/* Pre-bootstrap messages from index.html and main.ts, direct children of
-   app-root only; the rendered shell never places a <p> there. */
-app-root > p {
-  padding: 1rem;
-}
-
-app-root > p[role="alert"] {
-  color: var(--sh-color-error);
-  font-weight: 600;
 }

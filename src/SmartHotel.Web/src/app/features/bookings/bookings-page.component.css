@@ -29,8 +29,10 @@
   margin-block: 0;
 }
 
+/* The top margin equals the heading's global bottom margin, so the message
+   sits 0.75rem under the heading, as content does on every screen. */
 .empty {
-  margin-block: 1rem 0;
+  margin-block: 0.75rem 0;
   color: var(--sh-color-text-muted);
 }
 
@@ -80,13 +82,12 @@
   outline-offset: -2px;
 }
 
-/* A 44px target. The focus ring is the global button's, as is Cancel's
-   disabled state; the pager's aria-disabled state is drawn below. The scroll
-   margin makes scrollIntoView and focus scrolling, which stop at the border
-   box, also bring the whole 2px + 2px focus ring into view. */
+/* The 2.75rem minimum height and the focus ring are the global button's, as
+   is Cancel's disabled state; the pager's aria-disabled state is drawn below.
+   The scroll margin makes scrollIntoView and focus scrolling, which stop at
+   the border box, also bring the whole 2px + 2px focus ring into view. */
 .bookings button,
 .pager button {
-  min-block-size: 2.75rem;
   scroll-margin-block: 0.5rem;
 }
 

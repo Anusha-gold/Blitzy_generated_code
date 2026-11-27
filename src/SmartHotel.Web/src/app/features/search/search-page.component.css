@@ -25,12 +25,6 @@ label {
   margin-block-end: 0.125rem;
 }
 
-/* Shared minimum touch target: every control is at least 2.75rem tall (44px at a 16px root). */
-input,
-button {
-  min-block-size: 2.75rem;
-}
-
 /* The list's gap, not item margins, spaces the cards. */
 .results {
   display: flex;
@@ -59,14 +53,6 @@ button {
 .price {
   font-weight: 600;
   color: var(--sh-color-text);
-}
-
-/* Block padding gives the link a 44px-tall target. */
-.results a {
-  display: inline-block;
-  padding-block: 0.625rem;
-  font-weight: 600;
-  text-underline-offset: 0.2em;
 }
 
 /* Muted text on white is 6.4:1. */

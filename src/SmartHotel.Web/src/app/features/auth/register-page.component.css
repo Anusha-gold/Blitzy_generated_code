@@ -5,18 +5,20 @@
   margin-inline: auto;
 }
 
+/* Block flow, so the heading's global bottom margin puts the first content
+   0.75rem below it, as on every screen. flow-root keeps the heading's top
+   margin inside the column. */
 .auth-page {
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-
-h1 {
-  margin-block-end: 0;
+  display: flow-root;
 }
 
 p {
   margin-block: 0;
+}
+
+/* Spaces the "Already registered? Log in" paragraph below the form. */
+form {
+  margin-block-end: 1rem;
 }
 
 .field {
@@ -30,35 +32,10 @@ p {
   margin-block-end: 0;
 }
 
-input,
-button {
-  font: inherit;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--sh-color-control-border);
-  border-radius: var(--sh-radius);
-}
-
+/* Size, padding, border, colours, focus ring and disabled state are the
+   global control defaults in src/styles.css; only the column width is set here. */
 input {
   inline-size: 100%;
-}
-
-button {
-  border-color: var(--sh-color-accent);
-  color: var(--sh-color-on-accent);
-  background-color: var(--sh-color-accent);
-  cursor: pointer;
-}
-
-button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-input:focus-visible,
-button:focus-visible,
-a:focus-visible {
-  outline: 2px solid var(--sh-color-accent);
-  outline-offset: 2px;
 }
 
 /* A field the server rejected: a 2px error-coloured edge, the inset shadow adding the second pixel without a

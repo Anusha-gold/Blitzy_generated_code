@@ -39,7 +39,8 @@ export interface Session {
  * A server 401 that the expiry check cannot predict, such as a token the API
  * rejects before `expiresAt`, is handled in two places:
  * - `authInterceptor` calls {@link AuthService.clearSession} on a 401 from
- *   `/api/bookings` or `/api/bookings/…`, and never navigates;
+ *   `GET /api/bookings`, `POST /api/bookings` or `DELETE /api/bookings/{id}`
+ *   that carried this session's token, and never navigates;
  * - the page that sent the request decides the outcome.
  *   `BookingsPageComponent` answers a 401 on its entry `GET /api/bookings` by
  *   navigating to `/login?returnUrl=%2Fbookings&reason=session-expired`. "Book"
@@ -99,7 +100,10 @@ export class AuthService {
    * the previous session's expiry timer with one for the new `expiresAt`.
    * Errors, such as the 401 for wrong credentials, the 400 for an unbindable
    * body or status 0 when the API is unreachable, pass through unchanged for the
-   * page to show.
+   * page to show. A 200 whose body lacks a `token` in compact signed-JWT form
+   * or an `expiresAt` that is an exact UTC instant arrives as an
+   * `HttpErrorResponse` with that 200 status, from `AuthApiService.login`, and
+   * stores no session.
    *
    * @param email - The email from the login form, sent unchanged. The server
    *   trims and folds its own copy.

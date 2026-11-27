@@ -1,6 +1,6 @@
 using System.Data.Common;
-using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -11,6 +11,8 @@ using Npgsql;
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 using SmartHotel.Data;
 using SmartHotel.Data.Seed;
+
+using Xunit.Sdk;
 
 namespace SmartHotel.Api.IntegrationTests.Data;
 
@@ -41,6 +43,13 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
 
     // Ends the session and waits up to 5 s for it to exit; its next read then fails with SqlState 57P01.
     private const string TerminateSessionSql = "SELECT pg_terminate_backend(@pid, 5000)";
+
+    // What the retry tests' observations can miss, each reported by its assertion or, when cleanup fails as well,
+    // ahead of the cleanup failures.
+    private const string FirstWaiterMissed = "The seed was not observed waiting to insert a hotel.";
+    private const string TerminationMissed = "The waiting seed session was not terminated.";
+    private const string RetryWaiterMissed = "The seed was not observed waiting again on a new session.";
+    private const string HolderWaiterMissed = "The retried seed was not observed waiting for the held transaction.";
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan ObservationLimit = TimeSpan.FromSeconds(15);
@@ -217,10 +226,12 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
             Assert.InRange(number % FloorNumberMultiplier, 1, RoomsPerType);
         });
 
-        // IX_Rooms_HotelId_RoomNumber: no room number repeats within a hotel.
+        // The seed satisfies IX_Rooms_HotelId_RoomNumber: no room number repeats within a hotel. BookingConstraintTests
+        // proves that the database enforces the index.
         Assert.Equal(200, rooms.Select(static room => (room.HotelId, room.RoomNumber)).Distinct().Count());
 
-        // The denormalized hotel id always equals the room type's hotel (FK_Rooms_RoomTypes_RoomTypeId_HotelId).
+        // The seed satisfies FK_Rooms_RoomTypes_RoomTypeId_HotelId: every room's denormalized hotel id equals its room
+        // type's hotel. BookingConstraintTests proves that the database enforces the key.
         Assert.All(rooms, static room => Assert.Equal(room.RoomTypeHotelId, room.HotelId));
     }
 
@@ -265,11 +276,19 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
         string connectionString = _postgres.CreateDatabaseConnectionString(
             TestDatabasePrefix + Guid.NewGuid().ToString("N"));
         await _postgres.CreateDatabaseAsync(connectionString, ct);
+
+        // The body's failure and each teardown step's, in the order they occur, thrown only once the database is
+        // dropped. Each resource is disposed as a step of its own, so one that fails to close is recorded rather than
+        // replacing the body's failure.
+        List<Exception> failures = [];
+        ServiceProvider? services = null;
+        NpgsqlConnection? holder = null;
+        NpgsqlTransaction? holderTx = null;
         try
         {
 
             // The data layer's own registration, so the seed runs under the execution strategy the API uses.
-            await using ServiceProvider services = new ServiceCollection()
+            services = new ServiceCollection()
                 .AddSmartHotelData(_ => connectionString)
                 .BuildServiceProvider();
             await using (AsyncServiceScope scope = services.CreateAsyncScope())
@@ -282,47 +301,90 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
 
             // The holder's lock blocks the seed's first insert inside the transaction the seed has begun, which is
             // where its session is then ended.
-            await using NpgsqlConnection holder = new(unpooled);
+            holder = new(unpooled);
             await holder.OpenAsync(ct);
-            await using NpgsqlTransaction holderTx = await holder.BeginTransactionAsync(ct);
+            holderTx = await holder.BeginTransactionAsync(ct);
             await using (NpgsqlCommand lockHotels = new(LockHotelsSql, holder, holderTx))
             {
                 await lockHotels.ExecuteNonQueryAsync(ct);
             }
 
-            Task<bool> seed = SeedInNewScopeAsync(services, ct);
+            // The seed's own token: the test's cancellation reaches it, and so does the drain's, which must not cancel
+            // the test's other work.
+            using CancellationTokenSource seedCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task<bool> seed = SeedInNewScopeAsync(services, seedCancellation.Token);
 
+            // One deadline covers the whole observation: opening the observer, every poll and every pause, and the
+            // termination.
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(ObservationLimit);
+            NpgsqlConnection observer = new(unpooled);
+            List<Exception> scenarioFailures = [];
             int? firstWaiter = null;
             bool terminated = false;
             int? retryWaiter = null;
-            bool inserted;
+            bool? inserted;
             try
             {
-                await using NpgsqlConnection observer = new(unpooled);
-                await observer.OpenAsync(ct);
+                await observer.OpenAsync(deadline.Token);
 
-                firstWaiter = await WaitForInsertWaiterAsync(observer, holder.ProcessID, excludedPid: 0, seed, ct);
+                firstWaiter = await WaitForInsertWaiterAsync(
+                    observer,
+                    holder.ProcessID,
+                    excludedPid: 0,
+                    seed,
+                    deadline.Token);
                 if (firstWaiter is int waiterPid)
                 {
                     await using NpgsqlCommand terminate = new(TerminateSessionSql, observer);
                     terminate.Parameters.AddWithValue("pid", waiterPid);
-                    terminated = (bool)(await terminate.ExecuteScalarAsync(ct))!;
+                    terminated = (bool)(await terminate.ExecuteScalarAsync(deadline.Token))!;
 
                     // A retry runs the whole unit again on a new session, which queues behind the holder once more.
-                    retryWaiter = await WaitForInsertWaiterAsync(observer, holder.ProcessID, waiterPid, seed, ct);
+                    retryWaiter = await WaitForInsertWaiterAsync(
+                        observer,
+                        holder.ProcessID,
+                        waiterPid,
+                        seed,
+                        deadline.Token);
                 }
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // The deadline passed: what was not seen in time stays unset, and is reported once cleanup has run.
+            }
+            catch (Exception exception)
+            {
+                // Kept, and rethrown only once the lock is released and the seed is drained.
+                scenarioFailures.Add(exception);
             }
             finally
             {
-                // Runs on every path. The holder changed nothing, so the rollback only releases the lock; the seed is
-                // then drained, so none is left running into the database drop.
-                await holderTx.RollbackAsync(CancellationToken.None);
-                inserted = await seed.WaitAsync(DrainLimit, ct);
+                // Runs on every path, and no step throws, so each runs whatever the ones before it did. The holder
+                // changed nothing, so the rollback only releases the lock; the seed is then drained, and cancelled
+                // first when the observation failed, so none is left running into the database drop. Last, what the
+                // observation missed is recorded ahead of any cleanup failure, which would otherwise be thrown alone.
+                bool observationFailed = scenarioFailures.Count > 0;
+                await DisposeRecordedAsync(observer, scenarioFailures);
+                await EndHolderTransactionAsync(holder, holderTx, commit: false, scenarioFailures);
+                inserted = await DrainSeedAsync(
+                    seed,
+                    seedCancellation,
+                    cancelFirst: observationFailed,
+                    scenarioFailures);
+                RecordMissedObservation(
+                    scenarioFailures,
+                    observationFailed,
+                    (firstWaiter is not null, FirstWaiterMissed),
+                    (terminated, TerminationMissed),
+                    (retryWaiter is not null, RetryWaiterMissed));
             }
 
-            Assert.True(firstWaiter is not null, "The seed was not observed waiting to insert a hotel.");
-            Assert.True(terminated, "The waiting seed session was not terminated.");
-            Assert.True(retryWaiter is not null, "The seed was not observed waiting again on a new session.");
+            ThrowFailures(scenarioFailures);
+
+            Assert.True(firstWaiter is not null, FirstWaiterMissed);
+            Assert.True(terminated, TerminationMissed);
+            Assert.True(retryWaiter is not null, RetryWaiterMissed);
             Assert.True(inserted, "Expected the retried seed to report that it inserted the catalogue.");
 
             // Exactly one catalogue: the ended attempt's rows rolled back, and its entities did not ride along with the
@@ -341,11 +403,24 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
             Assert.Equal(20, catalogue.RoomTypes.Count);
             Assert.Equal(200, catalogue.Rooms.Count);
         }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
         finally
         {
+            // No step throws, so each runs whatever the ones before it did.
+            await DisposeRecordedAsync(holderTx, failures);
+            await DisposeRecordedAsync(holder, failures);
+            await DisposeRecordedAsync(services, failures);
+
             // Not the test's token: the database must be dropped even when the test run is being cancelled.
-            await _postgres.DropDatabaseAsync(connectionString, CancellationToken.None);
+            await RunRecordedAsync(
+                () => _postgres.DropDatabaseAsync(connectionString, CancellationToken.None),
+                failures);
         }
+
+        ThrowFailures(failures);
     }
 
     [Fact]
@@ -358,6 +433,12 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
         string connectionString = _postgres.CreateDatabaseConnectionString(
             TestDatabasePrefix + Guid.NewGuid().ToString("N"));
         await _postgres.CreateDatabaseAsync(connectionString, ct);
+
+        // The body's failure and each teardown step's, in the order they occur, thrown only once the database is
+        // dropped. The holder is disposed as a step of its own, so a failure to close it is recorded rather than
+        // replacing the body's failure.
+        List<Exception> failures = [];
+        NpgsqlConnection? holder = null;
         try
         {
             // The test's sessions and the seed's bypass the pool, so no session is shared between them.
@@ -377,7 +458,7 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
             // API's retrying strategy, whose interceptor moves the first commit's transaction to the holder session and
             // reports a transient failure. The holder keeps that transaction open, with the uncommitted catalogue,
             // past the check that follows the failure, as a server still completing the commit would.
-            await using NpgsqlConnection holder = new(unpooled);
+            holder = new(unpooled);
             await holder.OpenAsync(ct);
             HoldFirstSeedCommit interceptor = new(holder);
             DbContextOptions<SmartHotelDbContext> options = new DbContextOptionsBuilder<SmartHotelDbContext>()
@@ -387,35 +468,65 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
                 .AddInterceptors(interceptor)
                 .Options;
 
-            Task<bool> seed = SeedOnOwnContextAsync(options, ct);
+            // The seed's own token, which the interceptor's statements on the holder session run under as well: the
+            // test's cancellation reaches it, and so does the drain's, which must not cancel the test's other work.
+            using CancellationTokenSource seedCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task<bool> seed = SeedOnOwnContextAsync(options, seedCancellation.Token);
 
+            // One deadline covers the whole observation: opening the observer, every poll and every pause.
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(ObservationLimit);
+            NpgsqlConnection observer = new(unpooled);
+            List<Exception> scenarioFailures = [];
             int? retryWaiter = null;
-            bool lateCommitted = false;
-            bool inserted;
+            bool lateCommitted;
+            bool? inserted;
             try
             {
-                await using NpgsqlConnection observer = new(unpooled);
-                await observer.OpenAsync(ct);
+                await observer.OpenAsync(deadline.Token);
 
                 // The retry begins only after the check, and it waits behind the held transaction.
-                retryWaiter = await WaitForHolderWaiterAsync(observer, holder.ProcessID, seed, ct);
+                retryWaiter = await WaitForHolderWaiterAsync(observer, holder.ProcessID, seed, deadline.Token);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                // The deadline passed: the retry was not seen in time, which is reported once cleanup has run.
+            }
+            catch (Exception exception)
+            {
+                // Kept, and rethrown only once the held transaction is settled and the seed is drained.
+                scenarioFailures.Add(exception);
             }
             finally
             {
-                // Runs on every path. A commit the server is completing takes effect whatever the client does, so the
-                // held transaction commits; the seed is then drained, so none is left running into the database drop.
-                if (interceptor.HeldTransaction is NpgsqlTransaction held)
+                // Runs on every path, and no step throws, so each runs whatever the ones before it did. A commit the
+                // server is completing takes effect whatever the client does, so the held transaction commits. Once
+                // the interceptor has stopped using the holder session, and unless the observation failed, the commit
+                // comes first and releases any retry waiting behind it, and the seed is then drained. Otherwise the
+                // seed is cancelled, which cancels the interceptor's statements too, and drained before the held
+                // transaction is touched. Either way no seed is left running into the database drop. Last, what the
+                // observation missed is recorded ahead of any cleanup failure, which would otherwise be thrown alone.
+                bool observationFailed = scenarioFailures.Count > 0;
+                bool commitFirst = !observationFailed && interceptor.HolderSessionFree;
+                await DisposeRecordedAsync(observer, scenarioFailures);
+                if (commitFirst)
                 {
-                    await using (held)
-                    {
-                        await held.CommitAsync(CancellationToken.None);
-                    }
-
-                    lateCommitted = true;
+                    lateCommitted = await CommitHeldAsync(holder, interceptor, scenarioFailures);
+                    inserted = await DrainSeedAsync(seed, seedCancellation, cancelFirst: false, scenarioFailures);
+                }
+                else
+                {
+                    inserted = await DrainSeedAsync(seed, seedCancellation, cancelFirst: true, scenarioFailures);
+                    lateCommitted = await CommitHeldAsync(holder, interceptor, scenarioFailures);
                 }
 
-                inserted = await seed.WaitAsync(DrainLimit, ct);
+                RecordMissedObservation(
+                    scenarioFailures,
+                    observationFailed,
+                    (retryWaiter is not null, HolderWaiterMissed));
             }
+
+            ThrowFailures(scenarioFailures);
 
             Assert.True(lateCommitted, "The first commit was not held back.");
             Assert.True(inserted, "Expected the seed to report the catalogue its late commit inserted.");
@@ -432,13 +543,24 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
                 catalogue.Hotels.Select(static hotel => hotel.Name));
             Assert.Equal(20, catalogue.RoomTypes.Count);
             Assert.Equal(200, catalogue.Rooms.Count);
-            Assert.True(retryWaiter is not null, "The retried seed was not observed waiting for the held transaction.");
+            Assert.True(retryWaiter is not null, HolderWaiterMissed);
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
         }
         finally
         {
+            // No step throws, so each runs whatever the ones before it did.
+            await DisposeRecordedAsync(holder, failures);
+
             // Not the test's token: the database must be dropped even when the test run is being cancelled.
-            await _postgres.DropDatabaseAsync(connectionString, CancellationToken.None);
+            await RunRecordedAsync(
+                () => _postgres.DropDatabaseAsync(connectionString, CancellationToken.None),
+                failures);
         }
+
+        ThrowFailures(failures);
     }
 
     private static decimal ExpectedNightlyPrice(ExpectedHotel hotel, ExpectedRoomType type)
@@ -492,7 +614,8 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
     }
 
     // Polls with autocommit statements, so each poll reads a fresh pg_stat_activity snapshot. Returns null when the
-    // seed completes, or the observation limit passes, before a waiter appears.
+    // seed completes before a waiter appears. The token is the caller's observation deadline: it alone ends a search
+    // that finds nothing, by cancelling the poll or the pause in progress.
     private static async Task<int?> WaitForInsertWaiterAsync(
         NpgsqlConnection observer,
         int holderPid,
@@ -504,8 +627,7 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
         findWaiter.Parameters.AddWithValue("holderPid", holderPid);
         findWaiter.Parameters.AddWithValue("excludedPid", excludedPid);
 
-        Stopwatch elapsed = Stopwatch.StartNew();
-        do
+        while (true)
         {
             if (await findWaiter.ExecuteScalarAsync(cancellationToken) is int pid)
             {
@@ -519,9 +641,6 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
 
             await Task.Delay(PollInterval, cancellationToken);
         }
-        while (elapsed.Elapsed < ObservationLimit);
-
-        return null;
     }
 
     // Polls like WaitForInsertWaiterAsync, for a session that waits on a lock the holder's transaction holds.
@@ -534,8 +653,7 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
         await using NpgsqlCommand findWaiter = new(FindHolderWaiterSql, observer);
         findWaiter.Parameters.AddWithValue("holderPid", holderPid);
 
-        Stopwatch elapsed = Stopwatch.StartNew();
-        do
+        while (true)
         {
             if (await findWaiter.ExecuteScalarAsync(cancellationToken) is int pid)
             {
@@ -549,9 +667,6 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
 
             await Task.Delay(PollInterval, cancellationToken);
         }
-        while (elapsed.Elapsed < ObservationLimit);
-
-        return null;
     }
 
     // The seed on a context of its own, which tracks nothing and has no transaction open, under the given options.
@@ -561,6 +676,194 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
     {
         await using SmartHotelDbContext db = new(options);
         return await DbSeeder.SeedAsync(db, cancellationToken);
+    }
+
+    // Commits and disposes the transaction the interceptor holds, if it holds one yet: a commit the server is
+    // completing takes effect whatever the client does. Returns whether it committed. Failures are recorded for the
+    // caller, never thrown.
+    private static async Task<bool> CommitHeldAsync(
+        NpgsqlConnection holder,
+        HoldFirstSeedCommit interceptor,
+        List<Exception> failures)
+    {
+        if (interceptor.HeldTransaction is not NpgsqlTransaction held)
+        {
+            return false;
+        }
+
+        bool committed = await EndHolderTransactionAsync(holder, held, commit: true, failures);
+        await DisposeRecordedAsync(held, failures);
+        return committed;
+    }
+
+    // Commits or rolls back a transaction on the holder session, which releases its locks. Not the test's token: the
+    // locks must be released even while the test is being cancelled. When ending the transaction fails, closing the
+    // holder's connection still ends it. Returns whether it ended as asked. Failures are recorded for the caller, never
+    // thrown.
+    private static async Task<bool> EndHolderTransactionAsync(
+        NpgsqlConnection holder,
+        NpgsqlTransaction transaction,
+        bool commit,
+        List<Exception> failures)
+    {
+        try
+        {
+            if (commit)
+            {
+                await transaction.CommitAsync(CancellationToken.None);
+            }
+            else
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+
+            return true;
+        }
+        catch (Exception endFailure)
+        {
+            failures.Add(endFailure);
+            await RunRecordedAsync(holder.CloseAsync, failures);
+            return false;
+        }
+    }
+
+    // Waits for the seed to end, whatever the test's token says, so a cancelled test still waits for its seed, and
+    // returns only once it has ended, so nothing the seed uses is disposed and its database is not dropped while it
+    // runs. cancelFirst cancels the seed before the wait. A seed still running after DrainLimit is recorded as one that
+    // did not end in time, then cancelled and waited for again; one still running DrainLimit after that is recorded as
+    // well, and then waited for until it ends. Its cancellation bounds that wait: the seed passes its token to every
+    // database call and to its execution strategy, which waits between retries under it, and a cancelled command ends
+    // even when the server does not answer, because the driver then breaks the connection. The two limits only detect
+    // and report a slow seed. Returns the seed's result, or null when it failed or ended by a cancellation requested
+    // here. Every failure, other than ending by that cancellation, is recorded for the caller, never thrown.
+    private static async Task<bool?> DrainSeedAsync(
+        Task<bool> seed,
+        CancellationTokenSource seedCancellation,
+        bool cancelFirst,
+        List<Exception> failures)
+    {
+        bool cancelled = cancelFirst && CancelSeed(seed, seedCancellation, failures);
+        if (!await EndsWithinAsync(seed, DrainLimit))
+        {
+            failures.Add(FailException.ForFailure(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The seed did not end within {DrainLimit.TotalSeconds} s; it is cancelled and waited for again.")));
+            cancelled = CancelSeed(seed, seedCancellation, failures) || cancelled;
+            if (!await EndsWithinAsync(seed, DrainLimit))
+            {
+                failures.Add(FailException.ForFailure(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The seed did not end within {DrainLimit.TotalSeconds} s of its cancellation either; teardown "
+                    + $"waits for it to end.")));
+            }
+        }
+
+        try
+        {
+            // Ended already, unless it outlasted both limits, in which case this waits until it ends.
+            return await seed;
+        }
+        catch (OperationCanceledException) when (cancelled)
+        {
+            // Ended by the cancellation requested here, which is no failure of the seed's own: what led to it is
+            // reported instead.
+            return null;
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+            return null;
+        }
+    }
+
+    // Cancels the seed unless it has already ended. Returns whether the cancellation was requested here, so that the
+    // seed's ending by it is expected rather than a failure. A cancellation callback's failure is recorded for the
+    // caller, never thrown.
+    private static bool CancelSeed(Task seed, CancellationTokenSource seedCancellation, List<Exception> failures)
+    {
+        if (seed.IsCompleted)
+        {
+            return false;
+        }
+
+        try
+        {
+            seedCancellation.Cancel();
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
+
+        return true;
+    }
+
+    // Whether the task ends within the limit, however it ends and whatever the test's token says. Never throws.
+    private static async Task<bool> EndsWithinAsync(Task task, TimeSpan limit)
+    {
+        await task.WaitAsync(limit, CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        return task.IsCompleted;
+    }
+
+    // Disposes the resource, if there is one, as a teardown step of its own.
+    private static async Task DisposeRecordedAsync(IAsyncDisposable? resource, List<Exception> failures)
+    {
+        if (resource is not null)
+        {
+            await RunRecordedAsync(() => resource.DisposeAsync().AsTask(), failures);
+        }
+    }
+
+    // Runs one teardown step and records its failure for the caller instead of throwing it, so the steps after it
+    // still run and no failure recorded before it is replaced.
+    private static async Task RunRecordedAsync(Func<Task> step, List<Exception> failures)
+    {
+        try
+        {
+            await step();
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
+        }
+    }
+
+    // Called once an observation's cleanup has run. When the observation did not fail but its cleanup did, the cleanup
+    // failures are thrown before the assertions on what was observed can run, so the first expectation not met is
+    // recorded ahead of them, under its assertion's message, as the failure that came first. Otherwise nothing is
+    // recorded: the observation's own failure already comes first, or the assertions report what was missed.
+    private static void RecordMissedObservation(
+        List<Exception> failures,
+        bool observationFailed,
+        params (bool Met, string Message)[] expectations)
+    {
+        if (observationFailed || failures.Count == 0)
+        {
+            return;
+        }
+
+        foreach ((bool met, string message) in expectations)
+        {
+            if (!met)
+            {
+                failures.Insert(0, FailException.ForFailure(message));
+                return;
+            }
+        }
+    }
+
+    // Rethrows a single failure as it was first thrown, or reports several together in the order they occurred.
+    private static void ThrowFailures(List<Exception> failures)
+    {
+        if (failures.Count == 1)
+        {
+            ExceptionDispatchInfo.Throw(failures[0]);
+        }
+
+        if (failures.Count > 1)
+        {
+            throw new AggregateException(failures);
+        }
     }
 
     // Holds the first commit back, as a server still completing a commit when the connection is lost would. The
@@ -588,9 +891,14 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
         ];
 
         private int _intercepted;
+        private int _holderSessionFree;
         private NpgsqlTransaction? _held;
 
         public NpgsqlTransaction? HeldTransaction => Volatile.Read(ref _held);
+
+        // True once the interceptor has stopped using the holder session, so the held transaction can be ended
+        // without racing its inserts.
+        public bool HolderSessionFree => Volatile.Read(ref _holderSessionFree) == 1;
 
         public override async ValueTask<InterceptionResult> TransactionCommittingAsync(
             DbTransaction transaction,
@@ -617,11 +925,19 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
 
             NpgsqlTransaction held = await holder.BeginTransactionAsync(cancellationToken);
             Volatile.Write(ref _held, held);
-            foreach (string sql in InsertCatalogueSql)
+            try
             {
-                await using NpgsqlCommand insert = new(sql, holder, held);
-                insert.Parameters.AddWithValue("catalogue", catalogue);
-                await insert.ExecuteNonQueryAsync(cancellationToken);
+                foreach (string sql in InsertCatalogueSql)
+                {
+                    await using NpgsqlCommand insert = new(sql, holder, held);
+                    insert.Parameters.AddWithValue("catalogue", catalogue);
+                    await insert.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+            finally
+            {
+                // No statement runs on the holder session after this, however the inserts ended.
+                Volatile.Write(ref _holderSessionFree, 1);
             }
 
             throw new NpgsqlException(

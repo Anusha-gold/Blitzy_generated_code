@@ -4,8 +4,8 @@ import { throwError } from 'rxjs';
 import type { Observable } from 'rxjs';
 
 import { API_CONFIG } from '../config/runtime-config';
-import { withRequestDeadline } from '../http/problem-details';
-import type { HotelDetail, HotelSearchQuery, HotelSummary, StayQuery } from './models';
+import { withRequestDeadline, withResponseBody } from '../http/problem-details';
+import type { HotelDetail, HotelSearchQuery, HotelSummary, RoomTypeAvailability, StayQuery } from './models';
 
 /**
  * Appends the stay criteria to `params` as `checkIn`, `checkOut` and `guests`,
@@ -50,6 +50,109 @@ function hotelIdSegment(text: string): string | null {
     : null;
 }
 
+/** An exact `yyyy-MM-dd` date, the form the API writes and the detail page compares as text. */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Whether `value` is a JSON object: neither `null` nor an array. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether `value` is a 32-bit signed integer, {@link MIN_ROUTE_ID} to
+ * {@link MAX_ROUTE_ID}: the C# `int` that the API serializes for every
+ * integer field of its wire models, the same range its `{id:int}` route binds.
+ */
+function isInt32(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= MIN_ROUTE_ID && value <= MAX_ROUTE_ID;
+}
+
+/**
+ * Whether `value` is a string holding an exact {@link ISO_DATE} that names a
+ * real calendar date: read as midnight UTC, it prints back as the same day, so
+ * a day past its month's end, such as `2099-02-30`, which `Date.parse` would
+ * roll over into March, fails.
+ */
+function isIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !ISO_DATE.test(value)) {
+    return false;
+  }
+  const ms = Date.parse(`${value}T00:00:00Z`);
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === value;
+}
+
+/** Whether `value` is an array whose every element `isItem` accepts; `[]` is one. */
+function isArrayOf<T>(value: unknown, isItem: (item: unknown) => item is T): value is T[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  const items: readonly unknown[] = value;
+  return items.every((item) => isItem(item));
+}
+
+/**
+ * Whether a search result carries every {@link HotelSummary} field with its
+ * wire type: `id` a 32-bit signed integer ({@link isInt32}), `name`, `city`
+ * and `address` strings, and `lowestNightlyPrice` a finite number.
+ */
+function isHotelSummary(value: unknown): value is HotelSummary {
+  return (
+    isRecord(value) &&
+    isInt32(value['id']) &&
+    typeof value['name'] === 'string' &&
+    typeof value['city'] === 'string' &&
+    typeof value['address'] === 'string' &&
+    Number.isFinite(value['lowestNightlyPrice'])
+  );
+}
+
+/** Whether a search 200 body is a list of valid results; `[]`, when no hotel qualifies, is one. */
+function isHotelSummaryList(body: unknown): body is HotelSummary[] {
+  return isArrayOf(body, isHotelSummary);
+}
+
+/**
+ * Whether a room type carries every {@link RoomTypeAvailability} field with
+ * its wire type: `id`, `maxGuests` and `availableRooms` 32-bit signed
+ * integers ({@link isInt32}), `name` a string, and `nightlyPrice` and
+ * `stayTotal` finite numbers.
+ */
+function isRoomTypeAvailability(value: unknown): value is RoomTypeAvailability {
+  return (
+    isRecord(value) &&
+    isInt32(value['id']) &&
+    typeof value['name'] === 'string' &&
+    isInt32(value['maxGuests']) &&
+    Number.isFinite(value['nightlyPrice']) &&
+    isInt32(value['availableRooms']) &&
+    Number.isFinite(value['stayTotal'])
+  );
+}
+
+/**
+ * Whether a detail 200 body carries every {@link HotelDetail} field with its
+ * wire type: `id`, `nights` and `guests` 32-bit signed integers
+ * ({@link isInt32}); `name`, `city`, `address` and `description` strings;
+ * `checkIn` and `checkOut` exact `yyyy-MM-dd` real calendar dates
+ * ({@link isIsoDate}), which the page compares as text and books with; and
+ * `roomTypes` a list of valid room types, `[]` included.
+ */
+function isHotelDetail(body: unknown): body is HotelDetail {
+  return (
+    isRecord(body) &&
+    isInt32(body['id']) &&
+    typeof body['name'] === 'string' &&
+    typeof body['city'] === 'string' &&
+    typeof body['address'] === 'string' &&
+    typeof body['description'] === 'string' &&
+    isIsoDate(body['checkIn']) &&
+    isIsoDate(body['checkOut']) &&
+    isInt32(body['nights']) &&
+    isInt32(body['guests']) &&
+    isArrayOf(body['roomTypes'], isRoomTypeAvailability)
+  );
+}
+
 /**
  * Typed client for the anonymous catalogue endpoints under `/api/hotels`: the
  * hotel search and the hotel detail.
@@ -64,9 +167,19 @@ function hotelIdSegment(text: string): string | null {
  * Each request is bounded by `REQUEST_DEADLINE_MS` through
  * {@link withRequestDeadline}: one with no response by then is aborted and
  * fails as a status-0 `HttpErrorResponse`, which `toUiError` shows as "The
- * service is unreachable.". Apart from that deadline the returned observables
- * are the `HttpClient` requests unchanged, except for a hotel id that is not
- * an integer literal, which fails with a local 404 and sends nothing
+ * service is unreachable.". Each 200 body is checked through
+ * {@link withResponseBody} before it is emitted: a search body that is not a
+ * list, or a body that lacks any field of its wire model ({@link HotelSummary}
+ * for each search result, {@link HotelDetail} with its
+ * {@link RoomTypeAvailability} room types) or holds one with another wire
+ * type, such as an `id` that is fractional or outside the 32-bit signed range
+ * of the API's C# `int`, or a `checkIn` that is not an exact `yyyy-MM-dd`
+ * calendar date, fails as an `HttpErrorResponse` carrying that 200, which
+ * `toUiError` shows as "The service sent an unexpected response."; an empty
+ * search list `[]` is valid.
+ * Apart from that deadline and that check the returned observables are the
+ * `HttpClient` requests unchanged, except for a hotel id that is not an
+ * integer literal, which fails with a local 404 and sends nothing
  * ({@link HotelsApiService.getHotel}): pages map their errors through
  * `toUiError`, and nothing here retries, caches, transforms or logs them.
  * Availability changes with every booking and cancellation, so each call sends
@@ -97,12 +210,15 @@ export class HotelsApiService {
    *   sent as its text, an empty string included, so the server decides it:
    *   an empty city, date or `guests` gets 400; only an omitted `guests` the
    *   server takes as 1.
-   * @returns The 200 body: the qualifying hotels, in server order.
+   * @returns The checked 200 body: the qualifying hotels, in server order; a
+   *   body that is not a list of complete results fails with that 200 status.
    */
   search(q: HotelSearchQuery): Observable<HotelSummary[]> {
     const params = withStayParams(new HttpParams().set('city', q.city), q);
     const url = `${this.config.apiBaseUrl}/hotels`;
-    return this.http.get<HotelSummary[]>(url, { params }).pipe(withRequestDeadline(url));
+    return this.http
+      .get<unknown>(url, { params, observe: 'response' })
+      .pipe(withRequestDeadline(url), withResponseBody(isHotelSummaryList));
   }
 
   /**
@@ -138,7 +254,8 @@ export class HotelsApiService {
    * @param id - The hotel's id: the route's path segment text, unchanged.
    * @param q - The stay as the page holds it, sent unchanged like the search
    *   criteria.
-   * @returns The 200 body: the hotel with its room types.
+   * @returns The checked 200 body: the hotel with its room types; a body
+   *   that is not a complete hotel detail fails with that 200 status.
    */
   getHotel(id: string, q: StayQuery): Observable<HotelDetail> {
     const segment = hotelIdSegment(id);
@@ -147,6 +264,8 @@ export class HotelsApiService {
     }
     const params = withStayParams(new HttpParams(), q);
     const url = `${this.config.apiBaseUrl}/hotels/${segment}`;
-    return this.http.get<HotelDetail>(url, { params }).pipe(withRequestDeadline(url));
+    return this.http
+      .get<unknown>(url, { params, observe: 'response' })
+      .pipe(withRequestDeadline(url), withResponseBody(isHotelDetail));
   }
 }

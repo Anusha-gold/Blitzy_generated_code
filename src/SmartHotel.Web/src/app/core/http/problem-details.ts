@@ -13,21 +13,30 @@
  *
  * Status `0` covers every request that got no response: a network failure, a
  * CORS rejection, the service down, or a request that passed its
- * {@link REQUEST_DEADLINE_MS} deadline. `HotelsApiService` and
- * `BookingsApiService` bound each of their requests with
+ * {@link REQUEST_DEADLINE_MS} deadline. `AuthApiService`, `HotelsApiService`
+ * and `BookingsApiService` bound each of their requests with
  * {@link withRequestDeadline}, which turns an expired wait into such a status-0
  * error, so a peer that never answers ends in the same inline error.
+ *
+ * A 2xx status reaches the mapping only for a success response whose body the
+ * app cannot use: one that failed its client's shape check under
+ * {@link withResponseBody}, or JSON that `HttpClient` could not parse. Both
+ * arrive as an `HttpErrorResponse` carrying that status, so a malformed success
+ * body ends in an inline error too, never in a page reading a missing field.
  *
  * Nothing here logs: an error body can echo user input. The result is plain
  * text that consumers render through interpolation only, never as HTML.
  */
 import { HttpErrorResponse } from '@angular/common/http';
-import { throwError, timeout } from 'rxjs';
-import type { MonoTypeOperatorFunction } from 'rxjs';
+import type { HttpResponse } from '@angular/common/http';
+import { map, throwError, timeout } from 'rxjs';
+import type { MonoTypeOperatorFunction, OperatorFunction } from 'rxjs';
 
 const UNREACHABLE_TITLE = 'The service is unreachable.';
+const UNEXPECTED_RESPONSE_TITLE = 'The service sent an unexpected response.';
 const PROBLEM_MEDIA_TYPE = 'application/problem+json';
 const DEADLINE_STATUS_TEXT = 'Request deadline exceeded';
+const UNEXPECTED_BODY_STATUS_TEXT = 'Unexpected response body';
 /** A JSON path naming one top-level member, such as `$.email`; group 1 is the member. */
 const TOP_LEVEL_JSON_PATH = /^\$\.([A-Za-z_][A-Za-z0-9_]*)$/;
 /**
@@ -81,6 +90,42 @@ export function withRequestDeadline<T>(url: string): MonoTypeOperatorFunction<T>
 }
 
 /**
+ * Checks the body of a successful `HttpClient` response at run time and emits
+ * it as `T`.
+ *
+ * `HttpClient`'s type argument is never checked, so a 2xx body such as `null`,
+ * `{}` or a field of the wrong type would otherwise reach the page as `T` and
+ * fail where it is read. Applied to a request sent with `observe: 'response'`,
+ * the operator emits the response's body when `isBody` accepts it. Otherwise it
+ * fails with an `HttpErrorResponse` carrying the response's own 2xx status,
+ * URL and headers, statusText "Unexpected response body" and no body, which
+ * {@link toUiError} maps to "The service sent an unexpected response.". The
+ * caller therefore receives an `HttpErrorResponse` for every failure, as for
+ * any other request. Errors from upstream pass through unchanged.
+ *
+ * The operator never retries and never logs: the body can echo user input.
+ *
+ * @param isBody - Whether a parsed body has the shape the caller reads.
+ * @returns An operator from the full response to its accepted body.
+ */
+export function withResponseBody<T>(
+  isBody: (body: unknown) => body is T,
+): OperatorFunction<HttpResponse<unknown>, T> {
+  return map((response) => {
+    const body = response.body;
+    if (isBody(body)) {
+      return body;
+    }
+    throw new HttpErrorResponse({
+      status: response.status,
+      statusText: UNEXPECTED_BODY_STATUS_TEXT,
+      url: response.url ?? undefined,
+      headers: response.headers,
+    });
+  });
+}
+
+/**
  * The single shape every inline error renders from. `ErrorMessageComponent`
  * shows `title`, then `detail` when it is not `null`, then each field message.
  */
@@ -110,14 +155,18 @@ export interface UiError {
  *    request that passed its deadline under {@link withRequestDeadline}) gives
  *    the title "The service is unreachable." with no detail and no field
  *    errors.
- * 2. A response whose `Content-Type` media type, without parameters and
+ * 2. A 2xx status (a success body that failed its check under
+ *    {@link withResponseBody}, or JSON that `HttpClient` could not parse) gives
+ *    the title "The service sent an unexpected response." with no detail and
+ *    no field errors.
+ * 3. A response whose `Content-Type` media type, without parameters and
  *    ignoring case, is `application/problem+json` and whose body is a JSON
  *    object is read as ProblemDetails: a string `title` with non-whitespace
  *    text is used, otherwise a generic "Request failed (status)." title; a
  *    string `detail` with non-whitespace text is used, otherwise `null`; and
  *    each `errors` entry whose value is an array keeps its string messages with
  *    non-whitespace text, dropping entries left with none.
- * 3. Any other response (another or no media type, or a body that is text, an
+ * 4. Any other response (another or no media type, or a body that is text, an
  *    array, `null` or absent) gives the generic title with no detail and no
  *    field errors.
  *
@@ -130,6 +179,9 @@ export interface UiError {
 export function toUiError(error: HttpErrorResponse): UiError {
   if (error.status === 0) {
     return { status: 0, title: UNREACHABLE_TITLE, detail: null, fieldErrors: [] };
+  }
+  if (error.status >= 200 && error.status < 300) {
+    return { status: error.status, title: UNEXPECTED_RESPONSE_TITLE, detail: null, fieldErrors: [] };
   }
 
   const body: unknown = error.error;
