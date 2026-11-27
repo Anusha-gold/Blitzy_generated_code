@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SmartHotel Playwright builder options",
+  "description": "Options for running Playwright Test through ng test.",
+  "type": "object",
+  "properties": {
+    "config": {
+      "type": "string",
+      "description": "Path to the Playwright configuration, relative to the workspace root.",
+      "default": "playwright.config.ts"
+    }
+  },
+  "additionalProperties": false
+}
