@@ -1,8 +1,13 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -57,6 +62,13 @@ namespace SmartHotel.Api.IntegrationTests.Http;
 /// The server's own rejections, of a malformed request before any middleware runs and of a body over its size limit,
 /// are sent over TCP to the fixture's loopback listener, because the in-process server parses no request bytes.
 /// </para>
+/// <para>
+/// Outside Development the transport is tested on the API run as a process of its own, with a throwaway certificate
+/// and an environment set for that process alone, because Kestrel takes a certificate password from its process
+/// environment only: an HTTPS listener serves the readiness probe with the certificate the environment's password
+/// opens, while a password from the command line or a JSON file, or a listener that is plaintext only, stops startup
+/// with exit code 1.
+/// </para>
 /// </remarks>
 public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFactory>
 {
@@ -86,6 +98,19 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private const string InvalidInputDetail =
         "Some of the information provided is missing or not valid. Correct it and try again.";
     private const string HttpsWebOrigin = "https://localhost:4200";
+
+    // The API process tests' listeners, on a loopback port the operating system chooses, the variables Kestrel reads
+    // its default certificate from, the console lines of the API's NoHttpsListener and HostRunFailed events and of the
+    // hosting lifetime's address report, and the places outside the environment a certificate password can come from.
+    private const string HttpsLoopbackUrl = "https://127.0.0.1:0";
+    private const string HttpLoopbackUrl = "http://127.0.0.1:0";
+    private const string CertificatePathVariable = "Kestrel__Certificates__Default__Path";
+    private const string CertificatePasswordVariable = "Kestrel__Certificates__Default__Password";
+    private const string NoHttpsListenerRecord = "SmartHotel.Api[5201]";
+    private const string HostRunFailedRecord = "SmartHotel.Api[5202]";
+    private const string ListeningRecord = "Now listening on:";
+    private const string CommandLinePasswordSource = "command-line";
+    private const string JsonFilePasswordSource = "json-file";
 
     private const string SearchGuestsMarkerScenario = "search-guests-marker";
     private const string LoginEmailNumberScenario = "login-email-number";
@@ -424,19 +449,23 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     }
 
     // A variant host whose clock throws once armed. The search passes model validation and the controller then reads
-    // the clock, so the request reaches an unhandled exception whose message is the marker.
+    // the clock, so the request reaches an unhandled exception whose message is the marker. The recording handler,
+    // registered after the API's own, sees the exception the middleware handles, which identifies the 500 as the
+    // clock's and not an earlier failure's.
     [Fact]
     public async Task UnhandledException_Returns500WithoutDetails()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
 
         ThrowingTimeProvider clock = new(SecretMarker);
+        RecordingExceptionHandler recorder = new();
         await using SmartHotelApiFactory variant = new(_postgres)
         {
             ServiceOverrides = services =>
             {
                 services.RemoveAll<TimeProvider>();
                 services.AddSingleton<TimeProvider>(clock);
+                services.AddSingleton<IExceptionHandler>(recorder);
             },
         };
 
@@ -450,6 +479,18 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         DateOnly today = ApiTestClient.TodayUtc;
         string checkIn = ApiTestClient.Iso(today.AddDays(30));
         string checkOut = ApiTestClient.Iso(today.AddDays(32));
+
+        // The identical search succeeds while the clock still delegates, so the request itself is valid and only the
+        // armed clock can fail it.
+        using (HttpResponseMessage unarmed = await client.SearchAsync(
+            "Seattle",
+            checkIn,
+            checkOut,
+            "2",
+            cancellationToken))
+        {
+            Assert.Equal(HttpStatusCode.OK, unarmed.StatusCode);
+        }
 
         clock.Arm();
         try
@@ -488,6 +529,23 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             Assert.False(
                 body.Contains("GetUtcNow", StringComparison.Ordinal),
                 "Expected the 500 problem body not to contain the clock member name.");
+
+            // The controller reads the clock once, and nothing else reads it while the request runs: the search
+            // carries no token, so the bearer handler never consults it, and the exception path reads no time. The
+            // handler runs before the response starts, so its record is complete once the response has arrived.
+            // Counts and identity are checked as booleans with fixed messages, because a failing collection assertion
+            // would print each exception, message included.
+            IReadOnlyList<InvalidOperationException> thrown = clock.ThrownExceptions;
+            IReadOnlyList<Exception> handled = recorder.Exceptions;
+            Assert.True(
+                thrown.Count == 1,
+                $"Expected the armed clock to throw exactly once, but it threw {thrown.Count} times.");
+            Assert.True(
+                handled.Count == 1,
+                $"Expected the exception handlers to see exactly one exception, but they saw {handled.Count}.");
+            Assert.True(
+                ReferenceEquals(thrown[0], handled[0]),
+                "Expected the handled exception to be the one the armed clock threw.");
         }
         finally
         {
@@ -531,25 +589,32 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
 
         await ExpectStatusAsync(
             HttpStatusCode.OK,
-            client.SearchAsync(_marker, checkIn, checkOut, "2", ct));
+            client.SearchAsync(_marker, checkIn, checkOut, "2", ct),
+            ct);
         await ExpectStatusAsync(
             HttpStatusCode.NotFound,
-            client.Http.GetAsync($"/api/{_marker}?q={_marker}", ct));
+            client.Http.GetAsync($"/api/{_marker}?q={_marker}", ct),
+            ct);
         await ExpectStatusAsync(
             HttpStatusCode.NotFound,
-            client.Http.GetAsync($"/api/hotels/{_marker}", ct));
+            client.Http.GetAsync($"/api/hotels/{_marker}", ct),
+            ct);
+
+        // Malformed JSON is a body-level failure that names no field, so only the errors object is required.
         await ExpectStatusAsync(
             HttpStatusCode.BadRequest,
             client.Http.PostAsync(
                 "/api/auth/login",
                 new StringContent($"{{\"{_marker}\": nul", Encoding.UTF8, "application/json"),
-                ct));
+                ct),
+            ct);
         await ExpectStatusAsync(
             HttpStatusCode.UnsupportedMediaType,
             client.Http.PostAsync(
                 "/api/auth/login",
                 new StringContent("{}", Encoding.UTF8, $"text/x-{_marker}"),
-                ct));
+                ct),
+            ct);
 
         // A zero-night stay, so the 400 problem is negotiated against an Accept header that admits no JSON, from an
         // origin the CORS policy rejects.
@@ -559,7 +624,11 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         {
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue($"application/x-{_marker}"));
             request.Headers.TryAddWithoutValidation("Origin", $"http://{_marker}.test");
-            await ExpectStatusAsync(HttpStatusCode.BadRequest, client.Http.SendAsync(request, ct));
+            await ExpectStatusAsync(
+                HttpStatusCode.BadRequest,
+                client.Http.SendAsync(request, ct),
+                ct,
+                errorKey: "checkOut");
         }
 
         // A preflight from the allowed origin that asks for a header the policy does not allow.
@@ -568,7 +637,7 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             preflight.Headers.TryAddWithoutValidation("Origin", variant.AllowedOrigin);
             preflight.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "GET");
             preflight.Headers.TryAddWithoutValidation("Access-Control-Request-Headers", $"x-{_marker}");
-            await ExpectStatusAsync(HttpStatusCode.NoContent, client.Http.SendAsync(preflight, ct));
+            await ExpectStatusAsync(HttpStatusCode.NoContent, client.Http.SendAsync(preflight, ct), ct);
         }
 
         // A preflight from the allowed origin for a path that carries the marker: before the CORS policy answers it,
@@ -577,20 +646,32 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         {
             preflight.Headers.TryAddWithoutValidation("Origin", variant.AllowedOrigin);
             preflight.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "POST");
-            await ExpectStatusAsync(HttpStatusCode.NoContent, client.Http.SendAsync(preflight, ct));
+            await ExpectStatusAsync(HttpStatusCode.NoContent, client.Http.SendAsync(preflight, ct), ct);
         }
 
         string email = _marker + "@example.test";
         await ExpectStatusAsync(
             HttpStatusCode.Created,
-            client.RegisterAsync(new { email, password, fullName = _marker }, ct));
+            client.RegisterAsync(new { email, password, fullName = _marker }, ct),
+            ct);
+
+        // The wrong password is a credential failure the action reports, not an authentication challenge.
         await ExpectStatusAsync(
             HttpStatusCode.Unauthorized,
-            client.LoginAsync(new { email, password = password + "-wrong" }, ct));
-        await ExpectStatusAsync(HttpStatusCode.Unauthorized, client.ListBookingsAsync(_marker, ct));
+            client.LoginAsync(new { email, password = password + "-wrong" }, ct),
+            ct);
+
+        // A rejected token is challenged without error details, so neither challenge can echo the marked token.
         await ExpectStatusAsync(
             HttpStatusCode.Unauthorized,
-            client.ListBookingsAsync($"{_marker}.{_marker}.{_marker}", ct));
+            client.ListBookingsAsync(_marker, ct),
+            ct,
+            bareBearerChallenge: true);
+        await ExpectStatusAsync(
+            HttpStatusCode.Unauthorized,
+            client.ListBookingsAsync($"{_marker}.{_marker}.{_marker}", ct),
+            ct,
+            bareBearerChallenge: true);
 
         using (HttpRequestMessage faulted = new(HttpMethod.Get, "/api/bookings"))
         {
@@ -1028,12 +1109,48 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
         Uri address = await _factory.StartLoopbackListenerAsync(cancellationToken);
 
-        using HttpClient http = new() { BaseAddress = address };
+        // The listener is on a loopback address, which the client must reach directly: a proxy the environment of the
+        // host running the tests names would otherwise carry the request, since NO_PROXY's usual localhost entry does
+        // not cover 127.0.0.1.
+        using HttpClient http = new(new SocketsHttpHandler { UseProxy = false }) { BaseAddress = address };
         using HttpResponseMessage response = await http.GetAsync(ReadinessPath, cancellationToken);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
         Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+    }
+
+    // A variant derived through WithWebHostBuilder builds its host through its parent factory's CreateHost. A Production
+    // variant built and disposed before the listener starts must not become the listener's builder: a Production host
+    // on plaintext Kestrel binds no HTTPS address, so the API would set the process exit code and stop it. A factory of
+    // the test's own fixes that order whatever order xUnit runs the class's tests in.
+    [Fact]
+    public async Task LoopbackListener_StartedAfterProductionVariant_ServesRequests()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        await using SmartHotelApiFactory factory = new(_postgres);
+        await factory.InitializeAsync();
+        int exitCode = Environment.ExitCode;
+
+        WebApplicationFactory<Program> production = await StartProductionVariantAsync(
+            factory,
+            new Dictionary<string, string?>(),
+            cancellationToken);
+        string variantEnvironment = production.Services.GetRequiredService<IHostEnvironment>().EnvironmentName;
+        await production.DisposeAsync();
+        Assert.Equal(Environments.Production, variantEnvironment);
+
+        Uri address = await factory.StartLoopbackListenerAsync(cancellationToken);
+
+        // Directly to the loopback listener, never through a proxy the environment of the host running the tests
+        // names, whose NO_PROXY entry for localhost does not cover 127.0.0.1.
+        using HttpClient http = new(new SocketsHttpHandler { UseProxy = false }) { BaseAddress = address };
+        using HttpResponseMessage response = await http.GetAsync(ReadinessPath, cancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+        Assert.Equal(exitCode, Environment.ExitCode);
     }
 
     // Kestrel enforces its body-size limit while the API reads the body, by throwing a client error from the read: at
@@ -1159,25 +1276,56 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         Assert.Null(response.Headers.Location);
     }
 
-    // The same Production host serves a request that arrives over HTTPS: the guard passes it on to the pipeline.
+    // Outside Development Kestrel serves HTTPS on the listener and with the certificate the environment names, and the
+    // guard passes a request that arrives over TLS on to the pipeline. The API runs as a process of its own, because
+    // Kestrel takes a certificate password from its process environment alone and the tests set no variable in theirs.
+    // The client trusts the throwaway certificate and nothing else, so a served request shows that Kestrel bound TLS
+    // with the PFX the environment's password opened.
     [Fact]
     public async Task HttpsRequestOutsideDevelopment_IsServed()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
-        await using WebApplicationFactory<Program> production = await StartProductionVariantAsync(
-            new Dictionary<string, string?>(),
-            cancellationToken);
-        HttpClient https = production.CreateClient(new WebApplicationFactoryClientOptions
+        using ThrowawayCertificate certificate = ThrowawayCertificate.Create();
+        Dictionary<string, string> environment = ProductionProcessEnvironment(HttpsLoopbackUrl);
+        environment[CertificatePathVariable] = certificate.FilePath;
+        environment[CertificatePasswordVariable] = certificate.Password;
+        await using ApiProcess api = ApiProcess.Start(environment, [], AppContext.BaseDirectory);
+
+        Uri? address = await api.WaitForHttpsListenerAsync(cancellationToken);
+        Assert.True(
+            address is not null,
+            $"The API exited without listening on HTTPS; it wrote {api.DescribeRecords()}.");
+
+        // The certificate is self-signed, so an untrusted chain is the one error accepted, and only for that
+        // certificate: the address must still match a name it carries. The client connects to the loopback listener
+        // directly, so TLS is negotiated with the API, never tunnelled through a proxy the environment of the host
+        // running the tests names, whose NO_PROXY entry for localhost does not cover 127.0.0.1.
+        bool presented = false;
+        using HttpClient https = new(new SocketsHttpHandler
         {
-            BaseAddress = new Uri("https://localhost"),
             AllowAutoRedirect = false,
-        });
+            UseProxy = false,
+            SslOptions = new SslClientAuthenticationOptions
+            {
+                RemoteCertificateValidationCallback = (_, remote, _, errors) =>
+                {
+                    bool pinned = remote is not null && certificate.IsSameAs(remote);
+                    presented |= pinned;
+                    return pinned && (errors & ~SslPolicyErrors.RemoteCertificateChainErrors) == SslPolicyErrors.None;
+                },
+            },
+        })
+        {
+            BaseAddress = address,
+        };
 
-        using HttpResponseMessage response = await https.GetAsync("/api/health", cancellationToken);
+        using HttpResponseMessage response = await https.GetAsync(ReadinessPath, cancellationToken);
 
+        Assert.True(presented, "The API's TLS listener did not present the certificate the environment named.");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
         Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+        AssertOutputCarriesNoSecret(api.Output, certificate.Password);
     }
 
     // Kestrel reads its listeners and certificates through the API's view of the Kestrel section, where a certificate
@@ -1185,6 +1333,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     // line: the paths and the URL pass through, and neither password from them is answered. The passwords are a marker
     // unique to the run, and every check that involves a password is a boolean whose failure message holds no value,
     // so the outcome does not depend on the password variables of the host running the tests and none is ever printed.
+    // The API process tests beside this one show the outcome on a real listener: a password from the environment opens
+    // the certificate, and the same password from the command line or a JSON file stops startup.
     [Fact]
     public async Task KestrelConfiguration_TakesCertificatePasswordsOnlyFromEnvironment()
     {
@@ -1228,14 +1378,208 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         }
     }
 
-    // The class's host in the Production environment, on the same, already migrated and seeded database. Outside
-    // Development the API accepts only an https web origin, so one is added in memory after the factory's own, together
-    // with any further settings; no process environment variable is set or read. HTTPS redirection takes its port from
-    // HTTPS_PORT or ANCM_HTTPS_PORT in the configuration, which the environment of the host running the tests can
-    // supply, ASPNETCORE_HTTPS_PORT among others, before it asks the server. Both are pinned empty in memory, which
-    // names no port, and the in-process server publishes no addresses, so redirection never finds a port. Reading
-    // Server builds and starts the host, and Task.Run keeps that synchronous start off xUnit's synchronization context.
-    private async Task<WebApplicationFactory<Program>> StartProductionVariantAsync(
+    // A certificate password from anywhere but the environment never reaches Kestrel. The certificate and listener that
+    // serve HTTPS above, with the password on the command line, or in an appsettings.Production.json beside a copy of
+    // appsettings.json, leave Kestrel unable to open the PFX: the API reports HostRunFailed with the cryptographic
+    // exception's type, exits with code 1 and never listens. Its output carries no password and no other secret.
+    [Theory]
+    [InlineData(CommandLinePasswordSource)]
+    [InlineData(JsonFilePasswordSource)]
+    public async Task CertificatePasswordOutsideEnvironment_StopsStartupWithoutListening(string source)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        using ThrowawayCertificate certificate = ThrowawayCertificate.Create();
+        Dictionary<string, string> environment = ProductionProcessEnvironment(HttpsLoopbackUrl);
+        environment[CertificatePathVariable] = certificate.FilePath;
+
+        string[] arguments = [];
+        string contentRoot = AppContext.BaseDirectory;
+        if (source == CommandLinePasswordSource)
+        {
+            arguments = ["--Kestrel:Certificates:Default:Password=" + certificate.Password];
+        }
+        else if (source == JsonFilePasswordSource)
+        {
+            contentRoot = CreateContentRootWithCertificatePassword(certificate.DirectoryPath, certificate.Password);
+        }
+        else
+        {
+            throw new ArgumentOutOfRangeException(nameof(source));
+        }
+
+        await using ApiProcess api = ApiProcess.Start(environment, arguments, contentRoot);
+
+        Uri? address = await api.WaitForHttpsListenerAsync(cancellationToken);
+        Assert.True(address is null, $"The API listened on HTTPS with a certificate password from the {source}.");
+        int exitCode = await api.WaitForExitAsync(cancellationToken);
+
+        Assert.Equal(1, exitCode);
+        string output = api.Output;
+        Assert.True(
+            output.Contains(HostRunFailedRecord, StringComparison.Ordinal),
+            $"Expected the HostRunFailed event 5202, but the API wrote {api.DescribeRecords()}.");
+        Assert.True(
+            output.Contains(typeof(CryptographicException).FullName!, StringComparison.Ordinal),
+            "HostRunFailed does not name the CryptographicException of a certificate Kestrel could not open.");
+        Assert.False(
+            output.Contains(ListeningRecord, StringComparison.Ordinal),
+            "The API reported a listening address although its certificate could not be opened.");
+        AssertOutputCarriesNoSecret(output, certificate.Password);
+    }
+
+    // Outside Development a host whose listeners are all plaintext could serve nothing, because the guard refuses every
+    // request that does not arrive over HTTPS. The API therefore stops once Kestrel has bound them: it reports
+    // NoHttpsListener, exits with code 1 and never reports an HTTPS address.
+    [Fact]
+    public async Task PlaintextOnlyListenerOutsideDevelopment_StopsStartup()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        await using ApiProcess api = ApiProcess.Start(
+            ProductionProcessEnvironment(HttpLoopbackUrl),
+            [],
+            AppContext.BaseDirectory);
+
+        int exitCode = await api.WaitForExitAsync(cancellationToken);
+
+        Assert.Equal(1, exitCode);
+        string output = api.Output;
+        Assert.True(
+            output.Contains(NoHttpsListenerRecord, StringComparison.Ordinal),
+            $"Expected the NoHttpsListener event 5201, but the API wrote {api.DescribeRecords()}.");
+        Assert.False(
+            output.Contains(ListeningRecord + " https://", StringComparison.OrdinalIgnoreCase),
+            "The API reported an HTTPS address although only a plaintext listener was configured.");
+        AssertOutputCarriesNoSecret(output, certificatePassword: null);
+    }
+
+    // An API process inherits no variable that would configure the API or its host, whichever delimiter, prefix or
+    // letter case its name carries, and keeps every variable the dotnet host and the runtime need. The environment is
+    // a synthetic one with a fixed value, never that of the process running the tests.
+    [Theory]
+    [InlineData("Kestrel:Endpoints:Inherited:Url", false)]
+    [InlineData("Kestrel__Endpoints__Inherited__Url", false)]
+    [InlineData("DOTNET_Kestrel__Endpoints__Inherited__Url", false)]
+    [InlineData("kestrel__certificates__default__password", false)]
+    [InlineData("Logging:LogLevel:Default", false)]
+    [InlineData("Logging__Console__FormatterName", false)]
+    [InlineData("ConnectionStrings:SmartHotel", false)]
+    [InlineData("ConnectionStrings__SmartHotel", false)]
+    [InlineData("CUSTOMCONNSTR_SmartHotel", false)]
+    [InlineData("Jwt:SigningKey", false)]
+    [InlineData("Cors__AllowedOrigin", false)]
+    [InlineData("hostBuilder:reloadConfigOnChange", false)]
+    [InlineData("ASPNETCORE_ENVIRONMENT", false)]
+    [InlineData("aspnetcore_forwardedheaders_enabled", false)]
+    [InlineData("DOTNET_ENVIRONMENT", false)]
+    [InlineData("DOTNET_URLS", false)]
+    [InlineData("dotnet_urls", false)]
+    [InlineData("URLS", false)]
+    [InlineData("HTTPS_PORT", false)]
+    [InlineData("AllowedHosts", false)]
+    [InlineData("DOTNET_SHUTDOWNTIMEOUTSECONDS", false)]
+    [InlineData("ASPNET_ENV", false)]
+    [InlineData("DB_PASSWORD", false)]
+    [InlineData("DB_HOST", false)]
+    [InlineData("PATH", true)]
+    [InlineData("HOME", true)]
+    [InlineData("TMPDIR", true)]
+    [InlineData("DOTNET_ROOT", true)]
+    [InlineData("DOTNET_ROOT_X64", true)]
+    [InlineData("DOTNET_ROOT(x86)", true)]
+    [InlineData("DOTNET_HOST_PATH", true)]
+    [InlineData("DOTNET_gcServer", true)]
+    [InlineData("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", true)]
+    [InlineData("LANG", true)]
+    [InlineData("LC_ALL", true)]
+    [InlineData("SystemRoot", true)]
+    [InlineData("ProgramFiles(x86)", true)]
+    [InlineData("SSL_CERT_DIR", true)]
+    public void ApiProcessEnvironment_KeepsOnlyVariablesThatConfigureNothingOfTheApi(string name, bool kept)
+    {
+        Dictionary<string, string?> environment = new(StringComparer.Ordinal) { [name] = "inherited" };
+
+        ApiProcess.RemoveApiSettings(environment);
+
+        Assert.Equal(kept, environment.ContainsKey(name));
+    }
+
+    // The environment of an API process outside Development that listens on the URL given: the class's database and
+    // signing key, which the API takes from the environment alone, and the https web origin it requires there. The
+    // database is the class's own, already migrated and seeded, so the process's start-up changes nothing in it.
+    private Dictionary<string, string> ProductionProcessEnvironment(string url)
+    {
+        return new Dictionary<string, string>
+        {
+            ["ASPNETCORE_ENVIRONMENT"] = "Production",
+            ["ASPNETCORE_URLS"] = url,
+            ["ConnectionStrings__SmartHotel"] = _factory.DatabaseConnectionString,
+            ["Jwt__SigningKey"] = _factory.SigningKey,
+            ["Cors__AllowedOrigin"] = HttpsWebOrigin,
+        };
+    }
+
+    // A content root, in a new directory under the parent given, whose configuration files hold the certificate
+    // password: the build's appsettings.json, and an appsettings.Production.json with the password under Kestrel's
+    // default-certificate key.
+    private static string CreateContentRootWithCertificatePassword(string parent, string password)
+    {
+        string contentRoot = Path.Combine(parent, "content");
+        Directory.CreateDirectory(contentRoot);
+        File.Copy(
+            Path.Combine(AppContext.BaseDirectory, "appsettings.json"),
+            Path.Combine(contentRoot, "appsettings.json"));
+
+        JsonObject settings = new()
+        {
+            ["Kestrel"] = new JsonObject
+            {
+                ["Certificates"] = new JsonObject
+                {
+                    ["Default"] = new JsonObject { ["Password"] = password },
+                },
+            },
+        };
+        File.WriteAllText(Path.Combine(contentRoot, "appsettings.Production.json"), settings.ToJsonString());
+        return contentRoot;
+    }
+
+    // An API process's output must carry none of the secrets its environment or its certificate settings held. Each
+    // check is a boolean with a fixed message, so no secret reaches a failure message either.
+    private void AssertOutputCarriesNoSecret(string output, string? certificatePassword)
+    {
+        string? databasePassword = new NpgsqlConnectionStringBuilder(_factory.DatabaseConnectionString).Password;
+        Assert.False(
+            output.Contains(_factory.DatabaseConnectionString, StringComparison.Ordinal),
+            "The API's output carries its connection string.");
+        Assert.False(
+            !string.IsNullOrEmpty(databasePassword) && output.Contains(databasePassword, StringComparison.Ordinal),
+            "The API's output carries the database password.");
+        Assert.False(
+            output.Contains(_factory.SigningKey, StringComparison.Ordinal),
+            "The API's output carries the signing key.");
+        Assert.False(
+            certificatePassword is not null && output.Contains(certificatePassword, StringComparison.Ordinal),
+            "The API's output carries the certificate password.");
+    }
+
+    // The class's host in the Production environment, on the same, already migrated and seeded database.
+    private Task<WebApplicationFactory<Program>> StartProductionVariantAsync(
+        Dictionary<string, string?> settings,
+        CancellationToken cancellationToken)
+    {
+        return StartProductionVariantAsync(_factory, settings, cancellationToken);
+    }
+
+    // The source factory's host in the Production environment, derived through WithWebHostBuilder, on the source's
+    // already migrated and seeded database. Outside Development the API accepts only an https web origin, so one is
+    // added in memory after the factory's own, together with any further settings; no process environment variable is
+    // set or read. HTTPS redirection takes its port from HTTPS_PORT or ANCM_HTTPS_PORT in the configuration, which the
+    // environment of the host running the tests can supply, ASPNETCORE_HTTPS_PORT among others, before it asks the
+    // server. Both are pinned empty in memory, which names no port, and the in-process server publishes no addresses,
+    // so redirection never finds a port. Reading Server builds and starts the host, and Task.Run keeps that synchronous
+    // start off xUnit's synchronization context.
+    private static async Task<WebApplicationFactory<Program>> StartProductionVariantAsync(
+        SmartHotelApiFactory source,
         Dictionary<string, string?> settings,
         CancellationToken cancellationToken)
     {
@@ -1243,7 +1587,7 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             HttpsWebOrigin;
         settings["HTTPS_PORT"] = "";
         settings["ANCM_HTTPS_PORT"] = "";
-        WebApplicationFactory<Program> variant = _factory.WithWebHostBuilder(builder =>
+        WebApplicationFactory<Program> variant = source.WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
             builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(settings));
@@ -1441,10 +1785,47 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             });
     }
 
-    private static async Task ExpectStatusAsync(HttpStatusCode expected, Task<HttpResponseMessage> sending)
+    // An error status is held to the problem contract through ProblemAssert, whose failure messages quote no body,
+    // header or caller-supplied value; a success status is compared directly. errorKey is the field a 400 must key in
+    // errors, null for a body-level 400, and bareBearerChallenge marks a 401 whose every challenge must be a bare
+    // Bearer.
+    private static async Task ExpectStatusAsync(
+        HttpStatusCode expected,
+        Task<HttpResponseMessage> sending,
+        CancellationToken cancellationToken,
+        string? errorKey = null,
+        bool bareBearerChallenge = false)
     {
+        // Awaited first, so the response is disposed even when the arguments are rejected.
         using HttpResponseMessage response = await sending;
-        Assert.Equal(expected, response.StatusCode);
+
+        // A key or a challenge check the expected status cannot carry would let the case pass without checking it.
+        if (errorKey is not null && expected != HttpStatusCode.BadRequest)
+        {
+            throw new ArgumentException(
+                $"An error key applies only to a 400 problem, not to {(int)expected}.",
+                nameof(errorKey));
+        }
+
+        if (bareBearerChallenge && expected != HttpStatusCode.Unauthorized)
+        {
+            throw new ArgumentException(
+                $"A bearer challenge applies only to a 401 problem, not to {(int)expected}.",
+                nameof(bareBearerChallenge));
+        }
+
+        if ((int)expected < 400)
+        {
+            Assert.Equal(expected, response.StatusCode);
+            return;
+        }
+
+        await ProblemAssert.AssertProblemAsync(response, expected, errorKey, cancellationToken);
+
+        if (bareBearerChallenge)
+        {
+            ProblemAssert.AssertBareBearerChallenge(response);
+        }
     }
 
     // The problem's traceId is the W3C id of the request activity, which hosting starts only while its diagnostics
@@ -1519,30 +1900,36 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         }
     }
 
-    // Records the type of each exception the exception handler middleware offers it and declines every one, so the
-    // middleware still writes the generic problem. Requests may run on any thread, so the record is a concurrent queue.
+    // Records each exception the exception handler middleware offers it and declines every one, so the middleware still
+    // writes the generic problem. Requests may run on any thread, so the record is a concurrent queue.
     private sealed class RecordingExceptionHandler : IExceptionHandler
     {
-        private readonly ConcurrentQueue<Type> _exceptionTypes = new();
+        private readonly ConcurrentQueue<Exception> _exceptions = new();
 
-        public IReadOnlyList<Type> ExceptionTypes => [.. _exceptionTypes];
+        public IReadOnlyList<Exception> Exceptions => [.. _exceptions];
+
+        public IReadOnlyList<Type> ExceptionTypes => [.. _exceptions.Select(static exception => exception.GetType())];
 
         public ValueTask<bool> TryHandleAsync(
             HttpContext httpContext,
             Exception exception,
             CancellationToken cancellationToken)
         {
-            _exceptionTypes.Enqueue(exception.GetType());
+            _exceptions.Enqueue(exception);
             return ValueTask.FromResult(false);
         }
     }
 
-    // Delegates to the system clock until armed, then throws an exception with the given message on every read. Arm and
-    // Disarm may run on another thread than the request that reads the clock, so the flag is read and written with
-    // volatile semantics.
+    // Delegates to the system clock until armed, then throws an exception with the given message on every read and
+    // keeps each exception it throws, so a test can identify the exception that reached the handler. Arm and Disarm may
+    // run on another thread than the request that reads the clock, so the flag is read and written with volatile
+    // semantics, and the record is a concurrent queue.
     private sealed class ThrowingTimeProvider(string message) : TimeProvider
     {
+        private readonly ConcurrentQueue<InvalidOperationException> _thrown = new();
         private int _armed;
+
+        public IReadOnlyList<InvalidOperationException> ThrownExceptions => [.. _thrown];
 
         public void Arm()
         {
@@ -1560,7 +1947,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         {
             if (Volatile.Read(ref _armed) == 1)
             {
-                throw new InvalidOperationException(message);
+                InvalidOperationException fault = new(message);
+                _thrown.Enqueue(fault);
+                throw fault;
             }
 
             return TimeProvider.System.GetUtcNow();
@@ -1897,6 +2286,404 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             }
 
             return new HttpResponseMessage((HttpStatusCode)Status) { Content = content };
+        }
+    }
+
+    // The API as a process of its own, run by the dotnet host from the test output directory. This is test
+    // infrastructure, not a way to run the product, which runs only under Compose: it exists because Kestrel takes a
+    // certificate password from its process environment alone, and the tests set no variable in their own process.
+    // The process's environment is that of the process running the tests, less every variable that would configure
+    // the API or its host in any key form, plus the variables a test supplies. Standard output and error are read line
+    // by line as they arrive, so a full pipe never stalls the API, and kept for checks only: they can quote settings,
+    // so a failure message names event ids and exit codes, never the output. Disposing kills the process and any
+    // process it started, then waits for them to exit, so nothing outlives the test or still uses the class's
+    // database when the fixture drops it.
+    private sealed partial class ApiProcess : IAsyncDisposable
+    {
+        private const string ApiAssemblyFileName = "SmartHotel.Api.dll";
+
+        // How long the API may take to listen or to exit on its own, and to exit once it is killed.
+        private static readonly TimeSpan StartTimeout = TimeSpan.FromMinutes(1);
+        private static readonly TimeSpan KillTimeout = TimeSpan.FromSeconds(30);
+
+        // The prefixes the host's configuration strips from the variables it reads: every DOTNET_ and ASPNETCORE_
+        // variable is host configuration under the rest of its name, as well as application configuration whole.
+        private const string DotnetPrefix = "DOTNET_";
+        private const string AspNetCorePrefix = "ASPNETCORE_";
+
+        // The flat keys ASP.NET Core 8 reads from configuration to set up the API: the generic and web hosts' settings,
+        // host filtering's, the forwarded headers switch and the HTTPS redirection port, and the legacy environment
+        // name the web host reads from the environment.
+        private static readonly string[] FlatSettingNames =
+        [
+            "ENVIRONMENT", "ASPNET_ENV", "APPLICATIONNAME", "CONTENTROOT", "WEBROOT", "STARTUPASSEMBLY", "URLS",
+            "HTTP_PORTS", "HTTPS_PORTS", "HTTPS_PORT", "ANCM_HTTPS_PORT", "PREFERHOSTINGURLS", "ALLOWEDHOSTS",
+            "FORWARDEDHEADERS_ENABLED", "HOSTINGSTARTUPASSEMBLIES", "HOSTINGSTARTUPEXCLUDEASSEMBLIES",
+            "PREVENTHOSTINGSTARTUP", "CAPTURESTARTUPERRORS", "DETAILEDERRORS", "SUPPRESSSTATUSMESSAGES",
+            "STATICWEBASSETS", "SHUTDOWNTIMEOUTSECONDS", "STARTUPTIMEOUTSECONDS", "SERVICESSTARTCONCURRENTLY",
+            "SERVICESSTOPCONCURRENTLY",
+        ];
+
+        // The database settings the secret source reads from the environment by name, and the prefixes the environment
+        // configuration provider maps into the ConnectionStrings section.
+        private static readonly string[] FlatSettingPrefixes =
+            ["DB_", "CUSTOMCONNSTR_", "MYSQLCONNSTR_", "SQLAZURECONNSTR_", "SQLCONNSTR_"];
+
+        private readonly Process _process;
+        private readonly StringBuilder _output = new();
+        private readonly TaskCompletionSource<Uri> _httpsAddress =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private ApiProcess(Process process)
+        {
+            _process = process;
+            _process.OutputDataReceived += OnLineReceived;
+            _process.ErrorDataReceived += OnLineReceived;
+        }
+
+        // Every line read so far, standard output and error interleaved. It must never reach a failure message.
+        public string Output
+        {
+            get
+            {
+                lock (_output)
+                {
+                    return _output.ToString();
+                }
+            }
+        }
+
+        // Starts the API with the arguments given and the working directory, which is its content root.
+        public static ApiProcess Start(
+            IReadOnlyDictionary<string, string> environment,
+            IEnumerable<string> arguments,
+            string workingDirectory)
+        {
+            ProcessStartInfo startInfo = new(FindDotnetHost())
+            {
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8,
+                CreateNoWindow = true,
+            };
+
+            // One item per argument and no shell, so a path with spaces reaches the host intact.
+            startInfo.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, ApiAssemblyFileName));
+            foreach (string argument in arguments)
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            RemoveApiSettings(startInfo.Environment);
+            foreach ((string name, string value) in environment)
+            {
+                startInfo.Environment[name] = value;
+            }
+
+            Process process = new() { StartInfo = startInfo };
+            ApiProcess api = new(process);
+            try
+            {
+                process.Start();
+            }
+            catch
+            {
+                process.Dispose();
+                throw;
+            }
+
+            // The API reads nothing from standard input; closing it keeps the process off the test runner's.
+            process.StandardInput.Close();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            return api;
+        }
+
+        // The first HTTPS address the API reports listening on, or null once it has exited without reporting one. The
+        // wait for the exit also waits for the end of the output, so an address reported just before an exit is seen.
+        public async Task<Uri?> WaitForHttpsListenerAsync(CancellationToken cancellationToken)
+        {
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(StartTimeout);
+            Task exited = _process.WaitForExitAsync(deadline.Token);
+            await Task.WhenAny(_httpsAddress.Task, exited);
+
+            if (_httpsAddress.Task.IsCompletedSuccessfully)
+            {
+                // Ends the exit wait, which nothing awaits any longer.
+                await deadline.CancelAsync();
+                return await _httpsAddress.Task;
+            }
+
+            if (exited.IsCompletedSuccessfully)
+            {
+                return null;
+            }
+
+            // The runner's cancellation stays a cancellation; only the deadline becomes a failure.
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new TimeoutException("The API process neither listened on HTTPS nor exited within a minute.");
+        }
+
+        // The API's exit code, once it has exited on its own and its output has ended.
+        public async Task<int> WaitForExitAsync(CancellationToken cancellationToken)
+        {
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(StartTimeout);
+            try
+            {
+                await _process.WaitForExitAsync(deadline.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException("The API process did not exit within a minute.");
+            }
+
+            return _process.ExitCode;
+        }
+
+        // The event ids of the console records read so far, the only part of the output a failure message may name.
+        public string DescribeRecords()
+        {
+            string[] eventIds =
+            [
+                .. ConsoleRecord().Matches(Output).Select(static record => record.Groups["id"].Value).Distinct(),
+            ];
+
+            return eventIds.Length == 0
+                ? "no console record"
+                : "console records with event ids " + string.Join(", ", eventIds);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                try
+                {
+                    _process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException) when (_process.HasExited)
+                {
+                    // The process has exited on its own, so nothing is left to stop.
+                }
+
+                // Deliberately not the test's token: the process must be gone even when the test was cancelled, so the
+                // wait has a bound of its own.
+                using CancellationTokenSource deadline = new(KillTimeout);
+                try
+                {
+                    await _process.WaitForExitAsync(deadline.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw new TimeoutException("The API process did not exit within 30 seconds of being killed.");
+                }
+            }
+            finally
+            {
+                _process.Dispose();
+            }
+        }
+
+        // Removes from an inherited environment every variable that would configure the API or its host, in any of the
+        // forms the environment configuration provider reads, and keeps the rest, which the dotnet host and the runtime
+        // need: PATH, HOME, TMPDIR, the DOTNET_ROOT variables, the locale, the runtime's switches and the system
+        // variables, none of which on Windows holds a delimiter. On macOS __CF_USER_TEXT_ENCODING goes, which only
+        // CoreFoundation's default text encoding reads, falling back without it.
+        public static void RemoveApiSettings(IDictionary<string, string?> environment)
+        {
+            foreach (string name in environment.Keys.Where(IsApiSetting).ToList())
+            {
+                environment.Remove(name);
+            }
+        }
+
+        // The environment configuration provider reads a name as a key whose sections a double underscore or a colon
+        // delimits, and the host's providers also read it less a DOTNET_ or ASPNETCORE_ prefix. A name whose key has a
+        // section therefore configures some part of the API, whatever the section and whichever delimiter or prefix it
+        // carries, and so does every ASPNETCORE_ name; a flat name does when it is a host setting or a database
+        // setting, with or without a DOTNET_ prefix. Prefixes and configuration keys match ignoring case, as Windows
+        // environment names do, so names are compared ignoring case.
+        private static bool IsApiSetting(string name)
+        {
+            string key = name.Replace("__", ConfigurationPath.KeyDelimiter, StringComparison.Ordinal);
+            if (key.Contains(ConfigurationPath.KeyDelimiter, StringComparison.Ordinal)
+                || key.StartsWith(AspNetCorePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (key.StartsWith(DotnetPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                key = key[DotnetPrefix.Length..];
+            }
+
+            return FlatSettingNames.Contains(key, StringComparer.OrdinalIgnoreCase)
+                || FlatSettingPrefixes.Any(prefix => key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // The dotnet host that runs the tests: dotnet test names it in DOTNET_HOST_PATH, a test process the host
+        // started directly is that host, and otherwise it is at the root of the installation whose runtime runs the
+        // tests, three levels above that runtime's directory, shared/Microsoft.NETCore.App/<version>.
+        private static string FindDotnetHost()
+        {
+            string hostFileName = OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet";
+
+            string? hostPath = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
+            if (!string.IsNullOrEmpty(hostPath) && File.Exists(hostPath))
+            {
+                return hostPath;
+            }
+
+            string? processPath = Environment.ProcessPath;
+            if (processPath is not null
+                && string.Equals(Path.GetFileName(processPath), hostFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return processPath;
+            }
+
+            string runtimeDirectory = Path.TrimEndingDirectorySeparator(RuntimeEnvironment.GetRuntimeDirectory());
+            DirectoryInfo? installation = new DirectoryInfo(runtimeDirectory).Parent?.Parent?.Parent;
+            string? installedHost = installation is null ? null : Path.Combine(installation.FullName, hostFileName);
+            if (installedHost is not null && File.Exists(installedHost))
+            {
+                return installedHost;
+            }
+
+            throw new InvalidOperationException("The dotnet host that runs the tests could not be found.");
+        }
+
+        // The simple console formatter's first line of a record, "<level>: <category>[<event id>]".
+        [GeneratedRegex(
+            @"^(?:trce|dbug|info|warn|fail|crit): [^\s\[]+\[(?<id>\d+)\]",
+            RegexOptions.Multiline | RegexOptions.CultureInvariant)]
+        private static partial Regex ConsoleRecord();
+
+        // The hosting lifetime's report of an HTTPS address the server listens on.
+        [GeneratedRegex(@"Now listening on: (?<address>https://\S+)", RegexOptions.CultureInvariant)]
+        private static partial Regex HttpsListeningReport();
+
+        private void OnLineReceived(object sender, DataReceivedEventArgs line)
+        {
+            // Null marks the end of the stream.
+            if (line.Data is null)
+            {
+                return;
+            }
+
+            lock (_output)
+            {
+                _output.Append(line.Data).Append('\n');
+            }
+
+            Match report = HttpsListeningReport().Match(line.Data);
+            if (report.Success
+                && Uri.TryCreate(report.Groups["address"].Value, UriKind.Absolute, out Uri? address))
+            {
+                _httpsAddress.TrySetResult(address);
+            }
+        }
+    }
+
+    // A self-signed TLS server certificate for localhost and 127.0.0.1, valid for a day and made for one test. It is
+    // written as a PKCS #12 file under a random password into a new directory of its own under the temporary path,
+    // which on Unix only the current user can read. Disposing deletes the directory and everything in it.
+    private sealed class ThrowawayCertificate : IDisposable
+    {
+        private const string ServerAuthenticationOid = "1.3.6.1.5.5.7.3.1";
+
+        private readonly byte[] _rawData;
+
+        private ThrowawayCertificate(string directoryPath, string filePath, string password, byte[] rawData)
+        {
+            DirectoryPath = directoryPath;
+            FilePath = filePath;
+            Password = password;
+            _rawData = rawData;
+        }
+
+        public string DirectoryPath { get; }
+
+        public string FilePath { get; }
+
+        public string Password { get; }
+
+        public static ThrowawayCertificate Create()
+        {
+            string directoryPath = Path.Combine(Path.GetTempPath(), "smarthotel-tls-" + Guid.NewGuid().ToString("N"));
+            if (OperatingSystem.IsWindows())
+            {
+                Directory.CreateDirectory(directoryPath);
+            }
+            else
+            {
+                Directory.CreateDirectory(
+                    directoryPath,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            try
+            {
+                using RSA key = RSA.Create(2048);
+                CertificateRequest request = new(
+                    "CN=localhost",
+                    key,
+                    HashAlgorithmName.SHA256,
+                    RSASignaturePadding.Pkcs1);
+                SubjectAlternativeNameBuilder names = new();
+                names.AddDnsName("localhost");
+                names.AddIpAddress(IPAddress.Loopback);
+                request.CertificateExtensions.Add(names.Build());
+                request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+                request.CertificateExtensions.Add(new X509KeyUsageExtension(
+                    X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
+                    critical: true));
+                request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+                    [new Oid(ServerAuthenticationOid)],
+                    critical: false));
+
+                DateTimeOffset now = TimeProvider.System.GetUtcNow();
+                using X509Certificate2 certificate = request.CreateSelfSigned(now.AddMinutes(-5), now.AddDays(1));
+                string password = RandomNumberGenerator.GetHexString(32, lowercase: true);
+                string filePath = Path.Combine(directoryPath, "api.pfx");
+
+                FileStreamOptions options = new() { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+                if (!OperatingSystem.IsWindows())
+                {
+                    options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                }
+
+                using (FileStream file = new(filePath, options))
+                {
+                    file.Write(certificate.Export(X509ContentType.Pkcs12, password));
+                }
+
+                return new ThrowawayCertificate(directoryPath, filePath, password, certificate.RawData);
+            }
+            catch
+            {
+                Directory.Delete(directoryPath, recursive: true);
+                throw;
+            }
+        }
+
+        // Whether a presented certificate is this one, byte for byte.
+        public bool IsSameAs(X509Certificate presented)
+        {
+            return presented.GetRawCertData().AsSpan().SequenceEqual(_rawData);
+        }
+
+        public void Dispose()
+        {
+            if (Directory.Exists(DirectoryPath))
+            {
+                Directory.Delete(DirectoryPath, recursive: true);
+            }
         }
     }
 }

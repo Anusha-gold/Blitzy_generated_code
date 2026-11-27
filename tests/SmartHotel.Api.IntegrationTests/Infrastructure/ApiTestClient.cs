@@ -1,11 +1,14 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 using Xunit.Sdk;
 
@@ -20,7 +23,9 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// <para>
 /// The nested wire records are declared here, independently of the API's contract records, so the serialized shape
 /// the API sends is what the tests verify: a renamed member or a changed format fails deserialization or an
-/// assertion instead of changing on both sides at once.
+/// assertion instead of changing on both sides at once. <see cref="ReadAsync{T}"/> checks a success body against
+/// that shape on the raw JSON before it binds: the media type, the exact camelCase member set and each member's
+/// JSON kind and format.
 /// </para>
 /// <para>
 /// One instance is safe for concurrent requests. Each request is its own <see cref="HttpRequestMessage"/> that
@@ -28,12 +33,13 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// so concurrent requests with different tokens cannot see each other's headers.
 /// </para>
 /// <para>
-/// No helper writes output. Failure messages carry only the operation, the numeric status codes and the name of the
-/// expected wire type. They never quote a body, a header, a parser message, a token, a password or an email,
-/// because a response can carry any of them and test output is logged.
+/// No helper writes output. Failure messages carry only the operation, the numeric status codes, the name of the
+/// expected wire type and the members and JSON path it declares. They never quote a body, a member name taken from
+/// it, a header, a parser message, a token, a password or an email, because a response can carry any of them and
+/// test output is logged.
 /// </para>
 /// </remarks>
-public sealed class ApiTestClient
+public sealed partial class ApiTestClient
 {
     private const string RegisterRoute = "api/auth/register";
     private const string LoginRoute = "api/auth/login";
@@ -42,12 +48,32 @@ public sealed class ApiTestClient
 
     private const string BearerScheme = "Bearer";
     private const string JsonMediaType = "application/json";
+    private const string Utf8CharSet = "utf-8";
+    private const string CharSetParameter = "charset";
     private const string IsoDateFormat = "yyyy-MM-dd";
+    private const string CacheControlHeader = "Cache-Control";
+    private const string NoStoreDirective = "no-store";
+
+    // The JSON path of a response body's root, which every failure message's path starts from.
+    private const string RootPath = "$";
 
     // Fixed, non-secret values for throwaway guests in a per-class test database. The password meets the API's
     // 8-character minimum.
     private const string TestPassword = "Passw0rd!x";
     private const string TestFullName = "Test Guest";
+
+    // The settings ReadAsync binds a success body with once its raw JSON has passed the wire-shape check. Unlike the
+    // Web defaults of JsonOptions, they match member names case-sensitively, accept a number only as a JSON number
+    // and reject a member the wire record does not declare, so binding cannot silently repair a body the SPA would
+    // misread. Statuses stay strings through the enum converter, as the API writes them.
+    private static readonly JsonSerializerOptions StrictReadOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = false,
+        NumberHandling = JsonNumberHandling.Strict,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        Converters = { new JsonStringEnumConverter() },
+    };
 
     /// <summary>
     /// Wraps <paramref name="http"/>, whose base address is the host's root, so every route is relative.
@@ -69,10 +95,14 @@ public sealed class ApiTestClient
     public HttpClient Http { get; }
 
     /// <summary>
-    /// The serializer options for request bodies and wire records: the Web defaults (camelCase names,
-    /// case-insensitive reading, numbers in quotes accepted on read) plus string enums. The Web defaults never omit a
-    /// <see langword="null"/> member, so a body can send an explicit JSON <c>null</c>.
+    /// The serializer options for request bodies: the Web defaults (camelCase names) plus string enums. The Web
+    /// defaults never omit a <see langword="null"/> member, so a body can send an explicit JSON <c>null</c>.
     /// </summary>
+    /// <remarks>
+    /// Their reading side is tolerant: it ignores letter case and unknown members and accepts numbers in quotes. No
+    /// helper reads a response with them; <see cref="ReadAsync{T}"/> checks the raw body and then binds with strict
+    /// settings instead.
+    /// </remarks>
     public static JsonSerializerOptions JsonOptions { get; } = new(JsonSerializerDefaults.Web)
     {
         Converters = { new JsonStringEnumConverter() },
@@ -261,48 +291,140 @@ public sealed class ApiTestClient
     }
 
     /// <summary>
-    /// Deserializes the body of <paramref name="response"/> as <typeparamref name="T"/> through
-    /// <see cref="JsonOptions"/>.
+    /// Reads the success body of <paramref name="response"/> as <typeparamref name="T"/>, after checking it against
+    /// the wire contract the SPA relies on: JSON, UTF-8, camelCase members, dates exactly <c>yyyy-MM-dd</c>,
+    /// timestamps in UTC with a <c>Z</c> suffix and money as a JSON number with two decimals.
     /// </summary>
-    /// <typeparam name="T">A wire record, or a list of them.</typeparam>
+    /// <remarks>
+    /// <para>The checks run in this order, and the first failure fails the test:</para>
+    /// <list type="number">
+    /// <item><description>
+    /// <c>Content-Type</c> has the media type <c>application/json</c>, compared case-insensitively, and either no
+    /// <c>charset</c> parameter or exactly one whose value is <c>utf-8</c> in any letter case, written as a token or
+    /// as a quoted-string, which is compared without its quotes and with each quoted-pair unescaped. Any other
+    /// charset name fails, the registered alias <c>csUTF8</c> and the unregistered spelling <c>utf8</c> included, and
+    /// so does a malformed declaration: a <c>charset</c> without a value, an unterminated quoted-string or a repeated
+    /// <c>charset</c> parameter.
+    /// </description></item>
+    /// <item><description>
+    /// The body is well-formed JSON whose shape matches the one <typeparamref name="T"/> declares, checked on the raw
+    /// JSON independently of binding. A wire record is a JSON object whose members are exactly its constructor
+    /// parameters named in camelCase, each once, compared ordinally, so a missing, extra, repeated or
+    /// differently-cased member fails. An <see cref="int"/> member is a JSON number with an integral
+    /// <see cref="int"/> value; a <see cref="decimal"/> member is a JSON number, never a string, written with exactly
+    /// two decimal places; a <see cref="string"/> member is a JSON string, never <c>null</c>; a
+    /// <see cref="DateOnly"/> member is a string of exactly <c>yyyy-MM-dd</c> that names a real date; a
+    /// <see cref="DateTime"/> member is a UTC ISO 8601 string ending in <c>Z</c>; and a <see cref="List{T}"/> or
+    /// <see cref="IReadOnlyList{T}"/>, at the top level or as a member, is a JSON array whose every element is checked
+    /// the same way.
+    /// </description></item>
+    /// <item><description>
+    /// The body then binds with strict settings: case-sensitive camelCase names, numbers only as JSON numbers, no
+    /// member the record does not declare, and statuses as strings.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// Failure messages name only <typeparamref name="T"/> and the expected member's JSON path, such as
+    /// <c>$[1].totalPrice</c>. They never quote the body, a member name taken from it, a header value or a parser
+    /// message, because a response can carry a token or an email and test output is logged.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="T">
+    /// A nested wire record such as <see cref="Booking"/>, or a <see cref="List{T}"/> or
+    /// <see cref="IReadOnlyList{T}"/> of one.
+    /// </typeparam>
     /// <param name="response">The response to read. It is not disposed; the caller owns it.</param>
     /// <param name="cancellationToken">Cancels reading the body.</param>
-    /// <returns>The deserialized body.</returns>
+    /// <returns>The body, bound to <typeparamref name="T"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="response"/> is <see langword="null"/>.</exception>
-    /// <exception cref="InvalidOperationException">The body is the JSON literal <c>null</c>.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <typeparamref name="T"/>, or a member type it declares, has no wire shape: it is none of the scalar types
+    /// above, a list of one, or a record whose single public constructor declares its members.
+    /// </exception>
     /// <exception cref="FailException">
-    /// The body is not JSON of the shape <typeparamref name="T"/> declares, or its <c>Content-Type</c> declares an
-    /// unsupported character set. The message names only <typeparamref name="T"/>.
+    /// The media type or charset is wrong, the body is not well-formed JSON, it does not match the shape
+    /// <typeparamref name="T"/> declares, or it does not bind.
     /// </exception>
     // An instance member although it reads no instance state (CA1822, info): tests call it on the client they send
     // requests with, which a static member would not allow.
     public async Task<T> ReadAsync<T>(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(response);
+        string wireType = WireTypeName(typeof(T));
 
-        T? value;
+        // Media types and charset names are case-insensitive (RFC 9110, sections 8.3.1 and 8.3.2).
+        MediaTypeHeaderValue? contentType = response.Content.Headers.ContentType;
+        bool isJson = string.Equals(contentType?.MediaType, JsonMediaType, StringComparison.OrdinalIgnoreCase);
+        bool isUtf8 = contentType is not null && HasUtf8OrNoCharSet(contentType);
+        if (!isJson || !isUtf8)
+        {
+            throw FailException.ForFailure(
+                $"Expected the {wireType} response to have Content-Type {JsonMediaType} with no charset or "
+                + $"{Utf8CharSet} but "
+                + (contentType is null ? "it has no valid Content-Type." : "it has another media type or charset."));
+        }
+
+        // The charset is UTF-8 or absent, and JSON without one is UTF-8 (RFC 8259, section 8.1), so the bytes are
+        // parsed as they arrived.
+        byte[] body = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        JsonDocument document;
         try
         {
-            value = await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
+            document = JsonDocument.Parse(body);
         }
-        catch (Exception exception) when (exception is JsonException or NotSupportedException)
+        catch (JsonException)
         {
-            // The serializer's messages name the JSON path and quote characters of the body, which can belong to a
-            // token or an email, so neither the message nor the exception is passed on.
-            throw FailException.ForFailure(
-                $"Expected the response body to be JSON of the {typeof(T).Name} shape but it could not be read "
-                + "as one.");
-        }
-        catch (InvalidOperationException exception) when (exception.InnerException is ArgumentException)
-        {
-            // HttpContent rejects an unknown charset this way, and the inner exception quotes the header value.
-            throw FailException.ForFailure(
-                $"Expected the response body to be JSON of the {typeof(T).Name} shape but the Content-Type declares "
-                + "an unsupported character set.");
+            // The parser's message quotes characters of the body, so neither it nor the exception is passed on.
+            throw FailException.ForFailure($"Expected the {wireType} response body to be well-formed JSON.");
         }
 
-        return value ?? throw new InvalidOperationException(
-            $"The response body deserialized to null instead of a {typeof(T).Name}.");
+        using (document)
+        {
+            CheckWireValue(document.RootElement, typeof(T), RootPath, wireType);
+
+            T? value;
+            try
+            {
+                value = document.RootElement.Deserialize<T>(StrictReadOptions);
+            }
+            catch (JsonException)
+            {
+                // As above, the serializer's message names the path and can quote the body.
+                throw FailException.ForFailure(
+                    $"Expected the {wireType} response body to bind to its wire record with strict settings.");
+            }
+
+            return value ?? throw FailException.ForFailure(
+                $"Expected the {wireType} response body to bind to a value rather than to null.");
+        }
+    }
+
+    /// <summary>
+    /// Asserts that <paramref name="response"/> carries exactly one <c>Cache-Control</c> header whose whole value is
+    /// <c>no-store</c>, the policy for a response that holds one guest's own data.
+    /// </summary>
+    /// <param name="response">The response to check. It is not disposed; the caller owns it.</param>
+    /// <param name="operation">
+    /// A fixed label for the request, such as <c>GET api/bookings</c>, which the failure message names.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="response"/> or <paramref name="operation"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="FailException">
+    /// The header is missing, repeated or has any other value. The message never quotes the header.
+    /// </exception>
+    public static void AssertNoStore(HttpResponseMessage response, string operation)
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        ArgumentNullException.ThrowIfNull(operation);
+
+        // The values are compared as received, before any parsing, so a directive added beside no-store, such as
+        // max-age or no-cache, or a second Cache-Control line also fails.
+        HttpHeadersNonValidated headers = response.Headers.NonValidated;
+        string[] received = headers.TryGetValues(CacheControlHeader, out HeaderStringValues values) ? [.. values] : [];
+        Assert.True(
+            received.Length == 1 && string.Equals(received[0], NoStoreDirective, StringComparison.Ordinal),
+            $"Expected {operation} to answer with exactly {CacheControlHeader}: {NoStoreDirective}.");
     }
 
     /// <summary>
@@ -459,6 +581,261 @@ public sealed class ApiTestClient
 
         Assert.Fail($"Expected {operation} to return {(int)expected} but got {(int)response.StatusCode}.");
     }
+
+    // True when the media type declares no charset, or exactly one whose value names UTF-8. A parameter value is a
+    // token or a quoted-string (RFC 9110, section 5.6.6), so charset=utf-8 and charset="UTF-8" declare the same
+    // encoding (section 8.3.1), but MediaTypeHeaderValue keeps a quoted-string as written, quotes included, so the
+    // value is unquoted before the case-insensitive comparison. A charset without a value, a quoted-string that does
+    // not close at the value's end and a repeated charset parameter (RFC 6838, section 4.3) are malformed and fail.
+    // Only the registered name is accepted, because it is what the API writes: the alias csUTF8 and the unregistered
+    // spelling utf8 fail as well.
+    private static bool HasUtf8OrNoCharSet(MediaTypeHeaderValue contentType)
+    {
+        NameValueHeaderValue[] charSets =
+        [
+            .. contentType.Parameters.Where(
+                parameter => string.Equals(parameter.Name, CharSetParameter, StringComparison.OrdinalIgnoreCase)),
+        ];
+        if (charSets.Length == 0)
+        {
+            return true;
+        }
+
+        return charSets.Length == 1
+            && charSets[0].Value is { } value
+            && TryUnquoteParameterValue(value, out string? name)
+            && string.Equals(name, Utf8CharSet, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Reads a parameter value as its text: a token is returned unchanged, and a quoted-string (RFC 9110, section
+    // 5.6.4) loses its surrounding quotes and has each quoted-pair replaced by the character after the backslash.
+    // Fails for an empty value, and for a quoted-string whose closing quote is missing or is not the last character.
+    private static bool TryUnquoteParameterValue(string value, [NotNullWhen(true)] out string? text)
+    {
+        text = null;
+        if (value.Length == 0)
+        {
+            return false;
+        }
+
+        if (value[0] != '"')
+        {
+            text = value;
+            return true;
+        }
+
+        StringBuilder unquoted = new(value.Length);
+        for (int index = 1; index < value.Length; index++)
+        {
+            char current = value[index];
+            if (current == '"')
+            {
+                if (index != value.Length - 1)
+                {
+                    return false;
+                }
+
+                text = unquoted.ToString();
+                return true;
+            }
+
+            if (current == '\\')
+            {
+                index++;
+                if (index == value.Length)
+                {
+                    return false;
+                }
+
+                current = value[index];
+            }
+
+            unquoted.Append(current);
+        }
+
+        return false;
+    }
+
+    // The name failure messages give a wire type: a record's own name, or "list of" followed by its element's name.
+    private static string WireTypeName(Type type)
+    {
+        return TryGetListElementType(type, out Type? elementType)
+            ? $"list of {WireTypeName(elementType)}"
+            : type.Name;
+    }
+
+    // A list on the wire is a JSON array; List<T> and IReadOnlyList<T> are the forms the wire records and tests use.
+    private static bool TryGetListElementType(Type type, [NotNullWhen(true)] out Type? elementType)
+    {
+        if (type.IsGenericType
+            && (type.GetGenericTypeDefinition() == typeof(List<>)
+                || type.GetGenericTypeDefinition() == typeof(IReadOnlyList<>)))
+        {
+            elementType = type.GetGenericArguments()[0];
+            return true;
+        }
+
+        elementType = null;
+        return false;
+    }
+
+    // Checks one raw JSON value against the form the wire contract gives its declared type, recursing into arrays and
+    // objects. The path names only expected members and array positions, never anything read from the body.
+    private static void CheckWireValue(JsonElement element, Type declaredType, string path, string wireType)
+    {
+        if (declaredType == typeof(int))
+        {
+            RequireWireForm(
+                element.ValueKind == JsonValueKind.Number && element.TryGetInt32(out _),
+                wireType,
+                path,
+                "a JSON number with an integral Int32 value");
+        }
+        else if (declaredType == typeof(decimal))
+        {
+            // The raw text is checked because a decimal binds 129, 129.0 and 1.29e2 alike, while the contract
+            // writes money with exactly two decimals.
+            RequireWireForm(
+                element.ValueKind == JsonValueKind.Number
+                    && MoneyPattern().IsMatch(element.GetRawText())
+                    && element.TryGetDecimal(out _),
+                wireType,
+                path,
+                "a JSON number written with exactly two decimal places");
+        }
+        else if (declaredType == typeof(string))
+        {
+            RequireWireForm(element.ValueKind == JsonValueKind.String, wireType, path, "a JSON string");
+        }
+        else if (declaredType == typeof(DateOnly))
+        {
+            RequireWireForm(
+                element.ValueKind == JsonValueKind.String
+                    && element.GetString() is string date
+                    && IsoDatePattern().IsMatch(date)
+                    && DateOnly.TryParseExact(
+                        date,
+                        IsoDateFormat,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out _),
+                wireType,
+                path,
+                "a JSON string of exactly yyyy-MM-dd that names a real date");
+        }
+        else if (declaredType == typeof(DateTime))
+        {
+            RequireWireForm(
+                element.ValueKind == JsonValueKind.String
+                    && element.GetString() is string instant
+                    && UtcTimestampPattern().IsMatch(instant)
+                    && DateTime.TryParse(
+                        instant,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind,
+                        out DateTime parsed)
+                    && parsed.Kind == DateTimeKind.Utc,
+                wireType,
+                path,
+                "a JSON string holding a real UTC ISO 8601 timestamp ending in Z");
+        }
+        else if (TryGetListElementType(declaredType, out Type? elementType))
+        {
+            RequireWireForm(element.ValueKind == JsonValueKind.Array, wireType, path, "a JSON array");
+
+            int index = 0;
+            foreach (JsonElement item in element.EnumerateArray())
+            {
+                CheckWireValue(
+                    item,
+                    elementType,
+                    string.Create(CultureInfo.InvariantCulture, $"{path}[{index}]"),
+                    wireType);
+                index++;
+            }
+        }
+        else
+        {
+            CheckWireObject(element, declaredType, path, wireType);
+        }
+    }
+
+    // A wire record is a JSON object with exactly the members its single public constructor declares, named in
+    // camelCase as the API's Web JSON options write them. Ordinal comparison makes letter case significant.
+    private static void CheckWireObject(JsonElement element, Type recordType, string path, string wireType)
+    {
+        ConstructorInfo[] constructors = recordType.GetConstructors();
+        if (!recordType.IsClass
+            || recordType.IsAbstract
+            || constructors.Length != 1
+            || constructors[0].GetParameters().Length == 0)
+        {
+            throw new NotSupportedException(
+                $"{recordType.Name} has no wire shape: it is not a supported scalar, a list or a record whose single "
+                + "public constructor declares its members.");
+        }
+
+        List<(string Name, Type Type)> declared = [];
+        foreach (ParameterInfo parameter in constructors[0].GetParameters())
+        {
+            string parameterName = parameter.Name ?? throw new NotSupportedException(
+                $"{recordType.Name} has no wire shape: a constructor parameter has no name.");
+            declared.Add((JsonNamingPolicy.CamelCase.ConvertName(parameterName), parameter.ParameterType));
+        }
+
+        (string Name, Type Type)[] members = [.. declared];
+        string expectedMembers = string.Join(", ", members.Select(static member => member.Name));
+
+        RequireWireForm(element.ValueKind == JsonValueKind.Object, wireType, path, "a JSON object");
+
+        HashSet<string> seen = new(StringComparer.Ordinal);
+        foreach (JsonProperty property in element.EnumerateObject())
+        {
+            int position = Array.FindIndex(
+                members,
+                member => string.Equals(member.Name, property.Name, StringComparison.Ordinal));
+            RequireWireForm(
+                position >= 0 && seen.Add(property.Name),
+                wireType,
+                path,
+                $"an object with exactly the members {expectedMembers}, each once, but it has another member or "
+                + "repeats one");
+
+            // The name is one of the expected members here, so the path it extends still quotes nothing of the body.
+            (string name, Type type) = members[position];
+            CheckWireValue(property.Value, type, $"{path}.{name}", wireType);
+        }
+
+        foreach ((string name, _) in members)
+        {
+            RequireWireForm(seen.Contains(name), wireType, path, $"an object with the member {name}");
+        }
+    }
+
+    private static void RequireWireForm(bool condition, string wireType, string path, string expectation)
+    {
+        if (!condition)
+        {
+            throw FailException.ForFailure(
+                $"Expected the {wireType} response body at {path} to be {expectation}.");
+        }
+    }
+
+    // Money as the contract writes it: an optional minus sign, an integer part without leading zeros, and exactly two
+    // decimal places, with no exponent.
+    [GeneratedRegex(@"\A-?(?:0|[1-9][0-9]*)\.[0-9]{2}\z", RegexOptions.CultureInvariant)]
+    private static partial Regex MoneyPattern();
+
+    // The exact yyyy-MM-dd form with ASCII digits; whether it is a real date is checked by parsing.
+    [GeneratedRegex(@"\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z", RegexOptions.CultureInvariant)]
+    private static partial Regex IsoDatePattern();
+
+    // ISO 8601 in UTC as System.Text.Json writes a UTC DateTime: whole seconds, then up to seven fractional digits,
+    // then Z. An offset such as +00:00 or a missing designator fails.
+    [GeneratedRegex(
+        @"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z\z",
+        RegexOptions.CultureInvariant)]
+    private static partial Regex UtcTimestampPattern();
 
     /// <summary>The 201 body of <c>POST /api/auth/register</c>: <c>{ "guestId": n }</c>.</summary>
     /// <param name="GuestId">The new guest's id.</param>

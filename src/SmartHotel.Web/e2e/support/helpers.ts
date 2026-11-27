@@ -186,6 +186,33 @@ export function utcDates(...offsetDays: number[]): string[] {
 }
 
 /**
+ * Returns a date as the web app displays it in this suite: `MM/dd/yyyy`, the
+ * `en-US` form. The app shows dates in the browser's own numeric order, the
+ * order its native date inputs use, and `playwright.config.ts` pins the
+ * browser's locale to `en-US`, so this is the form of every date the app
+ * displays in the suite, whatever the host's language settings. The app keeps
+ * `yyyy-MM-dd` in URLs and requests, so a spec compares against this form only
+ * where a date is on screen.
+ *
+ * The conversion only rearranges the digits, so it reads no clock and no time
+ * zone, and the calendar day is the one given.
+ *
+ * @param isoDate - The date as exactly `yyyy-MM-dd`, as {@link utcDates}
+ *   returns it.
+ * @returns The same date as `MM/dd/yyyy`; for example `'2026-12-07'` becomes
+ *   `'12/07/2026'`.
+ * @throws RangeError when `isoDate` is not of the form `yyyy-MM-dd`.
+ */
+export function displayDate(isoDate: string): string {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (parts === null) {
+    throw new RangeError(`displayDate expects a yyyy-MM-dd date, got "${isoDate}".`);
+  }
+  const [, year, month, day] = parts;
+  return `${month}/${day}/${year}`;
+}
+
+/**
  * Returns an email address that no earlier test has registered.
  *
  * It follows the `guest+<timestamp>@example.test` shape, with a random suffix

@@ -1,4 +1,5 @@
-/* My bookings page: the confirmation banner and the bookings table. */
+/* My bookings page: the confirmation banner and the bookings table. The
+   "Log in again" link takes the global in-content link sizing (src/styles.css). */
 :host {
   display: block;
   /* On white: success 6.3:1. */
@@ -44,23 +45,67 @@
   overflow-x: auto;
 }
 
-/* Width, collapse, start-aligned headers and row rules are the global table base. */
+/* Width, collapse, padding, start-aligned headers and row rules are the global
+   table base. Paging and Cancel move no column and resize no row: Room type and
+   Room fit their headers, Check-in to Status reserve the content width of their
+   widest value (a date, "30 nights", "4 guests", a five-digit total,
+   "Confirmed"), the last column the Cancel button's label, padding, border and
+   height, and Hotel takes the rest. Total reserves seven digits instead when
+   any loaded booking, on any page, has six or more. Each width is also the
+   minimum while the table scrolls; wider content, as in a wider font, still
+   widens its column instead of overlapping. */
 .bookings th,
 .bookings td {
-  padding-inline: 0.5rem;
+  box-sizing: content-box;
 }
 
-/* Only the hotel name wraps; dates would otherwise break at their hyphens. */
+.bookings th:nth-child(4),
+.bookings th:nth-child(5) {
+  inline-size: 9.4ch;
+  min-inline-size: 9.4ch;
+}
+
+.bookings th:nth-child(6) {
+  inline-size: 7.75ch;
+  min-inline-size: 7.75ch;
+}
+
+.bookings th:nth-child(7) {
+  inline-size: 7.1ch;
+  min-inline-size: 7.1ch;
+}
+
+.bookings th:nth-child(8) {
+  inline-size: 9.1ch;
+  min-inline-size: 9.1ch;
+}
+
+.bookings.wide-totals th:nth-child(8) {
+  inline-size: 11.6ch;
+  min-inline-size: 11.6ch;
+}
+
+.bookings th:nth-child(9) {
+  inline-size: 9.4ch;
+  min-inline-size: 9.4ch;
+}
+
+.bookings th:last-child {
+  inline-size: calc(5.6ch + 1.875rem);
+  min-inline-size: calc(5.6ch + 1.875rem);
+}
+
+.bookings td:last-child {
+  block-size: 2.75rem;
+}
+
+/* Only the hotel name wraps; "Check-in" and "30 nights" would otherwise break. */
 .bookings th:not(:first-child),
 .bookings td:not(:first-child) {
   white-space: nowrap;
 }
 
-.bookings thead th {
-  border-block-end: 2px solid var(--sh-color-control-border);
-}
-
-.money {
+.num {
   text-align: end;
   font-variant-numeric: tabular-nums;
 }

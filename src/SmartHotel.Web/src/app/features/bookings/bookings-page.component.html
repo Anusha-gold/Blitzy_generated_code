@@ -12,7 +12,7 @@
 >
   <h2>Booking confirmed</h2>
   <p>{{ c.hotelName }}, {{ c.roomTypeName }}, room {{ c.roomNumber }}</p>
-  <p>{{ c.checkIn }} to {{ c.checkOut }}, {{ c.nights }} {{ c.nights === 1 ? 'night' : 'nights' }}</p>
+  <p><time [attr.datetime]="c.checkIn">{{ c.checkIn | date }}</time> to <time [attr.datetime]="c.checkOut">{{ c.checkOut | date }}</time>, {{ c.nights }} {{ c.nights === 1 ? 'night' : 'nights' }}</p>
   <p>Total: {{ c.totalPrice | currency: 'USD' }}</p>
   <p>No payment is taken online in this version.</p>
 </section>
@@ -39,18 +39,18 @@
       tabindex="0"
       data-testid="bookings-scroll"
     >
-      <table class="bookings" data-testid="bookings-table">
+      <table class="bookings" [class.wide-totals]="hasWideTotals()" data-testid="bookings-table">
         <caption id="bookings-caption" class="visually-hidden">Your bookings, newest first</caption>
         <thead>
           <tr>
             <th scope="col">Hotel</th>
             <th scope="col">Room type</th>
-            <th scope="col">Room</th>
+            <th scope="col" class="num">Room</th>
             <th scope="col">Check-in</th>
             <th scope="col">Check-out</th>
-            <th scope="col">Nights</th>
-            <th scope="col">Guests</th>
-            <th scope="col" class="money">Total</th>
+            <th scope="col" class="num">Nights</th>
+            <th scope="col" class="num">Guests</th>
+            <th scope="col" class="num">Total</th>
             <th scope="col">Status</th>
             <th scope="col"><span class="visually-hidden">Actions</span></th>
           </tr>
@@ -59,12 +59,12 @@
           <tr *ngFor="let b of visibleBookings(); trackBy: trackById" [attr.data-testid]="'booking-row-' + b.id">
             <td>{{ b.hotelName }}</td>
             <td>{{ b.roomTypeName }}</td>
-            <td>{{ b.roomNumber }}</td>
-            <td>{{ b.checkIn }}</td>
-            <td>{{ b.checkOut }}</td>
-            <td>{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
-            <td>{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
-            <td class="money" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
+            <td class="num">{{ b.roomNumber }}</td>
+            <td><time [attr.datetime]="b.checkIn">{{ b.checkIn | date }}</time></td>
+            <td><time [attr.datetime]="b.checkOut">{{ b.checkOut | date }}</time></td>
+            <td class="num">{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
+            <td class="num">{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
+            <td class="num" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
             <td
               class="status"
               [class.status-confirmed]="b.status === 'Confirmed'"
@@ -85,7 +85,7 @@
                 [disabled]="cancelPending()"
                 #cancelButton
                 (click)="cancel(b, cancelButton)"
-              >Cancel<span class="visually-hidden"> booking at {{ b.hotelName }}, {{ b.roomTypeName }} room {{ b.roomNumber }}, {{ b.checkIn }} to {{ b.checkOut }}</span></button>
+              >Cancel<span class="visually-hidden"> booking at {{ b.hotelName }}, {{ b.roomTypeName }} room {{ b.roomNumber }}, {{ b.checkIn | date }} to {{ b.checkOut | date }}</span></button>
             </td>
           </tr>
         </tbody>

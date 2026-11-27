@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Net;
-using System.Text.Json;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -190,21 +189,37 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
         }
 
         // Apart from the arranged instant and the cancellation, each listed booking is exactly the one its 201 body
-        // described.
+        // described. Record equality compares every member, and each message names only which booking differs, never
+        // a listed value, because test output is logged.
         ApiTestClient.Booking listedFirst = listA[0];
         ApiTestClient.Booking listedThird = listA[1];
         ApiTestClient.Booking listedSecond = listA[2];
         Assert.Equal("Confirmed", listedFirst.Status);
         Assert.Equal("Confirmed", listedThird.Status);
         Assert.Equal("Cancelled", listedSecond.Status);
-        Assert.Equal(first with { CreatedAt = latestCreatedAt }, listedFirst);
-        Assert.Equal(third with { CreatedAt = tiedCreatedAt }, listedThird);
-        Assert.Equal(second with { CreatedAt = tiedCreatedAt, Status = "Cancelled" }, listedSecond);
+        Assert.True(
+            EqualityComparer<ApiTestClient.Booking>.Default.Equals(
+                first with { CreatedAt = latestCreatedAt },
+                listedFirst),
+            "Expected list entry 1 to be guest A's first booking as created, with its arranged createdAt.");
+        Assert.True(
+            EqualityComparer<ApiTestClient.Booking>.Default.Equals(
+                third with { CreatedAt = tiedCreatedAt },
+                listedThird),
+            "Expected list entry 2 to be guest A's third booking as created, with the tied createdAt.");
+        Assert.True(
+            EqualityComparer<ApiTestClient.Booking>.Default.Equals(
+                second with { CreatedAt = tiedCreatedAt, Status = "Cancelled" },
+                listedSecond),
+            "Expected list entry 3 to be guest A's second booking as created, cancelled, with the tied createdAt.");
 
+        // Guest B's one booking is listed exactly as its 201 body described it; no instant of it was rewritten.
         List<ApiTestClient.Booking> listB = await ListOkAsync(client, guestB.Token, ct);
 
-        ApiTestClient.Booking onlyB = Assert.Single(listB);
-        Assert.Equal(other.Id, onlyB.Id);
+        Assert.True(listB.Count == 1, "Expected guest B's list to hold exactly its one booking.");
+        Assert.True(
+            EqualityComparer<ApiTestClient.Booking>.Default.Equals(other, listB[0]),
+            "Expected guest B's listed booking to be its booking as created, member for member.");
     }
 
     [Fact]
@@ -216,10 +231,12 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
         using HttpResponseMessage response = await _client.ListBookingsAsync(guest.Token, ct);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        string body = await response.Content.ReadAsStringAsync(ct);
-        using JsonDocument document = JsonDocument.Parse(body);
-        Assert.Equal(JsonValueKind.Array, document.RootElement.ValueKind);
-        Assert.Empty(document.RootElement.EnumerateArray());
+        ApiTestClient.AssertNoStore(response, "GET api/bookings");
+
+        // Even an empty list is a success body, so the strict reader checks it like any other: Content-Type
+        // application/json in UTF-8 and a JSON array. The message names no listed value, because test output is logged.
+        List<ApiTestClient.Booking> bookings = await _client.ReadAsync<List<ApiTestClient.Booking>>(response, ct);
+        Assert.True(bookings.Count == 0, "Expected a guest with no bookings to get the empty JSON array.");
     }
 
     private static async Task<List<ApiTestClient.Booking>> ListOkAsync(
@@ -229,7 +246,9 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
     {
         using HttpResponseMessage response = await client.ListBookingsAsync(token, ct);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        ApiTestClient.AssertNoStore(response, "GET api/bookings");
 
+        // The strict reader checks the media type and every member's name, JSON kind and format before it binds.
         return await client.ReadAsync<List<ApiTestClient.Booking>>(response, ct);
     }
 

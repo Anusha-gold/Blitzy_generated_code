@@ -2,9 +2,41 @@
 // the app's navigation. The redirect routes ('' and '**') are checked by
 // direct URLs, because they are not navigation targets; every navigable route
 // is then reached by clicks alone after one initial load of /search.
-import { test, expect } from '@playwright/test';
+//
+// The session lifecycle is checked on the same routes. The reachability test
+// ends by logging out from /bookings, so only "Log out" itself can bring the
+// guest to /search, and it must send no API request. A separate test reloads
+// /bookings while signed in: the session lives only in memory, so the reload
+// starts signed out, authGuard redirects to /login?returnUrl=%2Fbookings
+// without the session-expired notice, and no API request leaves the page until
+// the guest logs in again, after which the login returns them to /bookings and
+// only then loads the list.
+import { test, expect, type Page, type Request } from '@playwright/test';
 
-import { expectSignedInAs, logIn, registerGuest, searchHotels, TEST_PASSWORD, uniqueEmail, utcDates } from './support/helpers';
+import { apiUrl, expectSignedInAs, logIn, registerGuest, searchHotels, TEST_PASSWORD, uniqueEmail, utcDates } from './support/helpers';
+
+/**
+ * Starts recording, in order, the requests the page sends to the API the run
+ * targets, each as `METHOD /path` with no query and no headers. A request
+ * counts only when its origin is the API's and its path is the API's base path
+ * or lies below it, so a call to any other backend is never mistaken for one
+ * to this API. With `ignorePreflight` set, CORS preflight `OPTIONS` requests
+ * are left out, leaving the calls the app itself makes.
+ */
+function recordApiRequests(page: Page, options: { ignorePreflight: boolean }): { requests: string[]; stop: () => void } {
+  const api = new URL(apiUrl());
+  const requests: string[] = [];
+  const record = (request: Request): void => {
+    const url = new URL(request.url());
+    const toApi =
+      url.origin === api.origin && (url.pathname === api.pathname || url.pathname.startsWith(`${api.pathname}/`));
+    if (toApi && !(options.ignorePreflight && request.method() === 'OPTIONS')) {
+      requests.push(`${request.method()} ${url.pathname}`);
+    }
+  };
+  page.on('request', record);
+  return { requests, stop: () => page.off('request', record) };
+}
 
 test('entry and unknown URLs redirect to search', async ({ page }) => {
   const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
@@ -165,4 +197,75 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(page.getByTestId('nav-bookings')).toHaveAttribute('aria-current', 'page');
     await expect(page.getByTestId('nav-search')).not.toHaveAttribute('aria-current');
   });
+
+  // The earlier "Log out" ran on bare /search, where the page would stay even
+  // if logging out did not navigate. From /bookings only "Log out" itself can
+  // reach /search, and it calls no endpoint.
+  await test.step('"Log out" from My bookings opens /search without an API request', async () => {
+    const recorder = recordApiRequests(page, { ignorePreflight: false });
+    try {
+      await page.getByTestId('nav-logout').click();
+      await expect(page).toHaveURL(/\/search$/);
+      await expect(h1('Find a hotel')).toBeVisible();
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      expect(recorder.requests, 'API requests sent by "Log out" and the bare search page').toEqual([]);
+    } finally {
+      recorder.stop();
+    }
+  });
+});
+
+test('reloading My bookings signs the guest out and returns there after logging in again', async ({ page }) => {
+  const email = uniqueEmail();
+  const api = new URL(apiUrl());
+  const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
+
+  await test.step('a signed-in guest opens My bookings', async () => {
+    await page.goto('/register');
+    await expect(h1('Register')).toBeVisible();
+    await registerGuest(page, { email, password: TEST_PASSWORD, fullName: 'Reload Guest' });
+    await logIn(page, email, TEST_PASSWORD);
+
+    const [list] = await Promise.all([
+      page.waitForResponse((r) => {
+        const url = new URL(r.url());
+        return (
+          url.origin === api.origin && url.pathname === `${api.pathname}/bookings` && r.request().method() === 'GET'
+        );
+      }),
+      page.getByTestId('nav-bookings').click(),
+    ]);
+    expect(list.status(), 'status of GET /api/bookings before the reload').toBe(200);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(h1('My bookings')).toBeVisible();
+  });
+
+  const recorder = recordApiRequests(page, { ignorePreflight: true });
+  try {
+    await test.step('the reload starts signed out on /login, returning to /bookings, before any API request', async () => {
+      await page.reload();
+      await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+      await expect(h1('Log in')).toBeVisible();
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      // The notice region is always mounted; the guard's redirect leaves it
+      // empty, because only a server 401 adds the session-expired reason.
+      await expect(page.getByTestId('login-notice')).toHaveText('');
+      expect(recorder.requests, 'API requests between the reload and logging in again').toEqual([]);
+    });
+
+    await test.step('logging in again opens /bookings, which only then loads the list', async () => {
+      await logIn(page, email, TEST_PASSWORD);
+      await expect(page).toHaveURL(/\/bookings$/);
+      await expect(h1('My bookings')).toBeVisible();
+      await expect(page.getByTestId('bookings-empty')).toHaveText('You have no bookings yet.');
+      expect(recorder.requests, 'API requests from the reload through the bookings list').toEqual([
+        'POST /api/auth/login',
+        'GET /api/bookings',
+      ]);
+    });
+  } finally {
+    recorder.stop();
+  }
 });

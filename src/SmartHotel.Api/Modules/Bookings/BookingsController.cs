@@ -32,10 +32,18 @@ namespace SmartHotel.Api.Modules.Bookings;
 /// Every problem title and detail is fixed English text. A detail names at most a room type and ISO dates, never a
 /// guest id, an email address, a token, a price or exception text. Nothing is logged here.
 /// </para>
+/// <para>
+/// <c>[ResponseCache(NoStore = true)]</c> gives every result an action returns, the 201, the 200 list, the 204 and
+/// each problem it maps, exactly <c>Cache-Control: no-store</c>. Those responses describe one guest's own bookings
+/// under URLs that every session shares, so no cache, a browser's private cache included, may store them. Responses
+/// produced before an action runs, the JwtBearer 401 and MVC's 415 and binding 400, are left as the framework
+/// writes them; none of them carries booking data.
+/// </para>
 /// </remarks>
 /// <param name="bookings">The request-scoped booking service.</param>
 [ApiController]
 [Authorize]
+[ResponseCache(NoStore = true)]
 [Route("api/bookings")]
 public sealed class BookingsController(BookingService bookings) : ControllerBase
 {
@@ -73,8 +81,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// </description></item>
     /// <item><description>
     /// 201 with the confirmed booking, <c>{ id, hotelId, hotelName, roomTypeId, roomTypeName, roomNumber, checkIn,
-    /// checkOut, nights, guests, totalPrice, status, createdAt }</c>. There is no <c>Location</c> header, because no
-    /// endpoint reads a single booking.
+    /// checkOut, nights, guests, totalPrice, status, createdAt }</c>, and <c>Cache-Control: no-store</c>. There is
+    /// no <c>Location</c> header, because no endpoint reads a single booking.
     /// </description></item>
     /// </list>
     /// </remarks>
@@ -128,6 +136,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// <item><description>
     /// 200 with the caller's bookings, in the same shape as the 201 body of <see cref="Create"/>, ordered by
     /// <c>createdAt</c> and then <c>id</c>, both descending. The list is <c>[]</c> when the guest has no bookings.
+    /// The response carries <c>Cache-Control: no-store</c>: every session reads its own list from this one URL, so a
+    /// stored copy could be served to the next guest who signs in on the same browser.
     /// </description></item>
     /// <item><description>
     /// 401, from JwtBearer, when the bearer token is missing, invalid or expired, or carries no valid guest id in

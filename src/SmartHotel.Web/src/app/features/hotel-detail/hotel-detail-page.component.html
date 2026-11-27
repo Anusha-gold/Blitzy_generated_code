@@ -8,7 +8,8 @@
 <div *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
   <p role="status" data-testid="late-booking-message">
     Your booking of {{ late.attempt.roomType.name }} at {{ late.attempt.hotel.name }}
-    from {{ late.attempt.hotel.checkIn }} to {{ late.attempt.hotel.checkOut }}
+    from <time [attr.datetime]="late.attempt.hotel.checkIn">{{ late.attempt.hotel.checkIn | date }}</time>
+    to <time [attr.datetime]="late.attempt.hotel.checkOut">{{ late.attempt.hotel.checkOut | date }}</time>
     {{ late.error === null ? 'is confirmed. No payment is taken online in this version.' : 'could not be confirmed.' }}
   </p>
   <a
@@ -59,7 +60,8 @@
     <p class="hotel-meta">{{ hotel.address }}</p>
     <p class="hotel-description">{{ hotel.description }}</p>
     <p class="hotel-stay">
-      {{ hotel.checkIn }} to {{ hotel.checkOut }},
+      <time [attr.datetime]="hotel.checkIn">{{ hotel.checkIn | date }}</time>
+      to <time [attr.datetime]="hotel.checkOut">{{ hotel.checkOut | date }}</time>,
       {{ hotel.nights }} {{ hotel.nights === 1 ? 'night' : 'nights' }},
       {{ hotel.guests }} {{ hotel.guests === 1 ? 'guest' : 'guests' }}
     </p>

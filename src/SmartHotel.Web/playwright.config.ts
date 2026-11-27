@@ -48,6 +48,9 @@ process.env['PLAYWRIGHT_NO_COPY_PROMPT'] = '1';
  * `E2E_API_URL`; such runs are for local iteration only.
  *
  * Browser: a single Chromium project, the browser Playwright 1.60.0 bundles.
+ * Its locale is pinned to `en-US` (`use.locale`): the app displays dates in
+ * the browser's own numeric order, so the pin keeps the dates the specs expect
+ * (`MM/dd/yyyy`) independent of the host's language settings.
  *
  * Execution is serial (`fullyParallel: false`, `workers: 1`): every spec
  * shares one stateful stack, and bookings made by one test change the
@@ -78,6 +81,7 @@ export default defineConfig({
   preserveOutput: 'never',
   use: {
     baseURL: target.baseUrl,
+    locale: 'en-US',
     trace: 'off',
     screenshot: 'off',
     video: 'off',

@@ -12,7 +12,9 @@
  * - enums as their names, as strings.
  *
  * Dates and timestamps stay `string`, never `Date`: `HttpClient` does not
- * revive dates, and the pages show the raw `yyyy-MM-dd` values.
+ * revive dates, and the pages pass the `yyyy-MM-dd` values on unchanged,
+ * formatting them only for display, through the `date` pipe's app-wide
+ * default format.
  *
  * The server is the only authority on validation. The bounds documented below
  * are the server's; the client does not repeat them, and the server's 400

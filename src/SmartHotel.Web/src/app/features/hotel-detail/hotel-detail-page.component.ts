@@ -11,7 +11,7 @@ import {
   signal,
 } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { CurrencyPipe, DOCUMENT, NgFor, NgIf } from '@angular/common';
+import { CurrencyPipe, DOCUMENT, DatePipe, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { Subject, catchError, distinctUntilChanged, finalize, map, merge, of, switchMap, take, tap } from 'rxjs';
@@ -152,7 +152,7 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
 @Component({
   selector: 'app-hotel-detail-page',
   standalone: true,
-  imports: [NgIf, NgFor, RouterLink, CurrencyPipe, ErrorMessageComponent],
+  imports: [NgIf, NgFor, RouterLink, CurrencyPipe, DatePipe, ErrorMessageComponent],
   templateUrl: './hotel-detail-page.component.html',
   styleUrl: './hotel-detail-page.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,

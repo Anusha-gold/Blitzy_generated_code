@@ -14,7 +14,7 @@ import {
   signal,
 } from '@angular/core';
 import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
-import { CurrencyPipe, DOCUMENT, Location, NgFor, NgIf } from '@angular/common';
+import { CurrencyPipe, DOCUMENT, DatePipe, Location, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { Router, RouterLink } from '@angular/router';
 import { finalize, skip, switchMap, tap } from 'rxjs';
@@ -117,7 +117,10 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
 @Component({
   selector: 'app-bookings-page',
   standalone: true,
-  imports: [NgIf, NgFor, RouterLink, CurrencyPipe, ErrorMessageComponent],
+  imports: [NgIf, NgFor, RouterLink, CurrencyPipe, DatePipe, ErrorMessageComponent],
+  // Lets the live-region messages format dates with the same pipe and app-wide
+  // default format as the template.
+  providers: [DatePipe],
   templateUrl: './bookings-page.component.html',
   styleUrl: './bookings-page.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -129,6 +132,12 @@ export class BookingsPageComponent implements AfterViewInit {
   private readonly auth = inject(AuthService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly changeDetector = inject(ChangeDetectorRef);
+
+  /**
+   * Formats the live-region messages' dates in the app's display format,
+   * which `DATE_PIPE_DEFAULT_OPTIONS` sets, as the template's `date` pipe does.
+   */
+  private readonly datePipe = inject(DatePipe);
 
   /**
    * The page's document: the resume listeners of the UTC date, and the focused
@@ -179,6 +188,17 @@ export class BookingsPageComponent implements AfterViewInit {
     const start = this.page() * PAGE_SIZE;
     return (this.bookings() ?? []).slice(start, start + PAGE_SIZE);
   });
+
+  /**
+   * Whether any loaded booking, on any page, totals $100,000.00 or more: six
+   * or seven integer digits, up to the largest valid total, $2,999,999.70.
+   * The table then reserves the Total column for that widest total on every
+   * page. Decided over the whole list, not the visible page, so paging, and
+   * the reload after a cancel, which returns the same totals, move no column.
+   */
+  protected readonly hasWideTotals = computed(() =>
+    (this.bookings() ?? []).some((b) => b.totalPrice >= 100_000),
+  );
 
   /**
    * The pager label's numbers: the one-based positions of the first and last
@@ -374,7 +394,8 @@ export class BookingsPageComponent implements AfterViewInit {
               : list.map((row): Booking => (row.id === b.id ? { ...row, status: 'Cancelled' } : row)),
           );
           this.announcement.set(
-            `Booking cancelled: ${b.hotelName}, room ${b.roomNumber}, ${b.checkIn} to ${b.checkOut}.`,
+            `Booking cancelled: ${b.hotelName}, room ${b.roomNumber}, ` +
+              `${this.displayDate(b.checkIn)} to ${this.displayDate(b.checkOut)}.`,
           );
         }),
         switchMap(() => this.api.list()),
@@ -646,13 +667,27 @@ export class BookingsPageComponent implements AfterViewInit {
     if (c !== null) {
       messages.push(
         `Booking confirmed: ${c.hotelName}, ${c.roomTypeName}, room ${c.roomNumber}, ` +
-          `${c.checkIn} to ${c.checkOut}. No payment is taken online in this version.`,
+          `${this.displayDate(c.checkIn)} to ${this.displayDate(c.checkOut)}. ` +
+          'No payment is taken online in this version.',
       );
     }
     if (list !== null && list.length === 0) {
       messages.push('You have no bookings yet.');
     }
     return messages.join(' ');
+  }
+
+  /**
+   * A stay date as a live-region message shows it: the app's display format,
+   * the same text the banner and the table show.
+   *
+   * @param isoDate - The date as the API sends it, `yyyy-MM-dd`.
+   * @returns The date in the `DatePipe` default format, such as `12/27/2026`;
+   *   the pipe yields `null` only for an empty string, which is returned as it
+   *   is.
+   */
+  private displayDate(isoDate: string): string {
+    return this.datePipe.transform(isoDate) ?? isoDate;
   }
 
   /** Cancels a pending live-region timer; does nothing when none is pending. */

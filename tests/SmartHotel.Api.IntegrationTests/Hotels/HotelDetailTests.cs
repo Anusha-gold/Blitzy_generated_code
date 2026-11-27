@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Net;
 
+using Microsoft.EntityFrameworkCore;
+
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 
 namespace SmartHotel.Api.IntegrationTests.Hotels;
@@ -103,15 +105,28 @@ public sealed class HotelDetailTests : IClassFixture<SmartHotelApiFactory>
         SmartHotelApiFactory.SeededRoomType family = await _factory.GetRoomTypeAsync(HotelName, "Family", ct);
         SmartHotelApiFactory.SeededRoomType suite = await _factory.GetRoomTypeAsync(HotelName, "Suite", ct);
 
+        var stored = await _factory.ExecuteDbAsync(
+            (db, token) => db.Hotels
+                .AsNoTracking()
+                .Where(hotel => hotel.Id == hotelId)
+                .Select(static hotel => new { hotel.Address, hotel.Description })
+                .SingleAsync(token),
+            ct);
+
         ApiTestClient.HotelDetail detail = await _client.GetHotelDetailAsync(hotelId, checkIn, checkOut, 2, ct);
 
         Assert.Equal(hotelId, detail.Id);
         Assert.Equal(HotelName, detail.Name);
         Assert.Equal(HotelCity, detail.City);
-        Assert.False(string.IsNullOrWhiteSpace(detail.Address), "Expected the hotel detail to carry an address.");
-        Assert.False(
-            string.IsNullOrWhiteSpace(detail.Description),
-            "Expected the hotel detail to carry a description.");
+
+        // The address and description are this hotel's own stored text, so another hotel's text or any placeholder
+        // fails. The messages name only the field, never the text the response carried.
+        Assert.True(
+            string.Equals(stored.Address, detail.Address, StringComparison.Ordinal),
+            "Expected the hotel detail to carry the hotel's stored address.");
+        Assert.True(
+            string.Equals(stored.Description, detail.Description, StringComparison.Ordinal),
+            "Expected the hotel detail to carry the hotel's stored description.");
         Assert.Equal(checkIn, detail.CheckIn);
         Assert.Equal(checkOut, detail.CheckOut);
         Assert.Equal(2, detail.Nights);

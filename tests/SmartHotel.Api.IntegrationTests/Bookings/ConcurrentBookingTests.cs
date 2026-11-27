@@ -35,9 +35,21 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan ObservationLimit = TimeSpan.FromSeconds(15);
+    // The whole drain, from the release: the wait for the client tasks, the factory's drain of the server's requests,
+    // its abort and grace included, and the last wait for the client tasks still pending.
     private static readonly TimeSpan DrainLimit = TimeSpan.FromSeconds(30);
 
-    // How long before the drain limit the requests still running are cancelled, which leaves them that long to stop.
+    // The least of DrainLimit left for the factory's drain once the wait for the client tasks ends: time to wait, to
+    // abort the requests still running and to give them its grace.
+    private static readonly TimeSpan ServerDrainReserve = TimeSpan.FromSeconds(4);
+
+    // The end of DrainLimit, kept for the client tasks still pending once the factory's drain has ended. The
+    // in-process server completes a client's task when the request's pipeline returns or the request is aborted, so
+    // they complete at once unless their requests never reached the server.
+    private static readonly TimeSpan ClientSettleLimit = TimeSpan.FromSeconds(1);
+
+    // How long before the wait for the client tasks ends the requests still running are cancelled, which leaves them
+    // that long to stop.
     private static readonly TimeSpan CancellationGrace = TimeSpan.FromSeconds(5);
 
     private readonly SmartHotelApiFactory _factory;
@@ -121,10 +133,10 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
             finally
             {
                 // Runs on success, on the observation timeout and on any failure, the test's cancellation included.
-                // Neither step throws, so the drain runs even when the release failed, and a request still running
-                // into the next test or into the factory's database drop is always reported.
+                // Neither step throws, so the drain runs even when the release failed, and a request whose server work
+                // is still running into the next test or into the factory's database drop is always reported.
                 await ReleaseLockAsync(holder, holderTx, failures);
-                await DrainAsync(requests, requestCancellation, responses, failures);
+                await DrainAsync(_factory, requests, requestCancellation, responses, failures);
             }
 
             ThrowFailures(failures);
@@ -254,38 +266,69 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
         }
     }
 
-    // Waits for every request, for at most DrainLimit from here and whatever the test's token says, so a cancelled
-    // test still waits for its requests. Those still running CancellationGrace before the limit are cancelled, which
-    // leaves them that long to stop. Then each response is collected for the caller to dispose, whatever happened to
-    // the others, and each failed or cancelled request is recorded. A request still running at the limit is recorded
-    // as one that did not stop, and disposes its response if it completes later. Failures are recorded for the
-    // caller, never thrown.
+    // Waits for every request, on the client and on the server, for at most DrainLimit from here, the release, in all,
+    // whatever the test's token says, so a cancelled test still waits for its requests. The client tasks are waited
+    // for first, until ServerDrainReserve and ClientSettleLimit are all that is left of DrainLimit at the latest, and
+    // the requests still running CancellationGrace before that are cancelled, which leaves them that long to stop. A
+    // client task can complete while its server handler and database commands go on, once the response has started
+    // or the request is aborted. So the factory's drain then waits for the server's own requests until only
+    // ClientSettleLimit is left, aborting those still running when only its grace is left of that. The client tasks
+    // still pending after it are given what is left of DrainLimit. Then each response is collected for the caller to
+    // dispose, whatever happened to the others, and each failed or cancelled request, each request whose server work
+    // did not stop and each client task still pending is recorded. A request whose client task is still pending can
+    // still reach the server, but it can start work only until the factory's dispose begins, which refuses it without
+    // passing it to the API. Failures are recorded for the caller, never thrown.
     private static async Task DrainAsync(
+        SmartHotelApiFactory factory,
         List<Task<HttpResponseMessage>> requests,
         CancellationTokenSource requestCancellation,
         List<HttpResponseMessage> responses,
         List<Exception> failures)
     {
-        TimeSpan cancelAfter = DrainLimit - CancellationGrace;
+        Stopwatch elapsed = Stopwatch.StartNew();
+        TimeSpan clientWaitLimit = DrainLimit - ServerDrainReserve - ClientSettleLimit;
+        TimeSpan cancelAfter = clientWaitLimit - CancellationGrace;
         requestCancellation.CancelAfter(cancelAfter);
+
+        // StoppedAsync never throws, so this completes only when every client task has stopped.
+        Task clientsStopped = Task.WhenAll(requests.Select(StoppedAsync));
+        await CompletesWithinAsync(clientsStopped, clientWaitLimit);
+
         try
         {
-            // StoppedAsync never throws, so the wait ends only when every request has stopped or at the limit.
-            await Task.WhenAll(requests.Select(StoppedAsync)).WaitAsync(DrainLimit, CancellationToken.None);
+            int serverRunning = await factory.DrainRequestsAsync(RemainingUntil(DrainLimit - ClientSettleLimit));
+            if (serverRunning > 0)
+            {
+                failures.Add(FailException.ForFailure(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{serverRunning} requests were still running on the server at the end of the "
+                    + $"{DrainLimit.TotalSeconds} s drain after the release, although aborted; the factory's dispose "
+                    + $"ends their database access before it drops the database.")));
+            }
         }
-        catch (TimeoutException)
+        catch (Exception exception)
         {
-            // The requests still running at the limit are counted and reported below.
+            // Aborting the server's requests failed. Recorded, never thrown, so the responses are still collected.
+            failures.Add(exception);
+        }
+
+        // The in-process server completes a client task when its request's pipeline returns or the request is aborted,
+        // so after a drain that left nothing running, only a request that never reached the server leaves its task
+        // pending here.
+        if (!clientsStopped.IsCompleted)
+        {
+            await CompletesWithinAsync(clientsStopped, RemainingUntil(DrainLimit));
         }
 
         List<Exception> requestFailures = [];
-        int stillRunning = 0;
+        int stillPending = 0;
         foreach (Task<HttpResponseMessage> request in requests)
         {
             if (!request.IsCompleted)
             {
-                stillRunning++;
-                _ = DisposeWhenStoppedAsync(request);
+                // Recorded below. Should its request reach the server later, it can start work only until the
+                // factory's dispose begins, which refuses it.
+                stillPending++;
                 continue;
             }
 
@@ -310,31 +353,40 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
                 requestFailures));
         }
 
-        if (stillRunning > 0)
+        if (stillPending > 0)
         {
             failures.Add(FailException.ForFailure(string.Create(
                 CultureInfo.InvariantCulture,
-                $"{stillRunning} of {requests.Count} booking requests did not stop within {DrainLimit.TotalSeconds} s "
-                + $"of the release, although cancelled after {cancelAfter.TotalSeconds} s; each disposes its response "
-                + $"if it completes later.")));
+                $"{stillPending} of {requests.Count} booking requests' client tasks were still pending at the end of "
+                + $"the {DrainLimit.TotalSeconds} s drain after the release, although cancelled "
+                + $"{cancelAfter.TotalSeconds} s after it; the factory's dispose refuses their requests from the "
+                + $"moment it begins.")));
+        }
+
+        // What is left from now until mark, measured from the release; zero once mark has passed.
+        TimeSpan RemainingUntil(TimeSpan mark)
+        {
+            TimeSpan remaining = mark - elapsed.Elapsed;
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
         }
 
         // Completes when the request stops, however it stops, and never throws.
         static async Task StoppedAsync(Task request) =>
             await request.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
-    }
 
-    // Takes over a request still running when the drain ended: disposes its response if one arrives, and otherwise
-    // observes its failure.
-    private static async Task DisposeWhenStoppedAsync(Task<HttpResponseMessage> request)
-    {
-        try
+        // Whether task completed within limit. Not the test's token: the drain must run in full while the test is
+        // being cancelled.
+        static async Task<bool> CompletesWithinAsync(Task task, TimeSpan limit)
         {
-            (await request).Dispose();
-        }
-        catch (Exception)
-        {
-            // Already reported: the drain counted this request as one that did not stop in time.
+            try
+            {
+                await task.WaitAsync(limit, CancellationToken.None);
+                return true;
+            }
+            catch (TimeoutException)
+            {
+                return false;
+            }
         }
     }
 

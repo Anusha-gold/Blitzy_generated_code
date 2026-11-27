@@ -271,53 +271,101 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         string[] requestMembers = ["checkIn", "checkOut", "guests", "hotelId", "roomTypeId"];
         Assert.Equal(requestMembers, body.Select(static member => member.Key).Order(StringComparer.Ordinal));
 
+        // From here on every assertion carries a fixed message that names only expected values and members, never
+        // what the response holds, because test output is logged.
         using HttpResponseMessage response = await _client.CreateBookingAsync(body, session.Token, ct);
-        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        Assert.True(response.StatusCode == HttpStatusCode.Created, "Expected POST api/bookings to return 201.");
 
-        string payload = await response.Content.ReadAsStringAsync(ct);
-        using JsonDocument document = JsonDocument.Parse(payload);
+        // The booking is one guest's own data, so no cache may store it.
+        ApiTestClient.AssertNoStore(response, "POST api/bookings");
+
+        // The strict reader checks the raw body before it binds, because a bound value cannot tell 1107.00 from
+        // "1107.00", a date from a date-time, or totalPrice from TotalPrice: Content-Type application/json in UTF-8,
+        // exactly the wire record's camelCase members, each member's JSON kind, money with exactly two decimals,
+        // exact yyyy-MM-dd dates and a UTC createdAt ending in Z.
+        ApiTestClient.Booking booking = await _client.ReadAsync<ApiTestClient.Booking>(response, ct);
+
+        // The reader accepted the buffered body as UTF-8 JSON, so its raw members are read again for exact values.
+        using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(ct));
         JsonElement root = document.RootElement;
 
+        // The contract's 13 members, stated here independently of the wire record the reader checks against.
         string[] responseMembers =
         [
             "checkIn", "checkOut", "createdAt", "guests", "hotelId", "hotelName", "id", "nights", "roomNumber",
             "roomTypeId", "roomTypeName", "status", "totalPrice",
         ];
-        Assert.Equal(
-            responseMembers,
-            root.EnumerateObject().Select(static member => member.Name).Order(StringComparer.Ordinal));
+        Assert.True(
+            root.EnumerateObject()
+                .Select(static member => member.Name)
+                .Order(StringComparer.Ordinal)
+                .SequenceEqual(responseMembers, StringComparer.Ordinal),
+            $"Expected the 201 body to have exactly the members {string.Join(", ", responseMembers)}, each once.");
 
-        string? createdAt = root.GetProperty("createdAt").GetString();
-        Assert.NotNull(createdAt);
-        Assert.EndsWith("Z", createdAt, StringComparison.Ordinal);
+        JsonElement totalPrice = root.GetProperty("totalPrice");
+        Assert.True(
+            totalPrice.ValueKind == JsonValueKind.Number
+                && string.Equals(totalPrice.GetRawText(), "1107.00", StringComparison.Ordinal),
+            "Expected totalPrice to be the JSON number 1107.00.");
 
-        ApiTestClient.Booking? booking = root.Deserialize<ApiTestClient.Booking>(ApiTestClient.JsonOptions);
-        Assert.NotNull(booking);
+        string expectedCheckIn = ApiTestClient.Iso(checkIn);
+        string expectedCheckOut = ApiTestClient.Iso(checkOut);
+        Assert.True(
+            root.GetProperty("checkIn") is { ValueKind: JsonValueKind.String } checkInMember
+                && string.Equals(checkInMember.GetString(), expectedCheckIn, StringComparison.Ordinal),
+            $"Expected checkIn to be the JSON string {expectedCheckIn}.");
+        Assert.True(
+            root.GetProperty("checkOut") is { ValueKind: JsonValueKind.String } checkOutMember
+                && string.Equals(checkOutMember.GetString(), expectedCheckOut, StringComparison.Ordinal),
+            $"Expected checkOut to be the JSON string {expectedCheckOut}.");
+        Assert.True(
+            root.GetProperty("status") is { ValueKind: JsonValueKind.String } status
+                && string.Equals(status.GetString(), "Confirmed", StringComparison.Ordinal),
+            "Expected status to be the JSON string Confirmed.");
+        Assert.True(
+            root.GetProperty("createdAt") is { ValueKind: JsonValueKind.String } createdAt
+                && createdAt.GetString() is string instant
+                && instant.EndsWith('Z'),
+            "Expected createdAt to be a JSON string ending in Z.");
 
-        Assert.Equal(PriceCalculator.Total(suite.NightlyPrice, 3), booking.TotalPrice);
-        Assert.Equal(1107.00m, booking.TotalPrice);
-        Assert.Equal("Confirmed", booking.Status);
-        Assert.Equal(suite.HotelId, booking.HotelId);
-        Assert.Equal(ChicagoLoop, booking.HotelName);
-        Assert.Equal(suite.Id, booking.RoomTypeId);
-        Assert.Equal("Suite", booking.RoomTypeName);
-        Assert.Equal("401", booking.RoomNumber);
-        Assert.Equal(checkIn, booking.CheckIn);
-        Assert.Equal(checkOut, booking.CheckOut);
-        Assert.Equal(3, booking.Nights);
-        Assert.Equal(2, booking.Guests);
+        Assert.True(
+            booking.TotalPrice == PriceCalculator.Total(suite.NightlyPrice, 3),
+            "Expected totalPrice to be the Suite's nightly price times 3 nights.");
+        Assert.True(booking.TotalPrice == 1107.00m, "Expected totalPrice to bind to 1107.00.");
+        Assert.True(
+            string.Equals(booking.Status, "Confirmed", StringComparison.Ordinal),
+            "Expected status to bind to Confirmed.");
+        Assert.True(booking.HotelId == suite.HotelId, $"Expected hotelId to be the id of {ChicagoLoop}.");
+        Assert.True(
+            string.Equals(booking.HotelName, ChicagoLoop, StringComparison.Ordinal),
+            $"Expected hotelName to be {ChicagoLoop}.");
+        Assert.True(booking.RoomTypeId == suite.Id, $"Expected roomTypeId to be the id of {ChicagoLoop}'s Suite.");
+        Assert.True(
+            string.Equals(booking.RoomTypeName, "Suite", StringComparison.Ordinal),
+            "Expected roomTypeName to be Suite.");
+        Assert.True(
+            string.Equals(booking.RoomNumber, "401", StringComparison.Ordinal),
+            "Expected roomNumber to be 401.");
+        Assert.True(booking.CheckIn == checkIn, $"Expected checkIn to bind to {expectedCheckIn}.");
+        Assert.True(booking.CheckOut == checkOut, $"Expected checkOut to bind to {expectedCheckOut}.");
+        Assert.True(booking.Nights == 3, "Expected nights to be 3.");
+        Assert.True(booking.Guests == 2, "Expected guests to be 2.");
         Assert.True(booking.Id > 0, "Expected the booking to have a positive id.");
 
-        Assert.Equal(DateTimeKind.Utc, booking.CreatedAt.Kind);
+        Assert.True(booking.CreatedAt.Kind == DateTimeKind.Utc, "Expected createdAt to bind to a UTC instant.");
         DateTime now = TimeProvider.System.GetUtcNow().UtcDateTime;
-        Assert.InRange(booking.CreatedAt, now.AddMinutes(-5), now.AddMinutes(5));
+        Assert.True(
+            booking.CreatedAt >= now.AddMinutes(-5) && booking.CreatedAt <= now.AddMinutes(5),
+            "Expected createdAt to be within five minutes of the test's UTC clock.");
 
         // The detail's stay total and the booked total both come from PriceCalculator, so they must agree.
         ApiTestClient.HotelDetail detail =
             await _client.GetHotelDetailAsync(suite.HotelId, checkIn, checkOut, guests: 2, ct);
-        ApiTestClient.RoomTypeAvailability availability =
-            Assert.Single(detail.RoomTypes, roomType => roomType.Id == suite.Id);
-        Assert.Equal(booking.TotalPrice, availability.StayTotal);
+        ApiTestClient.RoomTypeAvailability[] suiteTypes = [.. detail.RoomTypes.Where(type => type.Id == suite.Id)];
+        Assert.True(suiteTypes.Length == 1, $"Expected the detail of {ChicagoLoop} to list its Suite exactly once.");
+        Assert.True(
+            suiteTypes[0].StayTotal == booking.TotalPrice,
+            "Expected the detail's Suite stayTotal for the same stay to equal the booked totalPrice.");
     }
 
     [Fact]
