@@ -42,6 +42,26 @@
   }
 }
 
+/* Forced colours paint the banner's fill as Canvas and drop the bar's gradient.
+   An inset outline draws the banner's edge and takes no space, so the banner
+   still fills the slot exactly. Only the decorative bar opts out of forced
+   colours, so the text keeps the user's palette; its sweep uses the Highlight
+   system colour and keeps the height and animation set above, inset by the
+   outline's width so it never paints over the edge. */
+@media (forced-colors: active) {
+  .loading-indicator {
+    outline: 1px solid CanvasText;
+    outline-offset: -1px;
+  }
+
+  .loading-indicator__bar {
+    inset-inline: 1px;
+    inset-block-end: 1px;
+    forced-color-adjust: none;
+    background-image: linear-gradient(90deg, transparent, Highlight, transparent);
+  }
+}
+
 @keyframes loading-indicator-sweep {
   to {
     background-position: 100% 0;

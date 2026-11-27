@@ -40,6 +40,18 @@ nav .brand:active {
   color: var(--sh-color-accent-pressed);
 }
 
+/* Current page (aria-current): body text color plus an underline thicker than hover's 2px,
+   so not color alone, and no box change, so no shift. Qualified to outrank nav a. */
+nav .current {
+  text-decoration-line: underline;
+  text-decoration-thickness: 3px;
+  color: var(--sh-color-text);
+}
+
+nav .current:active {
+  color: var(--sh-color-accent-pressed);
+}
+
 /* Short of room it wraps to its own row, then shrinks: the email wraps in full, never widening the page. */
 .account {
   display: flex;

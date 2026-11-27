@@ -237,10 +237,22 @@ test('loading indicator is visible while a request is pending', async ({ page })
 
   const indicator = page.getByTestId('loading-indicator');
   await expect(indicator).toHaveCount(0);
+  // While idle, the slot reserves the banner's height.
+  const slotHeight = await page
+    .locator('app-loading-indicator')
+    .evaluate((slot) => slot.getBoundingClientRect().height);
 
   await page.getByTestId('search-submit').click();
   await expect(indicator).toBeVisible();
   await expect(indicator).toHaveAttribute('role', 'progressbar');
+
+  // Forced colours drop fills and gradients. The banner keeps a solid edge
+  // that takes no space, so it still fills exactly the idle slot, and the
+  // sweep keeps its gradient.
+  await page.emulateMedia({ forcedColors: 'active' });
+  await expect(indicator).toHaveCSS('outline-style', 'solid');
+  await expect(indicator.locator('.loading-indicator__bar')).toHaveCSS('background-image', /gradient/);
+  expect(await indicator.evaluate((banner) => banner.getBoundingClientRect().height)).toBe(slotHeight);
 
   await expect(indicator).toBeHidden({ timeout: 10_000 });
   await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();

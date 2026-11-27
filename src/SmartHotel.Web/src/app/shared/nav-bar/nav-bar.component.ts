@@ -8,7 +8,7 @@ import {
   untracked,
 } from '@angular/core';
 import { NgIf } from '@angular/common';
-import { RouterLink } from '@angular/router';
+import { IsActiveMatchOptions, RouterLink, RouterLinkActive } from '@angular/router';
 import { AuthService } from '../../core/auth/auth.service';
 
 /**
@@ -21,6 +21,11 @@ import { AuthService } from '../../core/auth/auth.service';
  *
  * Signed out, it adds "Log in" and "Register". Signed in, it shows the guest's
  * email and "Log out" instead.
+ *
+ * Current page: "Search", "My bookings", "Log in" and "Register" each carry
+ * `aria-current="page"` and the `current` class while the URL's path is
+ * theirs, whatever its query string. The brand never does, so only one of the
+ * two `/search` links is current, and a hotel detail page marks none.
  *
  * Logging out is client-side only: {@link AuthService.logout} discards the
  * in-memory session and returns to `/search` without calling the API, so the
@@ -39,7 +44,7 @@ import { AuthService } from '../../core/auth/auth.service';
 @Component({
   selector: 'app-nav-bar',
   standalone: true,
-  imports: [NgIf, RouterLink],
+  imports: [NgIf, RouterLink, RouterLinkActive],
   templateUrl: './nav-bar.component.html',
   styleUrl: './nav-bar.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -47,6 +52,19 @@ import { AuthService } from '../../core/auth/auth.service';
 export class NavBarComponent {
   /** The guest's session, read by the template, and its logout action. */
   protected readonly auth = inject(AuthService);
+
+  /**
+   * When a nav link counts as the current page: its path must equal the URL's
+   * path, and the query string, fragment and matrix parameters are ignored. So
+   * `/search?city=…` keeps "Search" current, `/login?returnUrl=%2Fbookings`
+   * keeps "Log in" current, and `/bookings` never marks "Search".
+   */
+  protected readonly currentPageMatch: IsActiveMatchOptions = {
+    paths: 'exact',
+    queryParams: 'ignored',
+    fragment: 'ignored',
+    matrixParams: 'ignored',
+  };
 
   /**
    * Whether "Log out" holds focus. The button's removal leaves it `true`, so

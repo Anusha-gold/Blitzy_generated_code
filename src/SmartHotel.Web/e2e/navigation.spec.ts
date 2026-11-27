@@ -44,12 +44,19 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(page.getByTestId('nav-bookings')).toHaveText('My bookings');
     await expect(page.getByTestId('nav-login')).toHaveText('Log in');
     await expect(page.getByTestId('nav-register')).toHaveText('Register');
+
+    // The nav marks the current page; of the two links to /search, only "Search" does.
+    await expect(page.getByTestId('nav-search')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-brand')).not.toHaveAttribute('aria-current');
+    await expect(page.getByTestId('nav-bookings')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('nav "Register" opens /register', async () => {
     await page.getByTestId('nav-register').click();
     await expect(page).toHaveURL(/\/register$/);
     await expect(h1('Register')).toBeVisible();
+    await expect(page.getByTestId('nav-register')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-search')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('"Already registered? Log in" opens /login', async () => {
@@ -58,6 +65,8 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await link.click();
     await expect(page).toHaveURL(/\/login$/);
     await expect(h1('Log in')).toBeVisible();
+    await expect(page.getByTestId('nav-login')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-register')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('"Create an account" opens /register', async () => {
@@ -66,12 +75,16 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await link.click();
     await expect(page).toHaveURL(/\/register$/);
     await expect(h1('Register')).toBeVisible();
+    await expect(page.getByTestId('nav-register')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-login')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('register, log in, then nav "Search" opens /search', async () => {
     await registerGuest(page, { email, password: TEST_PASSWORD, fullName: 'Navigation Guest' });
     await expect(page).toHaveURL(/\/login\?registered=1$/);
     await expect(h1('Log in')).toBeVisible();
+    // The query string does not stop "Log in" marking its page.
+    await expect(page.getByTestId('nav-login')).toHaveAttribute('aria-current', 'page');
 
     await logIn(page, email, TEST_PASSWORD);
     await expectSignedInAs(page, email);
@@ -85,11 +98,16 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
     await expect(page).toHaveURL(/\/search\?.*city=Seattle/);
     await expect(page.locator('[data-testid^="hotel-result-"]').first()).toBeVisible();
+    // Search criteria in the query string keep "Search", not the brand, current.
+    await expect(page.getByTestId('nav-search')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-brand')).not.toHaveAttribute('aria-current');
+    await expect(page.getByTestId('nav-bookings')).not.toHaveAttribute('aria-current');
 
     await page.getByTestId('nav-search').click();
     await expect(page).toHaveURL(/\/search$/);
     await expect(h1('Find a hotel')).toBeVisible();
     await expect(page.locator('[data-testid^="hotel-result-"]')).toHaveCount(0);
+    await expect(page.getByTestId('nav-search')).toHaveAttribute('aria-current', 'page');
   });
 
   await test.step('search, then "View rooms" opens /hotels/:id', async () => {
@@ -102,6 +120,10 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(hotelName).toBeVisible();
     await expect(hotelName).toHaveText(/\S/);
     await expect(page.getByRole('heading', { level: 1 })).toHaveAttribute('data-testid', 'hotel-name');
+    // No nav link leads to a hotel detail page, so none is current.
+    await expect(page.getByTestId('nav-brand')).not.toHaveAttribute('aria-current');
+    await expect(page.getByTestId('nav-search')).not.toHaveAttribute('aria-current');
+    await expect(page.getByTestId('nav-bookings')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('nav "My bookings" opens /bookings', async () => {
@@ -109,12 +131,17 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(page).toHaveURL(/\/bookings$/);
     await expect(h1('My bookings')).toBeVisible();
     await expect(page.getByTestId('bookings-empty')).toHaveText('You have no bookings yet.');
+    await expect(page.getByTestId('nav-bookings')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-search')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('the brand link opens /search', async () => {
     await page.getByTestId('nav-brand').click();
     await expect(page).toHaveURL(/\/search$/);
     await expect(h1('Find a hotel')).toBeVisible();
+    await expect(page.getByTestId('nav-search')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-brand')).not.toHaveAttribute('aria-current');
+    await expect(page.getByTestId('nav-bookings')).not.toHaveAttribute('aria-current');
   });
 
   await test.step('after "Log out", nav "My bookings" is redirected to /login and back after logging in', async () => {
@@ -127,10 +154,15 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await page.getByTestId('nav-bookings').click();
     await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
     await expect(h1('Log in')).toBeVisible();
+    // The guard's redirect lands on /login, so "Log in", not "My bookings", is current.
+    await expect(page.getByTestId('nav-login')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-bookings')).not.toHaveAttribute('aria-current');
 
     await logIn(page, email, TEST_PASSWORD);
     await expect(page).toHaveURL(/\/bookings$/);
     await expect(h1('My bookings')).toBeVisible();
     await expect(page.getByTestId('bookings-empty')).toHaveText('You have no bookings yet.');
+    await expect(page.getByTestId('nav-bookings')).toHaveAttribute('aria-current', 'page');
+    await expect(page.getByTestId('nav-search')).not.toHaveAttribute('aria-current');
   });
 });
