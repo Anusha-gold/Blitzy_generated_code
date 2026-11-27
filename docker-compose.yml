@@ -1,0 +1,133 @@
+# SmartHotel local stack: `docker compose up` starts db, api and web, migrates
+# and seeds the database, with no manual step.
+#
+# Also used, always with -f, --project-directory and an explicit project, by:
+#   - the acceptance stack (project smarthotel-acceptance, ports 18080/14200,
+#     --env-file deploy/acceptance.env);
+#   - the integration-test database (project smarthotel-test, --profile test,
+#     service db-test).
+#
+# Host ports are bound to 127.0.0.1 only. SMARTHOTEL_API_PORT and
+# SMARTHOTEL_WEB_PORT set the published ports and the origins derived from
+# them, so the SPA, CORS and the tests always agree.
+#
+# Secrets: none is written here. On the first start the db wrapper writes the
+# database password and the JWT signing key into the `secrets` volume, from
+# SMARTHOTEL_DB_PASSWORD / SMARTHOTEL_JWT_SIGNING_KEY when set, otherwise
+# generated. Reset the secrets and the database together with
+# `docker compose down -v`.
+#
+# Only Compose v2.1.1 features are used, the minimum the project supports.
+
+services:
+  db:
+    image: postgres:16.16-alpine3.24
+    # The wrapper creates the secrets, exports POSTGRES_PASSWORD and execs the
+    # image entrypoint. Overriding the entrypoint clears the image's default
+    # command, so it is restated.
+    entrypoint: ["/bin/sh", "/opt/smarthotel/db-entrypoint.sh"]
+    command: ["postgres"]
+    environment:
+      POSTGRES_DB: smarthotel
+      POSTGRES_USER: smarthotel
+      # First-start overrides only; blank means "generate".
+      SMARTHOTEL_DB_PASSWORD: ${SMARTHOTEL_DB_PASSWORD:-}
+      SMARTHOTEL_JWT_SIGNING_KEY: ${SMARTHOTEL_JWT_SIGNING_KEY:-}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - secrets:/run/smarthotel-secrets
+      - ./deploy/db/db-entrypoint.sh:/opt/smarthotel/db-entrypoint.sh:ro
+    # No published port: only the api service reaches the product database.
+    networks:
+      - default
+    healthcheck:
+      # TCP, so the image's init-only, socket-only server never counts as ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U smarthotel -d smarthotel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: src/SmartHotel.Api/Dockerfile
+    # DB_PASSWORD and Jwt__SigningKey are deliberately absent: the image's
+    # entrypoint exports them from the secret files only when they are unset.
+    # Jwt__Issuer and Jwt__Audience come from appsettings.json.
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_HTTP_PORTS: "8080"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: smarthotel
+      DB_USER: smarthotel
+      SMARTHOTEL_SECRETS_DIR: /run/smarthotel-secrets
+      # A bare origin, with no path or trailing slash, as the API requires.
+      Cors__AllowedOrigin: http://localhost:${SMARTHOTEL_WEB_PORT:-4200}
+    volumes:
+      - secrets:/run/smarthotel-secrets:ro
+    ports:
+      - "127.0.0.1:${SMARTHOTEL_API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - default
+    healthcheck:
+      # The API listens only after migration and seeding succeed, so healthy
+      # means a migrated and seeded database.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 5s
+      retries: 30
+      start_period: 20s
+
+  web:
+    build:
+      context: src/SmartHotel.Web
+      dockerfile: Dockerfile
+    # Rendered into /config.json as apiBaseUrl and environment at start.
+    environment:
+      API_BASE_URL: http://localhost:${SMARTHOTEL_API_PORT:-8080}/api
+      WEB_ENVIRONMENT: Development
+    ports:
+      - "127.0.0.1:${SMARTHOTEL_WEB_PORT:-4200}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/"]
+      interval: 5s
+      retries: 20
+
+  # Integration-test database, started only with --profile test. It trusts
+  # every connection, so it sits alone on the testdb network and is published
+  # on host loopback only. testdb is not internal: an internal network cannot
+  # publish a port.
+  db-test:
+    image: postgres:16.16-alpine3.24
+    profiles: ["test"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+    networks:
+      - testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+networks:
+  default:
+  testdb:
+
+volumes:
+  db-data:
+  secrets:
