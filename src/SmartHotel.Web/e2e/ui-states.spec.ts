@@ -24,6 +24,15 @@
  * detail page reused by one history traversal that changes both its hotel and
  * its stay loads once, for the hotel and stay it lands on.
  *
+ * Search form state: the guest count is text, so a typed `2.0`, `2e0`, `1e`
+ * or white space reaches the server as typed, on submit and on an unchanged
+ * re-submit. A deep link's `guests=2.0` or explicit empty `guests=` stays in
+ * the form, and its unchanged re-submit sends that text again: an unedited
+ * empty from the URL is the one empty guest count sent. A field the guest
+ * leaves empty or clears is left out, and the server uses 1. Leaving a
+ * results page for bare `/search` through the brand, nav "Search" or
+ * "Log out" resets the form to its initial criteria along with the results.
+ *
  * Session expiry: with the browser's clock faked and moved past the token's
  * 60 minutes, the nav bar must show the guest signed out on the public page
  * they stayed on, without the app sending any API request, and focus left on
@@ -32,10 +41,11 @@
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory.
  */
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Response } from '@playwright/test';
 
 import {
   TEST_PASSWORD,
+  expectControlValue,
   expectNoInlineError,
   // Some tests fill forms field by field: the form helpers also wait for
   // their success outcome, which these tests must not wait for (a delayed
@@ -140,6 +150,28 @@ const RAW_CRITERIA_CASES: readonly RawCriteriaCase[] = [
 const NON_INTEGER_HOTEL_IDS: readonly string[] = ['1.0', 'abc'];
 
 /**
+ * Guest counts typed into the search form that only the server can judge, one
+ * test each: a decimal and an exponent spelling of a whole number, an
+ * incomplete exponent, and white space, which is not the empty field. A number
+ * input would read the first two as 2 and the last two as an empty field.
+ */
+const TYPED_GUESTS: readonly string[] = ['2.0', '2e0', '1e', ' '];
+
+/**
+ * Guest counts a search deep link can carry that only the server can judge,
+ * one test each: a decimal spelling of a whole number, and an explicit empty
+ * `guests=`, which the API rejects while it gives an absent count 1. The form
+ * must hold each unedited and send it again on an unchanged re-submit.
+ */
+const DEEP_LINK_GUESTS: readonly string[] = ['2.0', ''];
+
+/** The API's message for a supplied `guests` it cannot bind as an integer, an empty one included. */
+const GUESTS_INTEGER_MESSAGE = 'The value must be a whole number of at least 1.';
+
+/** The nav bar links to bare `/search`, one test each. */
+const BARE_SEARCH_LINKS: readonly string[] = ['nav-brand', 'nav-search'];
+
+/**
  * Records, from now on, every request the page sends to a hotel detail path,
  * `/api/hotels/{id}`, whatever its method, and returns the list it fills.
  */
@@ -218,6 +250,46 @@ async function rejectBookingsToken(page: Page): Promise<void> {
       headers: { ...route.request().headers(), authorization: 'Bearer not-a-valid-token' },
     }),
   );
+}
+
+/**
+ * Fills the search form, without submitting it, with Seattle, a valid stay
+ * and `guests` exactly as given. Returns the stay's dates.
+ */
+async function fillSearchForm(page: Page, guests: string): Promise<{ checkIn: string; checkOut: string }> {
+  const [checkIn, checkOut] = utcDates(30, 32);
+  await fillBound(page, 'search-city', 'Seattle');
+  await fillBound(page, 'search-check-in', checkIn);
+  await fillBound(page, 'search-check-out', checkOut);
+  await fillBound(page, 'search-guests', guests);
+  return { checkIn, checkOut };
+}
+
+/**
+ * Clicks Search and returns the response to the hotel search it sends. The
+ * method filter keeps a CORS preflight from matching.
+ */
+async function submitSearch(page: Page): Promise<Response> {
+  const response = page.waitForResponse(
+    (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+  );
+  await page.getByTestId('search-submit').click();
+  return response;
+}
+
+/**
+ * Asserts the idle search page: bare `/search`, the form holding its initial
+ * criteria (no city, no dates, 1 guest), and no result, empty-result message
+ * or inline error.
+ */
+async function expectIdleSearch(page: Page): Promise<void> {
+  await expect(page).toHaveURL(/\/search$/);
+  await expectControlValue(page, 'search-city', '');
+  await expectControlValue(page, 'search-check-in', '');
+  await expectControlValue(page, 'search-check-out', '');
+  await expectControlValue(page, 'search-guests', '1');
+  await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="search-empty"]`)).toHaveCount(0);
+  await expectNoInlineError(page);
 }
 
 test('loading indicator is visible while a request is pending', async ({ page }) => {
@@ -321,6 +393,114 @@ for (const c of RAW_CRITERIA_CASES) {
     });
   });
 }
+
+for (const text of TYPED_GUESTS) {
+  test(`typed guests ${JSON.stringify(text)} reaches the server as written, also on an unchanged re-submit`, async ({
+    page,
+  }) => {
+    await page.goto('/search');
+    await fillSearchForm(page, text);
+
+    for (const attempt of ['submit', 'unchanged re-submit']) {
+      await test.step(`the ${attempt} sends the typed text and shows its 400 inline`, async () => {
+        const res = await submitSearch(page);
+        expect(new URL(res.url()).searchParams.get('guests')).toBe(text);
+        expect(res.status()).toBe(400);
+        await expect(page).toHaveURL((url) => url.searchParams.get('guests') === text);
+
+        const guests = page.getByTestId('search-guests');
+        await expect(page.getByTestId('inline-error')).toBeVisible();
+        await expect(guests).toHaveAttribute('aria-invalid', 'true');
+        await expect(guests).toHaveAccessibleDescription(GUESTS_INTEGER_MESSAGE);
+        await expectControlValue(page, 'search-guests', text);
+      });
+    }
+  });
+}
+
+for (const text of DEEP_LINK_GUESTS) {
+  test(`a search deep link's guests ${JSON.stringify(text)} stays in the form for an unchanged re-submit`, async ({
+    page,
+  }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+
+    await test.step(`open a deep link with guests=${text}`, async () => {
+      const response = page.waitForResponse(
+        (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await page.goto(`/search?city=Seattle&checkIn=${checkIn}&checkOut=${checkOut}&guests=${text}`);
+      const res = await response;
+      expect(new URL(res.url()).searchParams.get('guests')).toBe(text);
+      expect(res.status()).toBe(400);
+      await expectControlValue(page, 'search-guests', text);
+    });
+
+    await test.step('the unchanged re-submit sends the same text again and shows its 400 inline', async () => {
+      const res = await submitSearch(page);
+      expect(new URL(res.url()).searchParams.get('guests')).toBe(text);
+      expect(res.status()).toBe(400);
+      await expect(page.getByTestId('inline-error')).toContainText(GUESTS_INTEGER_MESSAGE);
+      // `get`, not `has`: `''` is the explicit empty, `null` an absent guests.
+      await expect(page).toHaveURL((url) => url.searchParams.get('guests') === text);
+      await expectControlValue(page, 'search-guests', text);
+    });
+
+    await test.step('clearing the field leaves guests out', async () => {
+      await fillBound(page, 'search-guests', '3');
+      await fillBound(page, 'search-guests', '');
+      const res = await submitSearch(page);
+      expect(new URL(res.url()).searchParams.get('guests')).toBe('1');
+      expect(res.status()).toBe(200);
+      await expect(page).toHaveURL((url) => !url.searchParams.has('guests'));
+      await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+    });
+  });
+}
+
+test('a guests field left empty is left out of the URL and the server uses 1', async ({ page }) => {
+  await page.goto('/search');
+  const { checkIn, checkOut } = await fillSearchForm(page, '');
+
+  const res = await submitSearch(page);
+  expect(new URL(res.url()).searchParams.get('guests')).toBe('1');
+  expect(res.status()).toBe(200);
+  await expect(page).toHaveURL(new RegExp(`/search\\?city=Seattle&checkIn=${checkIn}&checkOut=${checkOut}$`));
+  await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+  await expectNoInlineError(page);
+});
+
+for (const link of BARE_SEARCH_LINKS) {
+  test(`${link} from a results page returns to the idle search with the initial criteria`, async ({ page }) => {
+    await test.step('search Seattle for 2 guests, then edit the city without searching', async () => {
+      const [checkIn, checkOut] = utcDates(30, 32);
+      await page.goto('/search');
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+      await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+      await fillBound(page, 'search-city', 'Portland');
+    });
+
+    await test.step(`click ${link}`, async () => {
+      await page.getByTestId(link).click();
+      await expectIdleSearch(page);
+    });
+  });
+}
+
+test('Log out from a results page returns to the idle search with the initial criteria', async ({ page }) => {
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  await test.step('search Seattle for 2 guests', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+    await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+  });
+
+  await test.step('log out', async () => {
+    await page.getByTestId('nav-logout').click();
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expectIdleSearch(page);
+  });
+});
 
 for (const id of NON_INTEGER_HOTEL_IDS) {
   test(`the hotel id ${id} shows an inline 404 without a request`, async ({ page }) => {

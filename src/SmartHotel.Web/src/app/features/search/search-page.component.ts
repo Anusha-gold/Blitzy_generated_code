@@ -12,20 +12,6 @@ import { UiError, fieldErrorIds, toUiError } from '../../core/http/problem-detai
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
 /**
- * Reads the URL's guest-count text as the number the form's number input
- * shows: `null`, an empty input, when the text is blank or not a finite
- * number. It is for display only; the search sends the text itself, so the
- * server's binding, not this reading, decides whether it is valid.
- */
-function guestsForDisplay(text: string): number | null {
-  if (text.trim() === '') {
-    return null;
-  }
-  const n = Number(text);
-  return Number.isFinite(n) ? n : null;
-}
-
-/**
  * The hotel search screen, route `search`: a city, a stay and a party size,
  * answered by `GET /api/hotels`.
  *
@@ -39,8 +25,11 @@ function guestsForDisplay(text: string): number | null {
  * flight, and only the latest outcome is ever shown.
  *
  * The visible states:
- * - idle on bare `/search` (the nav and brand links and the `''` and `**`
- *   redirects): the form only, with no results, message or error;
+ * - idle on bare `/search` (the nav and brand links, "Log out" and the `''`
+ *   and `**` redirects): the form only, holding its initial criteria (no
+ *   city, no dates, 1 guest), with no results, message or error. Leaving a
+ *   search URL for it reuses this page, and the form is reset then too, so
+ *   no earlier, rejected or unsent criteria linger without their results;
  * - loading: the app-wide indicator, driven by the loading interceptor, while
  *   the submit button is disabled through {@link SearchPageComponent.pending};
  *   the previous results stay rendered but hidden, so none can be seen,
@@ -86,14 +75,22 @@ export class SearchPageComponent {
   private focusedAtSubmit: HTMLElement | null = null;
 
   /**
-   * The search criteria as entered. The date inputs yield raw `yyyy-MM-dd`
-   * strings, and the number input yields `null` when it is emptied.
+   * The search criteria as entered, every one the text its input holds. The
+   * date inputs yield raw `yyyy-MM-dd` strings, and the guest count is a text
+   * input with a numeric keyboard hint, so a decimal, exponent, signed,
+   * white-space or incomplete entry such as `2.0`, `2e0` or `1e` stays exactly
+   * as typed, for the server to judge, instead of being read as a number. An
+   * empty guest count is left out of the search, so the server uses 1, except
+   * where the field still holds, unedited, the URL's own explicit empty
+   * `guests=`: that is the one place an empty field is sent, and the guest
+   * count's pristine state is what tells the two apart. These initial values
+   * are what `reset()` restores on the idle page, pristine as well.
    */
   protected readonly form = this.fb.group({
     city: '',
     checkIn: '',
     checkOut: '',
-    guests: this.fb.control<number | null>(1),
+    guests: '1',
   });
 
   /** `true` while this page's own search request is in flight. */
@@ -145,30 +142,45 @@ export class SearchPageComponent {
   }
 
   /**
-   * Writes the form's criteria into the URL, which runs the search. An emptied
-   * guest count is left out, and the server then uses 1. When the criteria
-   * equal the current URL, the router would not emit, so the current query is
-   * replayed instead. The element focused at submit, normally the Search
-   * button that the pending state disables, is recorded for the search this
-   * submit starts, so focus can return to it once that search completes with
-   * a response; a search cancelled by a newer one never moves focus.
+   * Writes the form's criteria into the URL, which runs the search. Every
+   * criterion goes into the URL as the text its input holds, with one
+   * exception: a guest count left exactly empty means the guest left that
+   * optional field blank, so it is left out and the server uses 1. The one
+   * place an empty guest count is sent is an unedited explicit empty from the
+   * URL: while the field still shows the current URL's own `guests=`, not
+   * edited since the page filled it in (the control is pristine), it goes out
+   * as `guests=` again, so the server judges it. Once the guest edits the
+   * field, even back to empty, an empty field is left out. Any other
+   * guest-count text, white space, a decimal, an exponent or an incomplete
+   * entry included, is written verbatim, so the server judges it. When the
+   * criteria, that guest count included, equal the current URL, the router
+   * would not emit, so the current query is replayed instead, and an
+   * unchanged re-submit sends the same text again. The element focused at
+   * submit, normally the Search button that the pending state disables, is
+   * recorded for the search this submit starts, so focus can return to it
+   * once that search completes with a response; a search cancelled by a
+   * newer one never moves focus.
    */
   protected submit(): void {
     const focused = this.document.activeElement;
     this.focusedAtSubmit = focused instanceof HTMLElement && focused !== this.document.body ? focused : null;
 
     const { city, checkIn, checkOut, guests } = this.form.getRawValue();
-    const queryParams: Record<string, string | number> = { city, checkIn, checkOut };
-    if (guests !== null) {
-      queryParams['guests'] = guests;
+    const current = this.route.snapshot.queryParamMap;
+    const queryParams: Record<string, string> = { city, checkIn, checkOut };
+    // An empty field is sent only as the URL's own explicit empty `guests`,
+    // still unedited; one the guest cleared is left out, so the server uses 1.
+    const keepsUrlEmpty = this.form.controls.guests.pristine && current.get('guests') === '';
+    const sentGuests = guests === '' && !keepsUrlEmpty ? null : guests;
+    if (sentGuests !== null) {
+      queryParams['guests'] = sentGuests;
     }
 
-    const current = this.route.snapshot.queryParamMap;
     const same =
       current.get('city') === city &&
       current.get('checkIn') === checkIn &&
       current.get('checkOut') === checkOut &&
-      current.get('guests') === (guests === null ? null : String(guests));
+      current.get('guests') === sentGuests;
     if (same) {
       this.rerun$.next();
       return;
@@ -184,12 +196,17 @@ export class SearchPageComponent {
 
   /**
    * Runs one search for the given query, or returns to the idle state when the
-   * query names none of the four criteria. `city`, `checkIn`, `checkOut` and a
-   * present `guests` are passed on exactly as the URL holds them, an empty
-   * string included; an absent `guests` is sent as 1, the server's own
-   * default. The server alone decides their validity. The form is refilled
-   * from the same values, its guest count with a numeric reading of the text
-   * for display only. The error handling and `finalize` sit inside this inner
+   * query names none of the four criteria: the form is reset to its initial
+   * criteria, and any results, error and pending state are cleared. `city`,
+   * `checkIn`, `checkOut` and a present `guests` are passed on exactly as the
+   * URL holds them, an empty string included; an absent `guests` is sent as
+   * 1, the server's own default. The server alone decides their validity. The
+   * form is refilled with the same text, so the guest count shows exactly what
+   * the URL holds, such as `2.0` or an explicit empty `guests=`, and the guest
+   * count is marked pristine, as not edited since. An unchanged re-submit
+   * therefore sends that text again, an empty one included: an unedited
+   * explicit empty from the URL is the one place `submit` sends an empty
+   * field. The error handling and `finalize` sit inside this inner
    * observable, so a failed search never ends the outer stream and a
    * cancelled one still clears `pending`.
    */
@@ -204,6 +221,10 @@ export class SearchPageComponent {
       !params.has('checkOut') &&
       !params.has('guests')
     ) {
+      // The page is reused when the brand, nav "Search" or "Log out" leaves a
+      // search for bare /search, so the form returns to its initial criteria
+      // too, as a reload of bare /search shows them.
+      this.form.reset();
       this.results.set(null);
       this.searched.set(null);
       this.error.set(null);
@@ -220,7 +241,10 @@ export class SearchPageComponent {
     const guests = params.get('guests') ?? '1';
     const q: HotelSearchQuery = { city, checkIn, checkOut, guests };
 
-    this.form.patchValue({ city, checkIn, checkOut, guests: guestsForDisplay(guests) });
+    this.form.patchValue({ city, checkIn, checkOut, guests });
+    // The guest count now shows the URL's own text, unedited, so `submit` can
+    // tell an explicit empty `guests` from a field the guest cleared.
+    this.form.controls.guests.markAsPristine();
     this.error.set(null);
     this.pending.set(true);
 

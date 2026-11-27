@@ -43,8 +43,8 @@
       id="search-guests"
       data-testid="search-guests"
       formControlName="guests"
-      type="number"
-      min="1"
+      type="text"
+      inputmode="numeric"
       [attr.aria-invalid]="fieldErrors().has('guests') ? 'true' : null"
       [attr.aria-describedby]="fieldErrors().get('guests') ?? null"
     />
