@@ -55,6 +55,16 @@ public sealed partial class BookingService(
 
     private const string UnvalidatedRequestMessage = "A booking request must pass model validation first.";
 
+    // The statuses pg_xact_status reports for a transaction PostgreSQL still tracks.
+    private const string CommittedTransactionStatus = "committed";
+    private const string AbortedTransactionStatus = "aborted";
+    private const string InProgressTransactionStatus = "in progress";
+
+    // Fixed text that quotes no value. The exception becomes the sanitized 500, which, like its log record, omits the
+    // message anyway.
+    private const string UndeterminedCancellationMessage =
+        "Whether an earlier attempt of the cancellation committed could not be determined.";
+
     /// <summary>
     /// Books a room of the requested type for the stay and confirms it, assigning the room and computing the total on
     /// the server.
@@ -280,8 +290,8 @@ public sealed partial class BookingService(
                     return new ExecutionResult<CreateBookingResult>(true, new CreateBookingResult.Created(saved));
                 }
 
-                // EF Core discards the result of an unsuccessful check and retries the unit, or rethrows the failure
-                // once no retry is left.
+                // EF Core discards the result of an unsuccessful check and retries the unit, or, once no retry is left,
+                // throws a RetryLimitExceededException that wraps the failure.
                 return new ExecutionResult<CreateBookingResult>(false, null!);
             },
             cancellationToken);
@@ -341,21 +351,30 @@ public sealed partial class BookingService(
     /// <remarks>
     /// <para>
     /// Checks run in this order, and the first failure decides the outcome: the booking exists, it belongs to the
-    /// caller, it is not already cancelled, and its check-in date is not earlier than today (UTC). Ownership is checked
+    /// caller, it is not already cancelled, and its check-in date has not passed, as
+    /// <see cref="StayRules.HasCheckInPassed"/> decides: it is not earlier than today (UTC). Ownership is checked
     /// before state, so another guest's request learns nothing about the booking's state.
     /// </para>
     /// <para>
-    /// The status changes in one conditional update that only matches a confirmed booking. When it matches nothing, a
-    /// concurrent cancellation won, and the result is <see cref="CancelResult.AlreadyCancelled"/>.
+    /// The status changes in one conditional update that only matches a confirmed booking. When it matches nothing and
+    /// no earlier attempt of this request committed the cancellation, a concurrent cancellation won, and the result is
+    /// <see cref="CancelResult.AlreadyCancelled"/>. A retry that matches nothing because an earlier attempt of this
+    /// request committed the cancellation is the exception, described in the next paragraph.
     /// </para>
     /// <para>
-    /// The update runs as one retriable unit of the context's execution strategy, so a transient failure, such as a
-    /// session the database ended, runs it again. An update whose commit took effect although its acknowledgement was
-    /// lost is recognized by the booking's status: once an attempt has failed transiently, a booking found cancelled,
-    /// by the check that follows the failure or by a retry whose update matches nothing, gives
-    /// <see cref="CancelResult.Cancelled"/>. The only other way to that status, a concurrent cancellation of the same
-    /// booking that races the failure, leaves the booking in the same state. A transient failure that outlasts the
-    /// strategy's retries propagates like any other database error.
+    /// Each attempt runs the update in a READ COMMITTED transaction of its own, as one retriable unit of the context's
+    /// execution strategy, so a transient failure, such as a session the database ended, runs it again. The booking's
+    /// status records no writer, so it never shows which request cancelled it; the transaction id does. An attempt
+    /// whose update matched the booking reads its transaction's id before it sends the commit. A failure before that
+    /// point leaves nothing committed, and the retry starts again from the beginning. After a failure from then on,
+    /// PostgreSQL's status of that transaction decides: committed gives <see cref="CancelResult.Cancelled"/>, even
+    /// when the acknowledgement was lost; aborted leaves the booking to the retry, whose update matches it again
+    /// unless a concurrent cancellation committed first, which gives <see cref="CancelResult.AlreadyCancelled"/>; and a
+    /// transaction that has not ended yet keeps the booking's row locked, so the retry's update waits for it to end,
+    /// and the retry then decides by how it ended. A request whose own transaction never committed therefore never
+    /// reports another request's cancellation as its own. When PostgreSQL can no longer report the transaction's
+    /// status, the outcome is unknown, and <see cref="InvalidOperationException"/> propagates instead of a guess. A
+    /// transient failure that outlasts the strategy's retries propagates like any other database error.
     /// </para>
     /// </remarks>
     /// <param name="guestId">The caller's guest id, from the bearer token's <c>sub</c> claim.</param>
@@ -366,6 +385,10 @@ public sealed partial class BookingService(
     /// <see cref="CancelResult.Forbidden"/>, <see cref="CancelResult.AlreadyCancelled"/> or
     /// <see cref="CancelResult.CheckInPassed"/>.
     /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// An attempt's commit failed transiently, and PostgreSQL can no longer report whether its transaction committed
+    /// or aborted, so whether this request cancelled the booking cannot be determined.
+    /// </exception>
     public async Task<CancelResult> CancelAsync(int guestId, int bookingId, CancellationToken cancellationToken)
     {
         var booking = await db.Bookings
@@ -389,52 +412,114 @@ public sealed partial class BookingService(
             return new CancelResult.AlreadyCancelled();
         }
 
-        if (booking.CheckIn < Today())
+        if (StayRules.HasCheckInPassed(booking.CheckIn, Today()))
         {
             return new CancelResult.CheckInPassed();
         }
 
         // Left to itself, the context's retrying execution strategy replays the update after a transient failure, and
         // the replay of an update whose commit took effect matches no row, which would report a concurrent
-        // cancellation. Run as one retriable unit with a check of its own, the committed update is recognized.
+        // cancellation; the booking's status cannot tell the two apart either, because it records no writer. Each
+        // attempt therefore runs as one retriable unit in a transaction of its own, and a cancellation counts as this
+        // request's only when the transaction that committed it is one of this request's attempts.
         IExecutionStrategy strategy = db.Database.CreateExecutionStrategy();
         CancellationAttempt attempt = new();
-        bool cancelled = await strategy.ExecuteAsync(
+        CancelResult result = await strategy.ExecuteAsync(
             attempt,
             async (state, token) =>
             {
+                await using IDbContextTransaction transaction =
+                    await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, token);
+
+                // Only a confirmed booking matches. While another transaction holds the booking's row, a concurrent
+                // cancellation or an earlier attempt of this request that has not ended yet, the update waits for it
+                // to end, and READ COMMITTED then checks the row as that transaction left it.
                 int affected = await db.Bookings
                     .Where(b => b.Id == bookingId && b.Status == BookingStatus.Confirmed)
                     .ExecuteUpdateAsync(s => s.SetProperty(b => b.Status, BookingStatus.Cancelled), token);
 
-                // Outside a transient failure, matching no row means that a concurrent cancellation won. After one,
-                // the booking, which exists and was confirmed, can only have been cancelled since: by an earlier
-                // attempt whose commit took effect after the check that followed the failure, or by a concurrent
-                // cancellation, which leaves the same final state.
-                return affected > 0 || state.FailedTransiently;
+                if (affected == 0)
+                {
+                    // Nothing was written, so the transaction holds nothing worth keeping.
+                    await transaction.RollbackAsync(token);
+
+                    // With no earlier attempt whose commit can have taken effect, a concurrent cancellation won. With
+                    // one, the update above waited for that attempt's transaction to end, so its status is final:
+                    // committed means this request cancelled the booking, aborted means a concurrent cancellation did,
+                    // and a status PostgreSQL no longer reports leaves the outcome undetermined.
+                    if (state.WriterTransactionId is not long writer)
+                    {
+                        return new CancelResult.AlreadyCancelled();
+                    }
+
+                    return await ReadTransactionStatusAsync(writer, token) switch
+                    {
+                        CommittedTransactionStatus => new CancelResult.Cancelled(),
+                        AbortedTransactionStatus => new CancelResult.AlreadyCancelled(),
+                        _ => throw new InvalidOperationException(UndeterminedCancellationMessage),
+                    };
+                }
+
+                // The update matched, so this transaction alone can cancel the booking now. Its id is read before the
+                // commit is sent: should the commit's outcome go unreported, that id is how this request recognizes
+                // its own write, and a failure before this point leaves nothing that can commit.
+                state.WriterTransactionId = await db.Database
+                    .SqlQuery<long>($"SELECT pg_current_xact_id()::text::bigint AS \"Value\"")
+                    .SingleAsync(token);
+                await transaction.CommitAsync(token);
+                return new CancelResult.Cancelled();
             },
             async (state, token) =>
             {
-                // Runs after a transient failure, before any retry. A booking's status only ever moves from Confirmed
-                // to Cancelled, so the update took effect exactly when the booking is now cancelled, whether or not its
-                // acknowledgement arrived. The only other explanation, a concurrent cancellation of the same booking
-                // racing the failure, leaves the same final state. EF Core discards the result of an unsuccessful
-                // check and retries the unit, or rethrows the failure once no retry is left.
-                state.FailedTransiently = true;
-                bool isCancelled = await db.Bookings
-                    .AsNoTracking()
-                    .AnyAsync(b => b.Id == bookingId && b.Status == BookingStatus.Cancelled, token);
-                return new ExecutionResult<bool>(isCancelled, isCancelled);
+                // Runs after a transient failure, before any retry. EF Core discards the result of an unsuccessful
+                // check and retries the unit, or, once no retry is left, throws a RetryLimitExceededException that
+                // wraps the failure. With no transaction id recorded, the failed attempt sent no commit, so it wrote
+                // nothing and the unit simply runs again.
+                if (state.WriterTransactionId is not long writer)
+                {
+                    return new ExecutionResult<CancelResult>(false, null!);
+                }
+
+                switch (await ReadTransactionStatusAsync(writer, token))
+                {
+                    case CommittedTransactionStatus:
+                        // The commit took effect although its acknowledgement was lost.
+                        return new ExecutionResult<CancelResult>(true, new CancelResult.Cancelled());
+                    case AbortedTransactionStatus:
+                        // The update was undone, so the retry's own update decides.
+                        state.WriterTransactionId = null;
+                        return new ExecutionResult<CancelResult>(false, null!);
+                    case InProgressTransactionStatus:
+                        // The transaction has not ended yet: the server may not have received or finished the commit.
+                        // It keeps the booking's row locked until it ends, so the retry's update waits for it, and the
+                        // retry then decides by how it ended.
+                        return new ExecutionResult<CancelResult>(false, null!);
+                    default:
+                        throw new InvalidOperationException(UndeterminedCancellationMessage);
+                }
             },
             cancellationToken);
 
-        if (!cancelled)
+        // Logged once the strategy has returned, so a cancellation whose commit the check or a retry attributed to this
+        // request is logged too. The event is written once for each request whose result is Cancelled, that is, whose
+        // own transaction is known to have committed the cancellation. A request whose outcome cannot be determined
+        // throws instead and logs nothing here, although its transaction may have committed; the exception handler's
+        // sanitized Error event records that failure.
+        if (result is CancelResult.Cancelled)
         {
-            return new CancelResult.AlreadyCancelled();
+            WriteBookingCancelled(bookingId);
         }
 
-        WriteBookingCancelled(bookingId);
-        return new CancelResult.Cancelled();
+        return result;
+    }
+
+    // pg_xact_status reports "committed", "aborted" or "in progress" for a transaction PostgreSQL still tracks, and
+    // NULL, read here as null, for one too old for it to know.
+    private async Task<string?> ReadTransactionStatusAsync(long transactionId, CancellationToken cancellationToken)
+    {
+        return await db.Database
+            .SqlQuery<string>($"SELECT pg_xact_status(CAST(CAST({transactionId} AS text) AS xid8)) AS \"Value\"")
+            .SingleAsync(cancellationToken);
     }
 
     private DateOnly Today()
@@ -546,11 +631,14 @@ public sealed partial class BookingService(
         public bool FailedTransiently { get; set; }
     }
 
-    // What the attempts of the retriable cancellation unit share: whether one has failed transiently.
+    // What the attempts of the retriable cancellation unit share, with each other and with the commit check that runs
+    // after a transient failure: the transaction that can have cancelled the booking for this request.
     private sealed class CancellationAttempt
     {
-        // Set by the check that follows a transient failure. From then on the update can have taken effect although no
-        // attempt has seen it match the booking.
-        public bool FailedTransiently { get; set; }
+        // The id of the latest attempt's transaction whose update matched the booking, read inside it before its
+        // commit is sent. Only that transaction can have cancelled the booking for this request, so its status decides
+        // the outcome once a failure leaves the commit unacknowledged. Null until an attempt records it, and cleared
+        // when the check that follows a failure finds that transaction aborted.
+        public long? WriterTransactionId { get; set; }
     }
 }

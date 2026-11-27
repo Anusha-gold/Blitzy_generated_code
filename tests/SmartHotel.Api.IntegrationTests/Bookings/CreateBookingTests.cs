@@ -197,11 +197,12 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         ApiTestClient.GuestSession session = await _client.RegisterGuestAsync(ct);
         DateOnly today = ApiTestClient.TodayUtc;
 
-        (int hotelId, int roomTypeId) = caseLabel switch
+        // The fixed title tells the two reasons for a 404 apart.
+        (int hotelId, int roomTypeId, string expectedTitle) = caseLabel switch
         {
-            "unknown-hotel" => (UnknownId, waterfrontStandard.Id),
-            "unknown-room-type" => (downtownId, UnknownId),
-            "room-type-of-other-hotel" => (downtownId, waterfrontStandard.Id),
+            "unknown-hotel" => (UnknownId, waterfrontStandard.Id, "Hotel not found"),
+            "unknown-room-type" => (downtownId, UnknownId, "Room type not found"),
+            "room-type-of-other-hotel" => (downtownId, waterfrontStandard.Id, "Room type not found"),
             _ => throw new ArgumentException($"Unknown case label '{caseLabel}'.", nameof(caseLabel)),
         };
         JsonObject body = ApiTestClient.BookingBody(
@@ -213,7 +214,16 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
 
         using HttpResponseMessage response = await _client.CreateBookingAsync(body, session.Token, ct);
 
-        await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.NotFound, cancellationToken: ct);
+        JsonElement problem = await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.NotFound,
+            cancellationToken: ct);
+
+        // Compared in memory, with a message naming only the expected title, so no response value reaches the output.
+        string? title = problem.GetProperty("title").GetString();
+        Assert.True(
+            string.Equals(expectedTitle, title, StringComparison.Ordinal),
+            $"Expected the 404 problem's title to be \"{expectedTitle}\".");
     }
 
     [Fact]

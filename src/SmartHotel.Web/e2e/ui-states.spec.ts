@@ -108,7 +108,6 @@ import {
 } from '@playwright/test';
 
 import {
-  TEST_PASSWORD,
   apiUrl,
   displayDate,
   expectControlValue,
@@ -117,36 +116,56 @@ import {
   // their success outcome, which these tests must not wait for (a delayed
   // search) or expect never to happen (a rejected registration or login).
   fillBound,
+  isApiEndpoint,
   logIn,
   readAvailableCount,
   registerGuest,
   searchHotels,
   uniqueEmail,
+  uniquePassword,
   utcDates,
   watchInlineErrors,
 } from './support/helpers';
 
+// The positive predicates below match a request only on the target API's
+// origin and endpoint path (`isApiEndpoint`), so a web app that calls another
+// stack's API fails the waiters and routes built on them; each waiter matches
+// its endpoint's exact path and checks the method as well. The recorders that
+// assert no request was sent match any origin instead, so a request to
+// another API cannot slip past them.
+
 /**
- * The hotel search, `GET /api/hotels?…`, and never the detail
+ * The target API's hotel search, `GET /api/hotels?…`, and never the detail
  * `/api/hotels/{id}`. A predicate rather than a glob: Playwright globs match
  * `?` literally and never let `*` cross a `/`.
  */
-const isHotelSearch = (url: URL): boolean => url.pathname === '/api/hotels';
+const isHotelSearch = (url: URL): boolean => isApiEndpoint(url, '/hotels');
 
 /**
- * The bookings endpoints: the list, "Book" and "Cancel". The SPA's own
- * `/bookings` page never matches, because its path has no `/api` prefix.
+ * The target API's bookings endpoints: the list, "Book" and "Cancel". The
+ * SPA's own `/bookings` page never matches, because it is on the web origin
+ * and its path has no `/api` prefix.
  */
-const isBookingsApi = (url: URL): boolean =>
-  url.pathname === '/api/bookings' || url.pathname.startsWith('/api/bookings/');
+const isBookingsApi = (url: URL): boolean => isApiEndpoint(url, '/bookings', 'withSubPaths');
 
-/** The registration endpoint, `/api/auth/register`, never the SPA's `/register` page. */
-const isRegisterApi = (url: URL): boolean => url.pathname === '/api/auth/register';
+/**
+ * The target API's bookings collection, `/api/bookings` exactly: the list
+ * (`GET`) and "Book" (`POST`), never a booking's own `/api/bookings/{id}`.
+ */
+const isBookingsCollection = (url: URL): boolean => isApiEndpoint(url, '/bookings');
 
-/** The login endpoint, `/api/auth/login`, never the SPA's `/login` page. */
-const isLoginApi = (url: URL): boolean => url.pathname === '/api/auth/login';
+/** The target API's registration endpoint, `/api/auth/register`, never the SPA's `/register` page. */
+const isRegisterApi = (url: URL): boolean => isApiEndpoint(url, '/auth/register');
 
-/** Any API endpoint. The SPA's own routes never match, because none has an `/api` prefix. */
+/** The target API's login endpoint, `/api/auth/login`, never the SPA's `/login` page. */
+const isLoginApi = (url: URL): boolean => isApiEndpoint(url, '/auth/login');
+
+/**
+ * Any API endpoint, on any origin, for asserting that the app sent no API
+ * request: matching the target API's origin only would let a request to
+ * another API go unseen. The SPA's own routes never match, because none has
+ * an `/api` prefix.
+ */
 const isApi = (url: URL): boolean => url.pathname === '/api' || url.pathname.startsWith('/api/');
 
 /** Every hotel card on the search page. */
@@ -167,8 +186,11 @@ interface RawCriteriaCase {
   title: string;
   /** The page URL; `{stay}` stands for a valid `checkIn=…&checkOut=…` query. */
   url: string;
-  /** The path the page's `GET` must request, the hotel id included. */
-  apiPath: string;
+  /**
+   * The target API endpoint the page's `GET` must request, below the API base
+   * and with the hotel id included, as {@link isApiEndpoint} takes it.
+   */
+  endpoint: string;
   /** The `guests` text that `GET` must carry: the URL's own, or `1` when it has none. */
   guests: string;
   /** The status the server answers. */
@@ -180,35 +202,35 @@ const RAW_CRITERIA_CASES: readonly RawCriteriaCase[] = [
   {
     title: 'a search URL with only guests',
     url: '/search?guests=2',
-    apiPath: '/api/hotels',
+    endpoint: '/hotels',
     guests: '2',
     status: 400,
   },
   {
     title: 'a search URL with guests=2.0',
     url: '/search?city=Seattle&{stay}&guests=2.0',
-    apiPath: '/api/hotels',
+    endpoint: '/hotels',
     guests: '2.0',
     status: 400,
   },
   {
     title: 'a search URL with an empty guests',
     url: '/search?city=Seattle&{stay}&guests=',
-    apiPath: '/api/hotels',
+    endpoint: '/hotels',
     guests: '',
     status: 400,
   },
   {
     title: 'a detail URL with guests=2e0',
     url: '/hotels/1?{stay}&guests=2e0',
-    apiPath: '/api/hotels/1',
+    endpoint: '/hotels/1',
     guests: '2e0',
     status: 400,
   },
   {
     title: 'a detail URL with an empty guests',
     url: '/hotels/1?{stay}&guests=',
-    apiPath: '/api/hotels/1',
+    endpoint: '/hotels/1',
     guests: '',
     status: 400,
   },
@@ -243,7 +265,7 @@ const DEADLINE_CASES: readonly DeadlineCase[] = [
     isEndpoint: isLoginApi,
     fill: async (page) => {
       await fillBound(page, 'login-email', uniqueEmail());
-      await fillBound(page, 'login-password', TEST_PASSWORD);
+      await fillBound(page, 'login-password', uniquePassword());
     },
   },
   {
@@ -251,7 +273,7 @@ const DEADLINE_CASES: readonly DeadlineCase[] = [
     isEndpoint: isRegisterApi,
     fill: async (page) => {
       await fillBound(page, 'register-email', uniqueEmail());
-      await fillBound(page, 'register-password', TEST_PASSWORD);
+      await fillBound(page, 'register-password', uniquePassword());
       await fillBound(page, 'register-full-name', 'States Guest');
     },
   },
@@ -283,8 +305,11 @@ const UNUSABLE_LOGIN_BODIES: readonly UnusableBodyCase[] = [
 interface UnusableReadCase extends UnusableBodyCase {
   /** The page URL; `{stay}` stands for a valid `checkIn=…&checkOut=…` query. */
   url: string;
-  /** The path of the page's `GET`, the hotel id included. */
-  apiPath: string;
+  /**
+   * The target API endpoint of the page's `GET`, below the API base and with
+   * the hotel id included, as {@link isApiEndpoint} takes it.
+   */
+  endpoint: string;
 }
 
 /** The deep links of the unusable-read test, one test each. */
@@ -292,25 +317,25 @@ const UNUSABLE_READ_CASES: readonly UnusableReadCase[] = [
   {
     title: 'a search answered with {}',
     url: '/search?city=Seattle&{stay}',
-    apiPath: '/api/hotels',
+    endpoint: '/hotels',
     body: '{}',
   },
   {
     title: 'a hotel detail answered with {"id":1}',
     url: '/hotels/1?{stay}',
-    apiPath: '/api/hotels/1',
+    endpoint: '/hotels/1',
     body: '{"id":1}',
   },
   {
     title: 'a search answered with a result id beyond the 32-bit range',
     url: '/search?city=Seattle&{stay}',
-    apiPath: '/api/hotels',
+    endpoint: '/hotels',
     body: '[{"id":2147483648,"name":"X","city":"Seattle","address":"Y","lowestNightlyPrice":100}]',
   },
   {
     title: 'a hotel detail answered with checkIn 2099-02-30',
     url: '/hotels/1?{stay}',
-    apiPath: '/api/hotels/1',
+    endpoint: '/hotels/1',
     body:
       '{"id":1,"name":"X","city":"Seattle","address":"Y","description":"Z",' +
       '"checkIn":"2099-02-30","checkOut":"2099-03-02","nights":2,"guests":1,"roomTypes":[]}',
@@ -341,7 +366,9 @@ const BARE_SEARCH_LINKS: readonly string[] = ['nav-brand', 'nav-search'];
 
 /**
  * Records, from now on, every request the page sends to a hotel detail path,
- * `/api/hotels/{id}`, whatever its method, and returns the list it fills.
+ * `/api/hotels/{id}`, on any origin and whatever its method, and returns the
+ * list it fills. It is for asserting that no such request was sent, so it is
+ * not limited to the target API's origin.
  */
 function recordDetailRequests(page: Page): URL[] {
   const requested: URL[] = [];
@@ -386,27 +413,40 @@ async function openHotel(page: Page, link: Locator): Promise<{ id: string; name:
 }
 
 /**
- * Opens the register page, registers a fresh guest and returns the email.
+ * A test guest's credentials: a fresh email and the guest's own random
+ * password, which no diagnostic prints.
+ */
+interface GuestCredentials {
+  /** The guest's email, from {@link uniqueEmail}. */
+  email: string;
+  /** The guest's password, from {@link uniquePassword}. */
+  password: string;
+}
+
+/**
+ * Opens the register page, registers a fresh guest with its own generated
+ * password and returns both credentials, which the test never prints.
  * The browser is left on `/login?registered=1`.
  */
-async function registerNewGuest(page: Page): Promise<string> {
+async function registerNewGuest(page: Page): Promise<GuestCredentials> {
   const email = uniqueEmail();
+  const password = uniquePassword();
   await page.goto('/register');
-  await registerGuest(page, { email, password: TEST_PASSWORD, fullName: 'States Guest' });
-  return email;
+  await registerGuest(page, { email, password, fullName: 'States Guest' });
+  return { email, password };
 }
 
 /**
  * Registers a fresh guest and logs in. With no `returnUrl`, the login page
  * continues to `/search`, so the browser is left there, signed in. Returns the
- * guest's email, which signs the same guest in through the API with
+ * guest's credentials, which sign the same guest in through the API with
  * {@link apiSignIn}.
  */
-async function registerAndLogIn(page: Page): Promise<string> {
-  const email = await registerNewGuest(page);
-  await logIn(page, email, TEST_PASSWORD);
+async function registerAndLogIn(page: Page): Promise<GuestCredentials> {
+  const guest = await registerNewGuest(page);
+  await logIn(page, guest.email, guest.password);
   await expect(page).toHaveURL(/\/search$/);
-  return email;
+  return guest;
 }
 
 /**
@@ -534,29 +574,30 @@ async function fixtureRequest(step: string, send: () => Promise<APIResponse>): P
 }
 
 /**
- * Registers a fresh guest through the API, without the web app, for a
- * fixture that must hold bookings under an account of its own.
+ * Registers a fresh guest, with its own random password, through the API,
+ * without the web app, for a fixture that must hold bookings under an
+ * account of its own.
  *
- * @returns The new guest's email; the password is `TEST_PASSWORD`.
+ * @returns The new guest's credentials.
  */
-async function apiRegisterGuest(request: APIRequestContext): Promise<string> {
-  const email = uniqueEmail();
+async function apiRegisterGuest(request: APIRequestContext): Promise<GuestCredentials> {
+  const guest: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
   const response = await fixtureRequest('registering a fixture guest', () =>
     request.post(`${apiUrl()}/auth/register`, {
-      data: { email, password: TEST_PASSWORD, fullName: 'Fixture Guest' },
+      data: { email: guest.email, password: guest.password, fullName: 'Fixture Guest' },
     }),
   );
   expect(response.status(), 'the fixture registration returns 201').toBe(201);
-  return email;
+  return guest;
 }
 
 /**
  * Logs a guest in through the API and returns the session that authorizes the
  * fixture requests. The web app's own session is not affected.
  */
-async function apiSignIn(request: APIRequestContext, email: string): Promise<ApiSession> {
+async function apiSignIn(request: APIRequestContext, guest: GuestCredentials): Promise<ApiSession> {
   const response = await fixtureRequest('logging in', () =>
-    request.post(`${apiUrl()}/auth/login`, { data: { email, password: TEST_PASSWORD } }),
+    request.post(`${apiUrl()}/auth/login`, { data: { email: guest.email, password: guest.password } }),
   );
   expect(response.status(), 'the fixture login returns 200').toBe(200);
   const body: unknown = await response.json();
@@ -1067,7 +1108,7 @@ for (const c of RAW_CRITERIA_CASES) {
 
     const res = await test.step('open the deep link', async () => {
       const response = page.waitForResponse(
-        (r) => new URL(r.url()).pathname === c.apiPath && r.request().method() === 'GET',
+        (r) => isApiEndpoint(r.url(), c.endpoint) && r.request().method() === 'GET',
       );
       await page.goto(url);
       return response;
@@ -1203,7 +1244,7 @@ for (const id of NON_INTEGER_HOTEL_IDS) {
 }
 
 test('the hotel id NUL from the login return URL shows an inline 404 without a request', async ({ page }) => {
-  const email = await test.step('register a guest', () => registerNewGuest(page));
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
 
   // nginx rejects /hotels/%00 on a direct load, so the in-app navigation
   // after login, which accepts any same-app path, is the way to reach it.
@@ -1212,7 +1253,7 @@ test('the hotel id NUL from the login return URL shows an inline 404 without a r
     const [checkIn, checkOut] = utcDates(30, 32);
     const returnUrl = `/hotels/%00?checkIn=${checkIn}&checkOut=${checkOut}`;
     await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
-    await logIn(page, email, TEST_PASSWORD);
+    await logIn(page, email, password);
     await expect(page).toHaveURL(/\/hotels\/%00\?/);
   });
 
@@ -1257,7 +1298,9 @@ test('a reused detail page loads once, for the hotel and stay it lands on', asyn
     await expect(page).toHaveURL(new RegExp(`/hotels/${first.id}\\?`));
     await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
 
-    expect(loads.map((u) => u.pathname)).toEqual([`/api/hotels/${first.id}`]);
+    // Loads are recorded on any origin, so a load sent to another API counts
+    // too and fails here: exactly one, from the target API's detail endpoint.
+    expect(loads.map((u) => `${u.origin}${u.pathname}`)).toEqual([`${apiUrl()}/hotels/${first.id}`]);
     const [load] = loads;
     expect(load.searchParams.get('checkIn')).toBe(firstStay.checkIn);
     expect(load.searchParams.get('checkOut')).toBe(firstStay.checkOut);
@@ -1297,12 +1340,22 @@ function recordApiRequests(page: Page): SentApiRequest[] {
 }
 
 /**
+ * Writes a recorded request's target as its path alone when it went to the
+ * target API's origin, and as origin and path otherwise, so a request that
+ * another stack's API received never compares equal to a target API path.
+ */
+function apiRelativeTarget(url: URL): string {
+  return url.origin === new URL(apiUrl()).origin ? url.pathname : `${url.origin}${url.pathname}`;
+}
+
+/**
  * Describes a recorded request by its method, path and stay query alone, so a
- * failed comparison prints no other part of it.
+ * failed comparison prints no other part of it; a request to another origin
+ * than the target API's also shows that origin ({@link apiRelativeTarget}).
  */
 function describeStayRequest({ method, url }: SentApiRequest): string {
   const query = url.searchParams;
-  return `${method} ${url.pathname} checkIn=${query.get('checkIn')} checkOut=${query.get('checkOut')} guests=${query.get('guests')}`;
+  return `${method} ${apiRelativeTarget(url)} checkIn=${query.get('checkIn')} checkOut=${query.get('checkOut')} guests=${query.get('guests')}`;
 }
 
 /**
@@ -1368,7 +1421,7 @@ async function bookThenReturnToShownStay(page: Page, shown: Stay, booked: Stay):
     const id = Number(testId.slice('book-'.length));
     const name = (await page.getByTestId(`room-type-row-${id}`).locator('td').first().innerText()).trim();
 
-    const gate = await holdRequest(page, isBookingsApi, 'POST');
+    const gate = await holdRequest(page, isBookingsCollection, 'POST');
     await page.getByTestId(testId).click();
     await gate.expectArrival('Book sends the POST');
     await expect(indicator).toBeVisible();
@@ -1381,7 +1434,7 @@ async function bookThenReturnToShownStay(page: Page, shown: Stay, booked: Stay):
     const loaded = page.waitForResponse((r) => {
       const url = new URL(r.url());
       return (
-        url.pathname === `/api/hotels/${hotel.id}` &&
+        isApiEndpoint(url, `/hotels/${hotel.id}`) &&
         url.searchParams.get('checkIn') === shown.checkIn &&
         r.request().method() === 'GET'
       );
@@ -1453,12 +1506,14 @@ for (const c of LATE_CREATED_CASES) {
 
     // The revalidation is held too, so the indicator and the disabled "Book"
     // can be seen to outlast the POST until the revalidation has answered.
-    const revalidation = c.overlaps ? await holdRequest(page, (url) => url.pathname === detailPath, 'GET') : null;
+    const revalidation = c.overlaps
+      ? await holdRequest(page, (url) => isApiEndpoint(url, `/hotels/${pending.hotel.id}`), 'GET')
+      : null;
     const sent = recordApiRequests(page);
 
     await test.step('release the POST: the API creates the booking', async () => {
       const created = page.waitForResponse(
-        (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'POST',
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
       );
       await pending.post.release();
       const response = await created;
@@ -1485,7 +1540,7 @@ for (const c of LATE_CREATED_CASES) {
         await expect(indicator).toBeVisible();
         await expectEveryBookDisabled(page);
         const reread = page.waitForResponse(
-          (r) => new URL(r.url()).pathname === detailPath && r.request().method() === 'GET',
+          (r) => isApiEndpoint(r.url(), `/hotels/${pending.hotel.id}`) && r.request().method() === 'GET',
         );
         await revalidation.release();
         expect((await reread).status()).toBe(200);
@@ -1528,7 +1583,7 @@ test('a late 401 on a reused detail page shows in its notice, never as an error 
 
   await test.step('release the POST with a token the API rejects', async () => {
     const rejected = page.waitForResponse(
-      (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'POST',
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
     );
     await pending.post.release({ authorization: 'Bearer not-a-valid-token' });
     expect((await rejected).status()).toBe(401);
@@ -1572,7 +1627,7 @@ test('a late 401 on a reused detail page shows in its notice, never as an error 
 });
 
 test('duplicate registration shows an inline 409', async ({ page }) => {
-  const email = await test.step('register a guest', () => registerNewGuest(page));
+  const { email } = await test.step('register a guest', () => registerNewGuest(page));
 
   await test.step('register the same email again', async () => {
     await page.getByTestId('register-link').click();
@@ -1581,7 +1636,8 @@ test('duplicate registration shows an inline 409', async ({ page }) => {
     // The API folds the email to lower case before comparing, so the same
     // address in other letter case is still a duplicate.
     await fillBound(page, 'register-email', email.replace(/^[^@]+/, (local) => local.toUpperCase()));
-    await fillBound(page, 'register-password', TEST_PASSWORD);
+    // A different valid password: the email alone makes the account a duplicate.
+    await fillBound(page, 'register-password', uniquePassword());
     await fillBound(page, 'register-full-name', 'States Guest');
     // Any other failing status with the same problem body shows the same
     // message through its `detail`, so only the response itself proves the
@@ -1602,11 +1658,12 @@ test('duplicate registration shows an inline 409', async ({ page }) => {
 });
 
 test('wrong password shows an inline 401', async ({ page }) => {
-  const email = await test.step('register a guest', () => registerNewGuest(page));
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
 
   await test.step('log in with a wrong password', async () => {
     await fillBound(page, 'login-email', email);
-    await fillBound(page, 'login-password', `${TEST_PASSWORD}x`);
+    // One character longer than the guest's own password, so never equal to it.
+    await fillBound(page, 'login-password', `${password}x`);
     // As for registration, the inline text alone cannot tell a 401 from
     // another failing status with the same problem body.
     const login = page.waitForResponse(
@@ -1685,7 +1742,7 @@ test('register with a too-short password shows the 400 field error inline and st
 // the real API rejects it, and the test checks how the unchanged page renders
 // that genuine 400.
 test('login page shows an API 400 inline (contract test: rewritten request body)', async ({ page }) => {
-  const email = await test.step('register a guest', () => registerNewGuest(page));
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
 
   const response = await test.step('log in with the request body rewritten to an unbindable email', async () => {
     // Only the POST is rewritten; a CORS preflight goes on unchanged. The
@@ -1699,7 +1756,7 @@ test('login page shows an API 400 inline (contract test: rewritten request body)
     // The form's own credentials are valid, so without the rewrite this login
     // would succeed.
     await fillBound(page, 'login-email', email);
-    await fillBound(page, 'login-password', TEST_PASSWORD);
+    await fillBound(page, 'login-password', password);
     const login = page.waitForResponse(
       (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
     );
@@ -1777,7 +1834,7 @@ for (const c of UNUSABLE_LOGIN_BODIES) {
 
     await page.goto('/login');
     await fillBound(page, 'login-email', uniqueEmail());
-    await fillBound(page, 'login-password', TEST_PASSWORD);
+    await fillBound(page, 'login-password', uniquePassword());
     const login = page.waitForResponse(
       (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
     );
@@ -1794,13 +1851,13 @@ for (const c of UNUSABLE_LOGIN_BODIES) {
 for (const c of UNUSABLE_READ_CASES) {
   test(`${c.title} shows inline and renders no hotel`, async ({ page }) => {
     await page.route(
-      (url) => url.pathname === c.apiPath,
+      (url) => isApiEndpoint(url, c.endpoint),
       (route) => route.fulfill({ status: 200, contentType: 'application/json', body: c.body }),
     );
 
     const [checkIn, checkOut] = utcDates(30, 32);
     const read = page.waitForResponse(
-      (r) => new URL(r.url()).pathname === c.apiPath && r.request().method() === 'GET',
+      (r) => isApiEndpoint(r.url(), c.endpoint) && r.request().method() === 'GET',
     );
     await page.goto(c.url.replace('{stay}', `checkIn=${checkIn}&checkOut=${checkOut}`));
     expect((await read).status()).toBe(200);
@@ -1825,7 +1882,7 @@ test('server 401 on entering My bookings redirects with session-expired', async 
   await test.step('open My bookings with a token the API rejects', async () => {
     await rejectBookingsToken(page);
     const list = page.waitForResponse(
-      (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'GET',
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
     );
     await page.getByTestId('nav-bookings').click();
     expect((await list).status()).toBe(401);
@@ -1859,7 +1916,7 @@ test('server 401 on Book stays on the page with an inline error', async ({ page 
     // The 401 to the POST itself proves the server refused the booking, so
     // none was created.
     const created = page.waitForResponse(
-      (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'POST',
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
     );
     await book.click();
     expect((await created).status()).toBe(401);
@@ -1878,7 +1935,7 @@ test('server 401 on Book stays on the page with an inline error', async ({ page 
 });
 
 test('server 401 on Cancel stays on My bookings with an inline error', async ({ page, request }) => {
-  const email = await test.step('register and log in', () => registerAndLogIn(page));
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
 
   const { session, id } = await test.step('book a later Seattle stay for the guest through the API', async () => {
     const [checkIn, checkOut] = utcDates(120, 122);
@@ -1896,7 +1953,7 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     const free = (await apiRoomTypes(request, Number(hotelId), stay)).find((rt) => rt.availableRooms > 0);
     expect(free !== undefined, 'the hotel has a free room type').toBe(true);
 
-    const guest = await apiSignIn(request, email);
+    const guest = await apiSignIn(request, credentials);
     const bookingId = await apiBook(request, guest, {
       hotelId: Number(hotelId),
       roomTypeId: Number(free?.id),
@@ -1909,7 +1966,7 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     // The entry GET must succeed: its own 401 is the redirect branch, which
     // the entry case covers.
     const list = page.waitForResponse(
-      (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'GET',
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
     );
     await page.getByTestId('nav-bookings').click();
     expect((await list).status(), 'the entry GET returns 200').toBe(200);
@@ -1931,7 +1988,7 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     });
     const recorded = recordApiRequests(page);
     const cancelled = page.waitForResponse(
-      (r) => new URL(r.url()).pathname === `/api/bookings/${id}` && r.request().method() === 'DELETE',
+      (r) => isApiEndpoint(r.url(), `/bookings/${id}`) && r.request().method() === 'DELETE',
     );
     await page.getByTestId(`cancel-${id}`).click();
     expect((await cancelled).status(), 'the API rejects the DELETE').toBe(401);
@@ -1964,7 +2021,7 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
     // A rejected cancel reloads nothing: the DELETE is the only API request.
     expect(
-      sent.map(({ method, url }) => `${method} ${url.pathname}`),
+      sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
       'the API requests after the click',
     ).toEqual([`DELETE /api/bookings/${id}`]);
     expect(await apiBookingStatus(request, session, id), 'the server status of the booking').toBe('Confirmed');
@@ -1976,9 +2033,9 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     await page.getByTestId('login-again').click();
     await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
     const list = page.waitForResponse(
-      (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'GET',
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
     );
-    await logIn(page, email, TEST_PASSWORD);
+    await logIn(page, credentials.email, credentials.password);
     expect((await list).status(), 'the list GET after logging in again returns 200').toBe(200);
     await expect(page).toHaveURL(bookingsUrl);
     await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
@@ -2075,7 +2132,7 @@ async function searchFirstHotelId(page: Page, criteria: Stay & { city: string })
 test('Book while signed out returns to the same stay after login', async ({ page, request }) => {
   const [checkIn, checkOut] = utcDates(130, 132);
   // The account exists, but the browser never signs in before "Book".
-  const email = await test.step('register a guest through the API', () => apiRegisterGuest(request));
+  const { email, password } = await test.step('register a guest through the API', () => apiRegisterGuest(request));
 
   const hotel = await test.step('open a Seattle hotel for the stay, signed out', async () => {
     await page.goto('/search');
@@ -2090,12 +2147,13 @@ test('Book while signed out returns to the same stay after login', async ({ page
   expect(shown.searchParams.get('checkOut')).toBe(checkOut);
   expect(shown.searchParams.get('guests')).toBe('2');
 
-  // Every method, so a preflight would count too: signed out, nothing goes there.
+  // Every method, so a preflight would count too: signed out, nothing goes
+  // there. Any origin, so a request to another stack's API counts as well.
   const bookingsRequests: string[] = [];
   page.on('request', (sent) => {
     const url = new URL(sent.url());
-    if (isBookingsApi(url)) {
-      bookingsRequests.push(`${sent.method()} ${url.pathname}`);
+    if (url.pathname === '/api/bookings' || url.pathname.startsWith('/api/bookings/')) {
+      bookingsRequests.push(`${sent.method()} ${url.origin}${url.pathname}`);
     }
   });
 
@@ -2110,7 +2168,7 @@ test('Book while signed out returns to the same stay after login', async ({ page
   });
 
   await test.step('log in: the same hotel and stay come back, with Book enabled', async () => {
-    await logIn(page, email, TEST_PASSWORD);
+    await logIn(page, email, password);
     await expect(page).toHaveURL(stayPath);
     await expect(page.getByTestId('hotel-name')).toHaveText(hotel.name);
     await expect(page.locator('.hotel-stay')).toHaveText(
@@ -2222,14 +2280,14 @@ test('Book answering a real 409 shows it above the room table and refreshes the 
   const reads: { status: number; url: URL }[] = [];
   page.on('response', (response) => {
     const url = new URL(response.url());
-    if (url.pathname === `/api/hotels/${hotelId}` && response.request().method() === 'GET') {
+    if (isApiEndpoint(url, `/hotels/${hotelId}`) && response.request().method() === 'GET') {
       reads.push({ status: response.status(), url });
     }
   });
 
   await test.step('click Book: the API answers 409', async () => {
     const created = page.waitForResponse(
-      (r) => isBookingsApi(new URL(r.url())) && r.request().method() === 'POST',
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
     );
     await book.click();
     expect((await created).status(), 'Book answers 409').toBe(409);

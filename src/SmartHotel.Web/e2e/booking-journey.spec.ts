@@ -61,7 +61,6 @@ import {
 } from '@playwright/test';
 
 import {
-  TEST_PASSWORD,
   apiUrl,
   displayDate,
   expectControlValue,
@@ -72,6 +71,7 @@ import {
   registerGuest,
   searchHotels,
   uniqueEmail,
+  uniquePassword,
   utcDates,
   watchInlineErrors,
 } from './support/helpers';
@@ -83,7 +83,7 @@ type CreateResponse = Response | APIResponse;
 interface GuestRun {
   /** The guest's email address. */
   email: string;
-  /** The guest's password. */
+  /** The guest's password, generated for this run; never printed. */
   password: string;
   /**
    * The run's latest `POST /api/bookings`, tracked from just before it was
@@ -576,9 +576,10 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
   const guests = 2;
   const criteria = { city, checkIn, checkOut, guests };
   const email = uniqueEmail();
+  const password = uniquePassword();
   const fullName = 'Journey Guest';
 
-  const state: JourneyState = { email, password: TEST_PASSWORD, create: null, cancelled: false };
+  const state: JourneyState = { email, password, create: null, cancelled: false };
   journey = state;
 
   /** Asserts the hotel detail URL for `hotelId` carries the searched stay. */
@@ -608,7 +609,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     await expect(page).toHaveURL(/\/search$/);
     await page.getByTestId('nav-register').click();
     await expect(page).toHaveURL(/\/register$/);
-    await registerGuest(page, { email, password: TEST_PASSWORD, fullName });
+    await registerGuest(page, { email, password, fullName });
     await expectNoInlineError(page);
     await expectNoInlineErrorSoFar();
   });
@@ -616,7 +617,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
   await test.step('log in', async () => {
     await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
     await expectControlValue(page, 'login-email', email);
-    await logIn(page, email, TEST_PASSWORD);
+    await logIn(page, email, password);
     await expect(page).toHaveURL(/\/search$/);
     await expectSignedInAs(page, email);
     await expectNoInlineError(page);
@@ -870,7 +871,7 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
     const [d1, d2, d3] = utcDates(1, 2, 3);
     const reference = new Date(`${d2}T12:00:00Z`);
     const email = uniqueEmail();
-    const password = TEST_PASSWORD;
+    const password = uniquePassword();
     const api = apiUrl();
 
     const [bookingA, bookingB] = await test.step('arrange bookings A and B through the API', async () => {

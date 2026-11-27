@@ -15,6 +15,15 @@
  * ends, however it ends, and a concurrent fresh run finds it taken and fails
  * before any Compose call instead of removing the stack under test.
  *
+ * Every Compose command runs under a deadline, 5 minutes for a `down` and 30
+ * minutes for the `up`. One that outlives it is stopped with its whole
+ * process tree, the `docker` CLI, the Compose plugin the CLI runs and every
+ * process they started, and nothing else: SIGTERM, then SIGKILL (on Windows,
+ * `taskkill /T /F`). Setup fails and releases the lock only after a bounded
+ * drain in which that tree has gone and its pipes have closed, so a stalled
+ * Docker operation can neither hold the lock indefinitely nor, short of a
+ * process that survives SIGKILL, keep running once the lock is released.
+ *
  * Playwright transpiles this file as CommonJS and it is never type-checked
  * (no `@types/node`; `tsconfig.app.json` excludes `e2e/**`). It uses Node's
  * built-in modules and globals only.
@@ -29,13 +38,21 @@
  *   caught error. They hold only fixed text, the project name, the acceptance
  *   and lock ports, the target URLs in the canonical form
  *   `./support/stack-target` validated them into (scheme, host, port and
- *   path, never a user name, password, query or fragment), HTTP statuses,
- *   validated error codes such as `ECONNREFUSED`, the manual removal command
- *   with this checkout's paths, and the process id, start time and checkout
- *   path the run owning the lock reports, with control characters removed.
- * - When a Compose command fails, its output is printed filtered, limited to
- *   the last 200 lines of at most 500 characters, and with every line
- *   prefixed `  compose | ` so it cannot pass for a message of this setup.
+ *   path, never a user name, password, query or fragment), the web app's
+ *   `/config.json` URL built from that canonical origin, HTTP statuses,
+ *   fixed-text reasons why `/config.json` does not name the target API (never
+ *   the value it serves), validated error codes such as `ECONNREFUSED`, the
+ *   Compose deadlines, the manual removal command with this checkout's
+ *   paths, and the process id, start time and checkout path the run owning
+ *   the lock reports, with control characters removed.
+ * - Only the last 1 MiB of characters of a Compose command's output is kept,
+ *   from the first line that starts within it; a line that limit cuts is
+ *   dropped whole, the part of it written later included, so no line's end
+ *   is kept without its start. When a Compose command fails or times out,
+ *   that output is printed filtered, limited to the last 200 lines of at most
+ *   500 characters, after a marker when earlier output was dropped, and with
+ *   every line prefixed `  compose | ` so it cannot pass for a message of
+ *   this setup.
  *   The filter removes control characters and escape sequences and redacts
  *   what its patterns recognize: credential headers and key-value pairs,
  *   connection strings, bearer and basic credentials, JWTs, URL user
@@ -44,7 +61,8 @@
  *   variables. Because it is pattern-based, that output can still contain
  *   sensitive text it does not recognize.
  */
-import { spawn } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as net from 'node:net';
 
 import {
@@ -62,10 +80,18 @@ import {
 
 /** The outcome of one Compose command. */
 interface ComposeResult {
-  /** The exit code; a child that ended on a signal counts as `1`. */
+  /** The exit code; a child that ended on a signal, or never exited, counts as `1`. */
   code: number;
-  /** Everything the command wrote to stdout and stderr, in arrival order. */
+  /**
+   * What the command wrote to stdout and stderr, in arrival order: all of it,
+   * or, when {@link outputDropped} is set, only its last whole lines within
+   * {@link COMPOSE_OUTPUT_MAX_CHARACTERS}.
+   */
   output: string;
+  /** Whether earlier output was dropped to keep {@link output} within its cap. */
+  outputDropped: boolean;
+  /** Whether the command outlived its deadline and was stopped. */
+  timedOut: boolean;
 }
 
 /** Removes the acceptance project with its containers, networks and volumes. */
@@ -75,10 +101,77 @@ const DOWN_ARGS = ['down', '-v', '--remove-orphans'];
  * Builds current images and starts db, api and web from fresh volumes.
  * `--wait` (Compose v2.1.1 or later) returns only once every service's
  * healthcheck passes, and the `api` healthcheck passes only after migration
- * and seeding, so success means a migrated and seeded stack. No timeout is
- * placed around it: an image build can take several minutes.
+ * and seeding, so success means a migrated and seeded stack. It runs under
+ * {@link COMPOSE_UP_TIMEOUT_MS}, which leaves room for a first image build
+ * on a clean machine, a matter of several minutes.
  */
 const UP_ARGS = ['up', '-d', '--build', '--force-recreate', '--wait'];
+
+/**
+ * Deadline for each {@link DOWN_ARGS} command, the removal before the build
+ * and the removal after a failed `up`: 5 minutes. A removal stops the
+ * project's containers, each within Compose's default 10-second stop
+ * timeout, and removes its networks and volumes, so one still running then
+ * is stalled.
+ */
+const COMPOSE_DOWN_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Deadline for the {@link UP_ARGS} command: 30 minutes. A first build on a
+ * clean machine pulls the base images, restores the NuGet and npm packages
+ * and builds both images within it, so only a stalled build or start reaches
+ * it.
+ */
+const COMPOSE_UP_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * How long a Compose command that outlived its deadline, the `docker` CLI and
+ * every process it started, gets to exit after SIGTERM before what is left of
+ * it is sent SIGKILL.
+ */
+const COMPOSE_KILL_GRACE_MS = 10_000;
+
+/**
+ * How long a Compose command gets, once it has exited or its process tree has
+ * been sent SIGKILL, for its output pipes to close and, after a timeout, for
+ * every process of its tree to be gone. A process it started, such as the
+ * Compose plugin, can hold the pipes open after it; they are then closed from
+ * this side.
+ */
+const COMPOSE_DRAIN_TIMEOUT_MS = 10_000;
+
+/**
+ * How often the process tree of a timed-out Compose command is read again
+ * while it is stopped and drained, so a process it starts meanwhile is
+ * signalled too and the wait ends soon after the whole tree is gone.
+ */
+const COMPOSE_STOP_POLL_INTERVAL_MS = 250;
+
+/**
+ * Upper bound for one run of `ps` or `taskkill` while a timed-out Compose
+ * command is stopped. Both run synchronously, so a hung one must not stall
+ * the stop.
+ */
+const PROCESS_TOOL_TIMEOUT_MS = 2_000;
+
+/** Upper bound, in bytes, for the process list `ps` prints. */
+const PROCESS_LIST_MAX_BYTES = 16 * 1_048_576;
+
+/**
+ * The most times the process tree of a timed-out Compose command is read
+ * again while it is frozen before SIGKILL. A frozen process starts no other,
+ * so each read finds only processes started just before their parent was
+ * frozen, and a read or two normally finds no new one.
+ */
+const PROCESS_TREE_FREEZE_MAX_PASSES = 10;
+
+/**
+ * The most characters (UTF-16 code units) of a Compose command's output that
+ * are kept, its last ones: 1 MiB. While the command runs, at most twice that
+ * is held before the oldest text is dropped, at a line boundary; a line that
+ * cut falls in is dropped whole, the part of it written later included.
+ */
+const COMPOSE_OUTPUT_MAX_CHARACTERS = 1_048_576;
 
 /** HTTP probe attempts, which absorb a listener that has only just started. */
 const PROBE_ATTEMPTS = 10;
@@ -601,22 +694,47 @@ function filterComposeOutput(output: string): { lines: string[]; omitted: number
 }
 
 /**
- * Prints a failed Compose command: a header naming the operation, exit code
- * and project, then the command's output as {@link filterComposeOutput}
- * leaves it, every line prefixed with {@link COMPOSE_OUTPUT_PREFIX}.
+ * Describes a deadline for a message: a whole number of minutes as
+ * `5 minutes`, any other length in seconds, as `2.5 s`.
+ */
+function describeDuration(ms: number): string {
+  if (ms % 60_000 === 0) {
+    const minutes = ms / 60_000;
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  }
+  return `${ms / 1_000} s`;
+}
+
+/**
+ * Prints a failed Compose command: a header naming the operation, how it
+ * failed (its exit code, or the deadline it outlived) and the project, then
+ * the command's output as {@link filterComposeOutput} leaves it, every line
+ * prefixed with {@link COMPOSE_OUTPUT_PREFIX}. Marker lines say when output
+ * was dropped while it was collected ({@link ComposeResult.outputDropped})
+ * and when earlier lines of what was kept are not printed.
  *
  * @param operation - The Compose subcommand and its arguments, as run.
  * @param result - The command's outcome.
+ * @param deadlineMs - The deadline the command ran under, which the header
+ *   names when the command outlived it.
  */
-function printComposeFailure(operation: string, result: ComposeResult): void {
+function printComposeFailure(operation: string, result: ComposeResult, deadlineMs: number): void {
   const { lines, omitted } = filterComposeOutput(result.output);
+  const outcome = result.timedOut
+    ? `for project ${ACCEPTANCE_PROJECT} timed out after ${describeDuration(deadlineMs)} and was stopped`
+    : `exited with code ${result.code} for project ${ACCEPTANCE_PROJECT}`;
   const report = [
-    `docker compose ${operation} exited with code ${result.code} for project ${ACCEPTANCE_PROJECT}; its output follows, filtered by pattern (recognized credentials, tokens, connection strings, URL queries and email addresses redacted; control characters removed):`,
+    `docker compose ${operation} ${outcome}; its output follows, filtered by pattern (recognized credentials, tokens, connection strings, URL queries and email addresses redacted; control characters removed):`,
   ];
+  if (result.outputDropped) {
+    report.push(
+      `${COMPOSE_OUTPUT_PREFIX}[earlier output omitted: only its last ${COMPOSE_OUTPUT_MAX_CHARACTERS} characters were kept, from the first line that starts within them]`,
+    );
+  }
   if (omitted > 0) {
     report.push(`${COMPOSE_OUTPUT_PREFIX}[${omitted} earlier line${omitted === 1 ? '' : 's'} omitted]`);
   }
-  if (lines.length === 0) {
+  if (lines.length === 0 && !result.outputDropped) {
     report.push(`${COMPOSE_OUTPUT_PREFIX}[no output]`);
   }
   for (const line of lines) {
@@ -640,45 +758,558 @@ function composeStartFailure(args: string[], err: unknown): Error {
   return Object.assign(new Error(message), { code });
 }
 
+/** A line break as {@link splitDisplayLines} reads one: CR LF, LF, CR, U+2028 or U+2029. */
+const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
+
+/**
+ * Keeps the end of a command's output within
+ * {@link COMPOSE_OUTPUT_MAX_CHARACTERS}, from the first line that starts
+ * within it. The line the cut falls in is dropped whole, so no fragment is
+ * printed and no credential key is cut away from its value, which the
+ * redaction patterns recognize only together. When no line break follows the
+ * cut, that line is still open, and what the command writes next continues
+ * it; {@link createOutputCollector} then drops that as well, up to the line's
+ * end.
+ *
+ * @param text - Output longer than {@link COMPOSE_OUTPUT_MAX_CHARACTERS}.
+ * @returns `tail`, the kept tail, empty when no line starts within it, and
+ *   `insideLine`, set when the cut falls in a line that `text` does not end.
+ */
+function keepOutputTail(text: string): { tail: string; insideLine: boolean } {
+  const start = text.length - COMPOSE_OUTPUT_MAX_CHARACTERS;
+  const previous = text[start - 1];
+  const startsLine =
+    previous === '\n' ||
+    previous === '\u2028' ||
+    previous === '\u2029' ||
+    // A cut between the CR and the LF of one line break starts no line.
+    (previous === '\r' && text[start] !== '\n');
+  const tail = text.slice(start);
+  if (startsLine) {
+    return { tail, insideLine: false };
+  }
+  const lineBreak = LINE_BREAK.exec(tail);
+  return lineBreak === null
+    ? { tail: '', insideLine: true }
+    : { tail: tail.slice(lineBreak.index + lineBreak[0].length), insideLine: false };
+}
+
+/**
+ * Collects a command's output, keeping at most its last
+ * {@link COMPOSE_OUTPUT_MAX_CHARACTERS}. Chunks are appended as they arrive;
+ * whenever twice that much has accumulated, the text is cut back by
+ * {@link keepOutputTail}, so the memory held stays bounded however much the
+ * command writes, and each character is copied a bounded number of times.
+ *
+ * A line the cut falls in is dropped whole, however long it grows: when the
+ * cut leaves it open, every chunk that follows is discarded up to the next
+ * line break as {@link splitDisplayLines} reads one (LF, CR, CR LF, U+2028 or
+ * U+2029; the LF of a CR LF split across two chunks included), and none of it
+ * is held, so the end of a line, such as a credential's value without the
+ * label its redaction needs, is never kept without the line's start.
+ * Collection resumes with the next line, and the drop stays reported.
+ *
+ * @returns `append`, the listener for decoded output chunks, and `read`,
+ *   which returns the kept output, cut back to the cap, and whether any
+ *   earlier output was dropped.
+ */
+function createOutputCollector(): {
+  append: (chunk: string) => void;
+  read: () => { output: string; outputDropped: boolean };
+} {
+  let chunks: string[] = [];
+  let length = 0;
+  let dropped = false;
+  // What is discarded from the output that comes next: nothing, the rest of
+  // a line whose start was dropped, or the LF of a CR LF whose CR ended the
+  // dropped text.
+  let discard: 'none' | 'line' | 'lineFeed' = 'none';
+  const cutBack = () => {
+    const text = chunks.join('');
+    const { tail, insideLine } = keepOutputTail(text);
+    chunks = [tail];
+    length = tail.length;
+    dropped = true;
+    if (insideLine) {
+      discard = 'line';
+    } else if (tail === '' && text.endsWith('\r')) {
+      discard = 'lineFeed';
+    } else {
+      discard = 'none';
+    }
+  };
+  return {
+    append: (chunk: string) => {
+      let text = chunk;
+      if (discard === 'lineFeed' && text !== '') {
+        discard = 'none';
+        if (text.startsWith('\n')) {
+          text = text.slice(1);
+        }
+      }
+      if (discard === 'line') {
+        const lineBreak = LINE_BREAK.exec(text);
+        if (lineBreak === null) {
+          return;
+        }
+        text = text.slice(lineBreak.index + lineBreak[0].length);
+        discard = lineBreak[0] === '\r' && text === '' ? 'lineFeed' : 'none';
+      }
+      if (text === '') {
+        return;
+      }
+      chunks.push(text);
+      length += text.length;
+      if (length > 2 * COMPOSE_OUTPUT_MAX_CHARACTERS) {
+        cutBack();
+      }
+    },
+    read: () => {
+      if (length > COMPOSE_OUTPUT_MAX_CHARACTERS) {
+        cutBack();
+      }
+      return { output: chunks.join(''), outputDropped: dropped };
+    },
+  };
+}
+
+/** One entry of the host's process table, as {@link readProcessTable} reads it. */
+interface ProcessEntry {
+  /** The parent's process id. */
+  ppid: number;
+  /**
+   * When the process started, as the table reports it: clock ticks since boot
+   * on Linux, the `ps` start time elsewhere. With the process id it identifies
+   * the process, so a process that reuses the id of one that ended is not
+   * mistaken for it.
+   */
+  started: string;
+  /** Whether the process has exited and only awaits reaping (a zombie). */
+  exited: boolean;
+}
+
+/**
+ * Reads the process table on Linux from `/proc/<pid>/stat`. The command name
+ * in that line is in parentheses and can hold spaces and parentheses itself,
+ * so fields are counted from the last `)`: the state is the first after it,
+ * the parent's id the second and the start time the twentieth.
+ *
+ * @returns Every process that could be read, by process id.
+ * @throws Error when `/proc` cannot be listed.
+ */
+function readProcTable(): Map<number, ProcessEntry> {
+  const table = new Map<number, ProcessEntry>();
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(name)) {
+      continue;
+    }
+    let stat: string;
+    try {
+      stat = fs.readFileSync(`/proc/${name}/stat`, 'utf8');
+    } catch {
+      // The process ended between the listing and the read.
+      continue;
+    }
+    const fields = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
+    const ppid = Number(fields[1]);
+    const started = fields[19];
+    if (Number.isInteger(ppid) && started !== undefined) {
+      table.set(Number(name), { ppid, started, exited: fields[0] === 'Z' || fields[0] === 'X' });
+    }
+  }
+  return table;
+}
+
+/**
+ * Reads the process table on POSIX systems other than Linux, such as macOS,
+ * with `ps -A -o pid=,ppid=,stat=,lstart=`, within
+ * {@link PROCESS_TOOL_TIMEOUT_MS}.
+ *
+ * @returns Every listed process by process id, or `undefined` when `ps`
+ *   cannot be run, fails or lists nothing.
+ */
+function readPsTable(): Map<number, ProcessEntry> | undefined {
+  const result = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,stat=,lstart='], {
+    encoding: 'utf8',
+    maxBuffer: PROCESS_LIST_MAX_BYTES,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: PROCESS_TOOL_TIMEOUT_MS,
+  });
+  if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== 'string') {
+    return undefined;
+  }
+  const table = new Map<number, ProcessEntry>();
+  for (const line of result.stdout.split('\n')) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$/.exec(line);
+    if (match !== null) {
+      table.set(Number(match[1]), { ppid: Number(match[2]), started: match[4], exited: match[3].startsWith('Z') });
+    }
+  }
+  return table.size > 0 ? table : undefined;
+}
+
+/**
+ * Reads the host's process table: from `/proc` on Linux, with `ps` on other
+ * POSIX systems.
+ *
+ * @returns The table by process id, or `undefined` when it cannot be read.
+ *   It never throws.
+ */
+function readProcessTable(): Map<number, ProcessEntry> | undefined {
+  try {
+    return process.platform === 'linux' ? readProcTable() : readPsTable();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Lists the descendants of `roots` in `table` by following parent ids: their
+ * children, those children's children, and so on.
+ *
+ * @param table - The process table, as {@link readProcessTable} read it.
+ * @param roots - The process ids to start from, which are not listed.
+ * @returns The descendants' process ids, each once.
+ */
+function collectDescendants(table: Map<number, ProcessEntry>, roots: number[]): number[] {
+  const children = new Map<number, number[]>();
+  for (const [pid, entry] of table) {
+    const siblings = children.get(entry.ppid);
+    if (siblings === undefined) {
+      children.set(entry.ppid, [pid]);
+    } else {
+      siblings.push(pid);
+    }
+  }
+  const seen = new Set<number>(roots);
+  const queue = [...roots];
+  const descendants: number[] = [];
+  for (let next = 0; next < queue.length; next += 1) {
+    for (const pid of children.get(queue[next]) ?? []) {
+      if (!seen.has(pid)) {
+        seen.add(pid);
+        descendants.push(pid);
+        queue.push(pid);
+      }
+    }
+  }
+  return descendants;
+}
+
+/** A signal the process tree of a timed-out Compose command is sent: SIGTERM first, then SIGKILL. */
+type StopSignal = 'SIGTERM' | 'SIGKILL';
+
+/**
+ * Prepares the stop of a timed-out Compose command's whole process tree on
+ * POSIX: the `docker` CLI, the Compose plugin it runs as a child process, and
+ * every process either of them started.
+ *
+ * Each call of the returned function reads the process table again and adds
+ * to the tree the descendants of the CLI while it runs and of every member
+ * still alive, so a process started during the stop is found while its
+ * parent lives, and a member stays in the tree after its parent has died.
+ * Members are recorded with their start time: a process holding a member's
+ * id with another start time is a different process, is never signalled and
+ * leaves that member counted as gone. The call then sends `signal` to the CLI
+ * and to every live member not yet sent it or SIGKILL, so each process gets
+ * each signal once. Before SIGKILL the tree is frozen with SIGSTOP and read
+ * again, up to {@link PROCESS_TREE_FREEZE_MAX_PASSES} times, until every
+ * member a read shows is frozen: a stopped process cannot start another, and
+ * one started just before its parent stopped shows under that parent in the
+ * next read, so no process the tree starts at the last moment escapes the
+ * kill.
+ *
+ * Nothing else is signalled. The CLI is not detached, so it and its tree stay
+ * in the process group a stopped `ng test` stops as a whole, and no group is
+ * addressed here, only these process ids. When the table cannot be read,
+ * only the CLI is signalled, through its handle.
+ *
+ * @param child - The `docker` CLI process of the command.
+ * @returns The stop step: it signals as above and returns `true` once the
+ *   tree is gone, that is the CLI has exited and no member is alive, an
+ *   exited one awaiting reaping counting as gone; `false` while any of it
+ *   runs or the table cannot be read to tell. It never throws.
+ */
+function createProcessTreeStop(child: ChildProcess): (signal: StopSignal) => boolean {
+  const members = new Map<number, { started: string; frozen: boolean; sent?: StopSignal }>();
+  let cliFrozen = false;
+  let cliSent: StopSignal | undefined;
+  const cliRunning = () => child.exitCode === null && child.signalCode === null;
+  const needs = (sent: StopSignal | undefined, signal: StopSignal) =>
+    sent === undefined || (sent === 'SIGTERM' && signal === 'SIGKILL');
+  const isLive = (table: Map<number, ProcessEntry>, pid: number, started: string) => {
+    const entry = table.get(pid);
+    return entry !== undefined && entry.started === started && !entry.exited;
+  };
+  const signalCli = (signal: 'SIGSTOP' | StopSignal) => {
+    try {
+      child.kill(signal);
+    } catch {
+      // Deliberately ignored: SIGKILL after the grace, then the bounded
+      // drain, still end the wait.
+    }
+  };
+  const signalMember = (pid: number, signal: 'SIGSTOP' | StopSignal) => {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // Deliberately ignored: it ended since the read, or it cannot be
+      // signalled; the bounded drain still ends the wait.
+    }
+  };
+  // Reads the table and records the descendants of the CLI while it runs and
+  // of every live member.
+  const discover = (): Map<number, ProcessEntry> | undefined => {
+    const table = readProcessTable();
+    if (table !== undefined) {
+      const roots = [...members].filter(([pid, member]) => isLive(table, pid, member.started)).map(([pid]) => pid);
+      if (cliRunning() && child.pid !== undefined) {
+        roots.push(child.pid);
+      }
+      for (const pid of collectDescendants(table, roots)) {
+        const started = table.get(pid)?.started;
+        if (started !== undefined && members.get(pid)?.started !== started) {
+          members.set(pid, { started, frozen: false });
+        }
+      }
+    }
+    return table;
+  };
+  return (signal) => {
+    try {
+      let table = discover();
+      const passes = signal === 'SIGKILL' ? PROCESS_TREE_FREEZE_MAX_PASSES : 0;
+      for (let pass = 0; table !== undefined && pass < passes; pass += 1) {
+        let froze = false;
+        if (cliRunning() && !cliFrozen) {
+          cliFrozen = true;
+          froze = true;
+          signalCli('SIGSTOP');
+        }
+        for (const [pid, member] of members) {
+          if (!member.frozen && isLive(table, pid, member.started)) {
+            member.frozen = true;
+            froze = true;
+            signalMember(pid, 'SIGSTOP');
+          }
+        }
+        if (!froze) {
+          break;
+        }
+        // A failed read keeps the last table, so every frozen member is
+        // still killed below.
+        table = discover() ?? table;
+      }
+      if (cliRunning() && needs(cliSent, signal)) {
+        cliSent = signal;
+        signalCli(signal);
+      }
+      let anyLive = false;
+      if (table !== undefined) {
+        for (const [pid, member] of members) {
+          if (!isLive(table, pid, member.started)) {
+            continue;
+          }
+          anyLive = true;
+          if (needs(member.sent, signal)) {
+            member.sent = signal;
+            signalMember(pid, signal);
+          }
+        }
+      }
+      // Without a table the members' state is unknown; with none recorded
+      // only the CLI is waited for, as only it was signalled.
+      return !cliRunning() && !anyLive && (table !== undefined || members.size === 0);
+    } catch {
+      return false;
+    }
+  };
+}
+
+/**
+ * Stops a timed-out Compose command's whole process tree on Windows, which
+ * has neither POSIX signals nor process groups to address: runs
+ * `taskkill /PID <pid> /T /F`, which ends the `docker` CLI and every process
+ * it started, as forcefully as Node's own kill does there, within
+ * {@link PROCESS_TOOL_TIMEOUT_MS}. When `taskkill` cannot be run or fails,
+ * the CLI alone is ended through its handle. It never throws.
+ *
+ * @param child - The `docker` CLI process of the command.
+ */
+function stopWindowsProcessTree(child: ChildProcess): void {
+  let ended = false;
+  try {
+    if (child.pid !== undefined) {
+      const result = spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: PROCESS_TOOL_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      ended = result.error === undefined && result.status === 0;
+    }
+  } catch {
+    ended = false;
+  }
+  if (!ended) {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Deliberately ignored: the bounded drain still ends the wait.
+    }
+  }
+}
+
 /**
  * Runs one Compose command on the acceptance project, from the repository
- * root, with the neutralized Compose environment. Output is collected, not
- * streamed, so it is printed once, filtered by {@link printComposeFailure},
- * and only when a command fails.
+ * root, with the neutralized Compose environment, within a deadline. Output
+ * is collected, not streamed, so it is printed once, filtered by
+ * {@link printComposeFailure}, and only when a command fails; at most its
+ * last {@link COMPOSE_OUTPUT_MAX_CHARACTERS} are kept
+ * ({@link createOutputCollector}).
+ *
+ * A command still running at its deadline is stopped, its whole process tree
+ * and nothing else: the `docker` CLI, the Compose plugin it runs as a child
+ * process and every process they started. On POSIX
+ * ({@link createProcessTreeStop}) the tree is read from the process table at
+ * the deadline, while the CLI still runs, and sent SIGTERM; what is left of
+ * it after {@link COMPOSE_KILL_GRACE_MS}, processes started meanwhile
+ * included, is frozen with SIGSTOP and sent SIGKILL. The table is read again
+ * every {@link COMPOSE_STOP_POLL_INTERVAL_MS}, so a tree that is gone earlier
+ * ends the grace early. The CLI is not detached, so the tree stays in the
+ * process group a stopped `ng test` stops as a whole. On Windows the tree is
+ * ended at the deadline with `taskkill /T /F` ({@link stopWindowsProcessTree}).
+ *
+ * The drain follows: {@link COMPOSE_DRAIN_TIMEOUT_MS} for the pipes to close
+ * and, after a timeout on POSIX, for every process of the tree to be gone.
+ * Pipes still held open then, by a process outside the tree or one that
+ * survived SIGKILL, are closed from this side. The promise settles exactly
+ * once: when the command has ended, its pipes have closed and, after a
+ * timeout, its tree is gone; when the drain ends; or when `docker` cannot be
+ * started. Every timer is cleared then. A caller holding the acceptance-run
+ * lock therefore releases it only after the command's tree has been stopped
+ * and drained, at most `deadlineMs` plus the grace and the drain after the
+ * command started.
  *
  * @param root - The repository root.
  * @param args - The Compose subcommand and its arguments.
- * @returns The exit code and the collected output.
+ * @param deadlineMs - How long the command may run before it is stopped.
+ * @returns The exit code, whether the command timed out, the kept output and
+ *   whether earlier output was dropped.
  * @throws Error when `docker` cannot be started at all. Its message is fixed
  *   text with at most a validated error code, such as `EACCES`, never the
  *   system's own message.
  */
-function runCompose(root: string, args: string[]): Promise<ComposeResult> {
+function runCompose(root: string, args: string[], deadlineMs: number): Promise<ComposeResult> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    const settle = (finish: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(deadlineTimer);
+      clearTimeout(killTimer);
+      clearTimeout(drainTimer);
+      clearInterval(pollTimer);
+      finish();
+    };
     try {
       const child = spawn('docker', composeArgs(root, ...args), {
         cwd: root,
         env: composeEnvironment(),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
-      const chunks: string[] = [];
-      const collect = (chunk: string) => chunks.push(chunk);
+      const collector = createOutputCollector();
+      let timedOut = false;
+      let pipesClosed = false;
+      // Set at the deadline on POSIX, where the command's tree is stopped
+      // step by step; Windows ends it at once.
+      let stopTree: ((signal: StopSignal) => boolean) | undefined;
+      let stopSignal: StopSignal = 'SIGTERM';
+      const finishWith = (code: number) => settle(() => resolve({ code, timedOut, ...collector.read() }));
       // Decoding on the stream keeps a multi-byte character split across two
       // chunks intact.
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
-      child.stdout.on('data', collect);
-      child.stderr.on('data', collect);
-      child.on('error', (err: unknown) => reject(composeStartFailure(args, err)));
-      // A promise settles once, so a 'close' that follows a spawn 'error'
-      // changes nothing.
+      child.stdout.on('data', collector.append);
+      child.stderr.on('data', collector.append);
+
+      const drain = () => {
+        if (settled || drainTimer !== undefined) {
+          return;
+        }
+        drainTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          // A process that survived SIGKILL must not keep this run alive.
+          child.unref();
+          finishWith(child.exitCode ?? 1);
+        }, COMPOSE_DRAIN_TIMEOUT_MS);
+      };
+      // One step of stopping a timed-out command: signals what is left of its
+      // tree, and settles once the tree is gone and the pipes have closed.
+      const stopStep = () => {
+        if (settled || stopTree === undefined || !stopTree(stopSignal)) {
+          return;
+        }
+        // A tree gone within the grace needs no SIGKILL; its drain starts now.
+        clearTimeout(killTimer);
+        drain();
+        if (pipesClosed) {
+          finishWith(child.exitCode ?? 1);
+        }
+      };
+      deadlineTimer = setTimeout(() => {
+        timedOut = true;
+        if (process.platform === 'win32') {
+          stopWindowsProcessTree(child);
+          drain();
+          return;
+        }
+        stopTree = createProcessTreeStop(child);
+        killTimer = setTimeout(() => {
+          stopSignal = 'SIGKILL';
+          drain();
+          stopStep();
+        }, COMPOSE_KILL_GRACE_MS);
+        pollTimer = setInterval(stopStep, COMPOSE_STOP_POLL_INTERVAL_MS);
+        stopStep();
+      }, deadlineMs);
+
+      child.on('error', (err: unknown) => {
+        // Without a pid the command never started. A started one reports
+        // only a signal it could not be sent, and the steps above still end
+        // the wait.
+        if (child.pid === undefined) {
+          settle(() => reject(composeStartFailure(args, err)));
+        }
+      });
+      child.on('exit', () => {
+        // After a timeout the stop goes on until the whole tree is gone.
+        if (!timedOut) {
+          clearTimeout(deadlineTimer);
+          drain();
+        }
+      });
+      // The promise settles once, so a 'close' that follows a spawn 'error'
+      // or the end of the drain changes nothing. After a timeout on POSIX,
+      // closed pipes settle it only once the tree is gone as well.
       child.on('close', (code: number | null) => {
-        resolve({ code: code ?? 1, output: chunks.join('') });
+        pipesClosed = true;
+        if (stopTree === undefined) {
+          finishWith(code ?? 1);
+        } else {
+          stopStep();
+        }
       });
     } catch (err) {
       // spawn throws synchronously on an invalid argument or environment
       // entry, with a message that can quote it.
-      reject(composeStartFailure(args, err));
+      settle(() => reject(composeStartFailure(args, err)));
     }
   });
 }
@@ -754,11 +1385,12 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
  * @param url - The absolute URL to request. It is built from a canonical
  *   {@link StackTarget}, so it holds only a scheme, host, port and path.
  * @param expectBody - The exact trimmed body required, if any.
+ * @returns The body of the accepted `200` answer, as received.
  * @throws Error naming the stack, the URL and the last failure as a fixed
  *   category (an HTTP status, a redirect, a missing body, a timeout or a
  *   network error with its validated code) when every attempt fails.
  */
-async function probe(stack: string, url: string, expectBody?: string): Promise<void> {
+async function probe(stack: string, url: string, expectBody?: string): Promise<string> {
   let reason = '';
   for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt += 1) {
     if (attempt > 1) {
@@ -780,7 +1412,7 @@ async function probe(stack: string, url: string, expectBody?: string): Promise<v
       } else if (expectBody !== undefined && body.trim() !== expectBody) {
         reason = `HTTP 200 without the expected "${expectBody}" body`;
       } else {
-        return;
+        return body;
       }
     } catch (err) {
       reason = describeProbeFailure(err);
@@ -789,15 +1421,124 @@ async function probe(stack: string, url: string, expectBody?: string): Promise<v
   throw new Error(`${stack} is not reachable at ${url} (${reason}).`);
 }
 
+/** The only path `/config.json` may give the API base URL, as the SPA requires. */
+const CONFIG_API_PATH = '/api';
+
+/**
+ * Reads the API base URL a `/config.json` body names, in the canonical form
+ * the SPA's `parseRuntimeConfig` (`src/app/core/config/runtime-config.ts`)
+ * derives before it calls the API: the body must be a JSON object whose
+ * `apiBaseUrl` is a string that parses as an absolute URL with no user name,
+ * password, query or fragment (a bare `?` or `#` counts), and whose path,
+ * after one trailing `/` is trimmed, is exactly `/api`. The canonical form is
+ * the parsed origin followed by `/api`, so it compares equal to a canonical
+ * {@link StackTarget} `apiUrl` exactly when the SPA calls that API. The SPA's
+ * transport rule is not repeated here: an `apiBaseUrl` it would refuse on
+ * that ground alone still names one API, and its boot error fails the specs.
+ *
+ * @param body - The text of the `200` answer to `/config.json`.
+ * @returns `{ apiUrl }` with the canonical `<origin>/api`, or `{ problem }`
+ *   with a fixed-text reason the document names no usable API. A reason never
+ *   holds any of the served text.
+ */
+function configuredApiUrl(body: string): { apiUrl: string } | { problem: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    // The parser's message can quote the body, so it is not passed on.
+    return { problem: 'its body is not valid JSON' };
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { problem: 'its body is not a JSON object' };
+  }
+  const value = (parsed as Record<string, unknown>)['apiBaseUrl'];
+  if (value === undefined) {
+    return { problem: 'it has no apiBaseUrl' };
+  }
+  if (typeof value !== 'string') {
+    return { problem: 'its apiBaseUrl is not a string' };
+  }
+  let url: URL;
+  try {
+    // No base URL, so a relative value such as `/api` is rejected.
+    url = new URL(value);
+  } catch {
+    return { problem: 'its apiBaseUrl is not an absolute URL' };
+  }
+  if (url.username !== '' || url.password !== '') {
+    return { problem: 'its apiBaseUrl has a user name or password' };
+  }
+  // As in the SPA: `search` and `hash` are empty for a bare `?` or `#` too, so
+  // presence is read from the serialized URL, where the first `#` starts the
+  // fragment and a `?` before it starts the query.
+  const fragmentStart = url.href.indexOf('#');
+  const beforeFragment = fragmentStart === -1 ? url.href : url.href.slice(0, fragmentStart);
+  if (beforeFragment.includes('?')) {
+    return { problem: 'its apiBaseUrl has a query' };
+  }
+  if (fragmentStart !== -1) {
+    return { problem: 'its apiBaseUrl has a fragment' };
+  }
+  const path = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : url.pathname;
+  if (path !== CONFIG_API_PATH) {
+    return { problem: `its apiBaseUrl path is not ${CONFIG_API_PATH}` };
+  }
+  return { apiUrl: url.origin + CONFIG_API_PATH };
+}
+
+/**
+ * Requires the web app at `target.baseUrl` to call the API at
+ * `target.apiUrl`: its `/config.json`, fetched as {@link probe} fetches, must
+ * name that API once {@link configuredApiUrl} canonicalizes it. Without this
+ * check two separately healthy URLs could belong to different stacks, and the
+ * browser specs would run against one database while the direct API requests
+ * of the specs and the setup use another.
+ *
+ * @param stack - The stack's name at the start of the failure message.
+ * @param target - The canonical target whose pair is checked.
+ * @throws Error as {@link probe} throws it when `/config.json` does not
+ *   answer `200`. Error naming the stack, the `/config.json` URL, the expected
+ *   API and a fixed-text reason when the answer is not a valid configuration
+ *   or names another API. The served value is never shown, because it is
+ *   foreign text.
+ */
+async function requireConfiguredApi(stack: string, target: StackTarget): Promise<void> {
+  const configUrl = `${target.baseUrl}/config.json`;
+  const configured = configuredApiUrl(await probe(stack, configUrl));
+  let problem: string | undefined;
+  if ('problem' in configured) {
+    problem = configured.problem;
+  } else if (configured.apiUrl !== target.apiUrl) {
+    problem = 'its apiBaseUrl names another API';
+  }
+  if (problem !== undefined) {
+    throw new Error(
+      `${stack}'s web app does not call the target API: ${configUrl} must name the apiBaseUrl ${target.apiUrl}, but ${problem}. The served value is not shown.`,
+    );
+  }
+}
+
 /**
  * Confirms the pair the specs target: the API readiness probe answers
- * `Healthy` and the web root answers `200`. A failure names the reused stack
- * in reuse mode and the acceptance stack otherwise.
+ * `Healthy` and the web root answers `200`. In fresh mode it also requires
+ * the web app's `/config.json` to name the target API
+ * ({@link requireConfiguredApi}), so the browser and the specs' direct API
+ * requests reach one stack. Reuse mode stops at the two probes, because its
+ * results are never evidence. A failure names the reused stack in reuse mode
+ * and the acceptance stack otherwise.
+ *
+ * @param target - The resolved target; `target.reuse` selects the mode.
+ * @throws Error when a probe fails or, in fresh mode, `/config.json` does not
+ *   name `target.apiUrl`; the message says which.
  */
 async function probeTarget(target: StackTarget): Promise<void> {
   const stack = target.reuse ? 'The reused stack (E2E_REUSE_STACK=1)' : 'The acceptance stack';
   await probe(stack, `${target.apiUrl}/health`, 'Healthy');
   await probe(stack, `${target.baseUrl}/`);
+  if (!target.reuse) {
+    await requireConfiguredApi(stack, target);
+  }
 }
 
 /**
@@ -880,19 +1621,23 @@ function manualRemovalHint(root: string): string {
 
 /**
  * Removes the acceptance project after a failed `up`, so the next run starts
- * clean. Its own failure is only reported, so the `up` failure stays the one
- * the run fails with. Whether the removal exits non-zero, after its Compose
- * output, or `docker` cannot be started, the report ends with the same
- * {@link manualRemovalHint}.
+ * clean. The removal runs under {@link COMPOSE_DOWN_TIMEOUT_MS}. Its own
+ * failure is only reported, so the `up` failure stays the one the run fails
+ * with. Whether the removal exits non-zero or outlives its deadline, after
+ * its Compose output, or `docker` cannot be started, the report ends with the
+ * same {@link manualRemovalHint}.
  *
  * @param root - The repository root.
  */
 async function removeFailedStack(root: string): Promise<void> {
   try {
-    const result = await runCompose(root, DOWN_ARGS);
-    if (result.code !== 0) {
-      printComposeFailure(DOWN_ARGS.join(' '), result);
-      console.error(`Removing the failed ${ACCEPTANCE_PROJECT} stack also failed. ${manualRemovalHint(root)}`);
+    const result = await runCompose(root, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
+    if (result.timedOut || result.code !== 0) {
+      printComposeFailure(DOWN_ARGS.join(' '), result, COMPOSE_DOWN_TIMEOUT_MS);
+      const note = result.timedOut
+        ? ` (it did not finish within ${describeDuration(COMPOSE_DOWN_TIMEOUT_MS)} and was stopped)`
+        : '';
+      console.error(`Removing the failed ${ACCEPTANCE_PROJECT} stack also failed${note}. ${manualRemovalHint(root)}`);
     }
   } catch (err) {
     // runCompose rejects with fixed text; only its validated code is repeated.
@@ -1106,12 +1851,15 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * `smarthotel-acceptance` Compose project with its volumes, fails when another
  * process holds host port 18080 or 14200, then builds current images and
  * starts db, api and web from fresh volumes with generated secrets, waiting
- * until all three are healthy. Every Compose call names the project, the
- * repository's `docker-compose.yml` and the empty `deploy/acceptance.env`
- * explicitly and runs with the Compose and `SMARTHOTEL_*` variables
- * neutralized, so a developer's stack, `.env` and overrides are never touched
- * or read. It never switches to other ports. The stack is left running after
- * the run; remove it with `docker compose -p smarthotel-acceptance down -v`.
+ * until all three are healthy. It then requires the web app's `/config.json`
+ * to name `http://localhost:18080/api` as its API, so the browser specs and
+ * the direct API requests reach the same stack and database. Every Compose
+ * call names the project, the repository's `docker-compose.yml` and the empty
+ * `deploy/acceptance.env` explicitly and runs with the Compose and
+ * `SMARTHOTEL_*` variables neutralized, so a developer's stack, `.env` and
+ * overrides are never touched or read. It never switches to other ports. The
+ * stack is left running after the run; remove it with
+ * `docker compose -p smarthotel-acceptance down -v`.
  *
  * One fresh run at a time owns the acceptance project on a host. Before its
  * first Compose call a fresh run listens on `127.0.0.1` port
@@ -1124,21 +1872,32 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * naming that port. A setup failure releases the lock before its error
  * propagates.
  *
+ * Every Compose command runs under a deadline: 5 minutes for each `down`
+ * ({@link COMPOSE_DOWN_TIMEOUT_MS}) and 30 minutes for the `up`
+ * ({@link COMPOSE_UP_TIMEOUT_MS}), which covers a first build on a clean
+ * machine. A command that outlives it is stopped with its whole process
+ * tree, SIGTERM and then SIGKILL, and drained before setup fails
+ * ({@link runCompose}), so the lock is released only after that tree has
+ * stopped. A timed-out `up` is followed by the same `down -v` as a failed
+ * one.
+ *
  * Reuse mode (`E2E_REUSE_STACK=1`) is for local iteration. It takes no lock,
  * makes no Compose call and only probes the stack at `E2E_BASE_URL` and
  * `E2E_API_URL` (defaults `http://localhost:4200` and
  * `http://localhost:8080/api`), as {@link resolveStackTarget} validated and
- * canonicalized them, following no redirect. It then prints the canonical
- * pair.
+ * canonicalized them, following no redirect; it does not read `/config.json`.
+ * It then prints the canonical pair.
  *
  * @returns In fresh mode, the global teardown Playwright runs after the
  *   suite: it releases the lock and leaves the stack running. In reuse mode,
  *   nothing.
  * @throws Error when another fresh run owns the acceptance stack, another
  *   program holds the lock port or it cannot be listened on, Docker or
- *   Compose is unavailable or fails, an acceptance port is taken, or the
- *   target does not answer; the message says which. A failed Compose
- *   command's filtered output is printed before the throw.
+ *   Compose is unavailable, fails or outlives its deadline, an acceptance
+ *   port is taken, the target does not answer, or in fresh mode the web
+ *   app's `/config.json` does not name the acceptance API; the message says
+ *   which. A failed or timed-out Compose command's filtered output is printed
+ *   before the throw.
  */
 export default async function globalSetup(): Promise<(() => Promise<void>) | void> {
   const target = resolveStackTarget();
@@ -1167,21 +1926,29 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
 /**
  * The fresh path of {@link globalSetup}, run while this run holds the lock:
  * removes the acceptance project, checks the acceptance ports, starts the
- * stack and probes `target`.
+ * stack, probes `target` and requires the web app's `/config.json` to name
+ * `target.apiUrl`.
  *
  * @param root - The repository root.
  * @param target - The fresh target, the stack this run builds.
- * @throws Error when Compose fails, an acceptance port is taken or the target
- *   does not answer.
+ * @throws Error when a Compose command fails or outlives its deadline, an
+ *   acceptance port is taken, the target does not answer or the web app's
+ *   `/config.json` does not name the acceptance API.
  */
 async function buildAcceptanceStack(root: string, target: StackTarget): Promise<void> {
   console.log(
     `Building the ${ACCEPTANCE_PROJECT} stack (web :${ACCEPTANCE_WEB_PORT}, API :${ACCEPTANCE_API_PORT})…`,
   );
 
-  const down = await runCompose(root, DOWN_ARGS);
+  const down = await runCompose(root, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
+  if (down.timedOut) {
+    printComposeFailure(DOWN_ARGS.join(' '), down, COMPOSE_DOWN_TIMEOUT_MS);
+    throw new Error(
+      `docker compose down did not finish within ${describeDuration(COMPOSE_DOWN_TIMEOUT_MS)} for project ${ACCEPTANCE_PROJECT} and was stopped; is the Docker daemon responding?`,
+    );
+  }
   if (down.code !== 0) {
-    printComposeFailure(DOWN_ARGS.join(' '), down);
+    printComposeFailure(DOWN_ARGS.join(' '), down, COMPOSE_DOWN_TIMEOUT_MS);
     throw new Error(
       `docker compose down failed for project ${ACCEPTANCE_PROJECT}; is the Docker daemon running?`,
     );
@@ -1205,12 +1972,14 @@ async function buildAcceptanceStack(root: string, target: StackTarget): Promise<
   }
 
   console.log('Building images and starting db, api and web; a first build can take several minutes.');
-  const up = await runCompose(root, UP_ARGS);
-  if (up.code !== 0) {
-    printComposeFailure(UP_ARGS.join(' '), up);
+  const up = await runCompose(root, UP_ARGS, COMPOSE_UP_TIMEOUT_MS);
+  if (up.timedOut || up.code !== 0) {
+    printComposeFailure(UP_ARGS.join(' '), up, COMPOSE_UP_TIMEOUT_MS);
     await removeFailedStack(root);
     throw new Error(
-      `docker compose up --wait failed for project ${ACCEPTANCE_PROJECT}; see the Compose output above.`,
+      up.timedOut
+        ? `docker compose up --wait did not finish within ${describeDuration(COMPOSE_UP_TIMEOUT_MS)} for project ${ACCEPTANCE_PROJECT} and was stopped; see the Compose output above.`
+        : `docker compose up --wait failed for project ${ACCEPTANCE_PROJECT}; see the Compose output above.`,
     );
   }
 

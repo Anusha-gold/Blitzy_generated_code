@@ -171,7 +171,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// </description></item>
     /// <item><description>
     /// 403 when the booking belongs to another guest. Ownership is checked before the booking's state, so another
-    /// guest learns nothing about it.
+    /// guest's request never discloses whether the booking is confirmed, cancelled or already started. The 403 itself,
+    /// unlike the 404 for an unknown id, does reveal that a booking with this id exists.
     /// </description></item>
     /// <item><description>
     /// 409 when the booking is already cancelled, or when its check-in date is before today (UTC). A stay that starts

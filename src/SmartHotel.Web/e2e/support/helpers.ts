@@ -21,14 +21,20 @@
  * a value runs inside the page and is asserted as a boolean under a fixed
  * message ({@link expectControlValue}, {@link expectSignedInAs}).
  *
+ * No test credential is written in source: each test guest registers and logs
+ * in with its own random password from {@link uniquePassword}, so an account
+ * a test leaves on a reused stack cannot be signed into with a known value.
+ *
  * Playwright transpiles this file as CommonJS (the workspace `package.json`
  * declares no `"type": "module"`). The workspace declares no `@types/node`, so
- * `process` is an unchecked global and the type annotations are stripped,
- * never checked.
+ * `process` is an unchecked global, the `node:crypto` import is unchecked and
+ * the type annotations are stripped, never checked.
  *
  * Importing this module has no side effects: it performs no I/O, logs nothing
  * and never writes to `process.env`.
  */
+import { randomBytes } from 'node:crypto';
+
 import { expect, type Page } from '@playwright/test';
 
 import { resolveStackTarget } from './stack-target';
@@ -154,6 +160,49 @@ export function apiUrl(): string {
 }
 
 /**
+ * Tells whether a request the browser sends is one endpoint of the API the
+ * run targets, for the specs' response waiters and routes.
+ *
+ * The request must go to the origin of {@link apiUrl} (scheme, host and port,
+ * compared in the URL parser's canonical form), and its path must be the
+ * API's path, `/api`, followed by `endpoint`. A path-only match would also
+ * accept that endpoint of another stack's API, so a web app configured for a
+ * different API could pass the browser checks while the specs' direct API
+ * requests use the target. The query is not compared, and the caller checks
+ * the method, so a CORS preflight `OPTIONS` can be told apart.
+ *
+ * @param url - The request URL, as `request.url()` returns it or as
+ *   `page.route` passes it. A value that is not an absolute URL never matches.
+ * @param endpoint - The endpoint's path below the API base, starting with `/`,
+ *   for example `/hotels` or `/auth/login`.
+ * @param scope - `exact`, the default, matches that path only; `withSubPaths`
+ *   also matches every path below it, so `/bookings` covers `/bookings/{id}`.
+ * @returns `true` when the request targets that endpoint of the target API.
+ * @throws Error when `endpoint` does not start with `/`.
+ */
+export function isApiEndpoint(
+  url: string | URL,
+  endpoint: string,
+  scope: 'exact' | 'withSubPaths' = 'exact',
+): boolean {
+  if (!endpoint.startsWith('/')) {
+    throw new Error('isApiEndpoint expects an endpoint path that starts with /.');
+  }
+  let requested: URL;
+  try {
+    requested = new URL(url);
+  } catch {
+    return false;
+  }
+  const api = new URL(apiUrl());
+  const path = `${api.pathname}${endpoint}`;
+  return (
+    requested.origin === api.origin &&
+    (requested.pathname === path || (scope === 'withSubPaths' && requested.pathname.startsWith(`${path}/`)))
+  );
+}
+
+/**
  * Returns the UTC calendar dates the given numbers of days from today, all
  * from one reading of the clock.
  *
@@ -228,11 +277,23 @@ export function uniqueEmail(): string {
 }
 
 /**
- * The password every test guest registers and logs in with. It lies within the
- * registration bound of 8 to 128 characters and is used only against the
- * throwaway test stack, whose guests are created by the tests themselves.
+ * Returns a new random password for one test guest.
+ *
+ * Each call draws 18 bytes from Node's cryptographically secure generator
+ * (`node:crypto` `randomBytes`), so every guest gets its own unguessable
+ * password and none is known from source. The bytes are written as base64url
+ * after the fixed prefix `e2e-`, giving 28 characters of `A–Z`, `a–z`, `0–9`,
+ * `-` and `_`: within registration's bound of 8 to 128 characters, with no
+ * whitespace, so the API stores it exactly as sent.
+ *
+ * The caller keeps the value for the guest's later logins and never prints
+ * it; {@link fillBound} keeps it out of Playwright's diagnostics.
+ *
+ * @returns A fresh password such as `e2e-` followed by 24 base64url characters.
  */
-export const TEST_PASSWORD = 'SmartHotel-e2e-2026';
+export function uniquePassword(): string {
+  return `e2e-${randomBytes(18).toString('base64url')}`;
+}
 
 /**
  * Registers a new guest through the register page's form.
@@ -245,7 +306,7 @@ export const TEST_PASSWORD = 'SmartHotel-e2e-2026';
  * @param page - The page showing the register page.
  * @param guest - The account to create.
  * @param guest.email - The email address, for example from {@link uniqueEmail}.
- * @param guest.password - The password, for example {@link TEST_PASSWORD}.
+ * @param guest.password - The password, for example from {@link uniquePassword}.
  * @param guest.fullName - The guest's full name.
  * @returns A promise that settles once the login page's URL is shown.
  */
@@ -286,16 +347,19 @@ export async function logIn(page: Page, email: string, password: string): Promis
  * outcome.
  *
  * Expects the browser to be on the search page (`/search`). It fills the
- * criteria, clicks "Search", waits for the `GET /api/hotels` response, and then
- * waits until the page shows a result, the empty-result message or an inline
- * error. It asserts nothing about which of the three appeared, so the specs
- * can use it for results, empty results, a 400 and a delayed response alike.
+ * criteria, clicks "Search", waits for the target API's `GET /api/hotels`
+ * response, and then waits until the page shows a result, the empty-result
+ * message or an inline error. It asserts nothing about which of the three
+ * appeared, so the specs can use it for results, empty results, a 400 and a
+ * delayed response alike.
  *
  * The response waiter is registered before the click, so a fast response
- * cannot be missed. It matches the `GET` only, never the CORS preflight
- * `OPTIONS` a signed-in, cross-origin request can cause. The search page
- * reruns an identical search too, so repeating the same criteria still sends
- * a request and the wait cannot hang.
+ * cannot be missed. It matches the `GET` to the target API's `/hotels` only
+ * ({@link isApiEndpoint}): never the CORS preflight `OPTIONS` a signed-in,
+ * cross-origin request can cause, and never a search the web app sends to
+ * another API, which leaves the wait to time out. The search page reruns an
+ * identical search too, so repeating the same criteria still sends a request
+ * and the wait cannot hang.
  *
  * @param page - The page showing the search page.
  * @param criteria - The search criteria to enter.
@@ -315,9 +379,7 @@ export async function searchHotels(
   await fillBound(page, 'search-check-out', criteria.checkOut);
   await fillBound(page, 'search-guests', String(criteria.guests));
   await Promise.all([
-    page.waitForResponse(
-      (r) => new URL(r.url()).pathname === '/api/hotels' && r.request().method() === 'GET',
-    ),
+    page.waitForResponse((r) => isApiEndpoint(r.url(), '/hotels') && r.request().method() === 'GET'),
     page.getByTestId('search-submit').click(),
   ]);
   await expect(

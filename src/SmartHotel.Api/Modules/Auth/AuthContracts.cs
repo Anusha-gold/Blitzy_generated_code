@@ -10,19 +10,20 @@ namespace SmartHotel.Api.Modules.Auth;
 // implicit [Required] of its own; the explicit attributes below are the only required checks. Validation
 // attributes sit on the positional parameters because MVC throws when they target a record's properties.
 //
-// MVC runs IValidatableObject.Validate only after every attribute check on the object has passed, so a bound that
-// must be reported together with another member's missing value is an attribute: the password length bound is one.
-// Validate holds only the email and full-name bounds, which apply to the trimmed values.
+// Every bound is a parameter attribute. MVC runs a model-level IValidatableObject.Validate only after every attribute
+// check on the object has passed, so a bound kept there would be reported only once the other members were valid. As
+// attributes, all the checks run together, and one 400 reports every invalid member.
 //
 // [ModelBinder(Name)] sets each parameter's key in the 400 errors object. For positional record parameters MVC
 // keys attribute errors by the CLR parameter name (Email) and ignores SystemTextJsonValidationMetadataProvider,
 // while the error contract keys them by the camelCase JSON name (email). The name does not affect body binding.
 
 /// <summary>
-/// Body of <c>POST /api/auth/register</c>. The attributes run first: each member's required check and the password
-/// length bound, which applies to the value as sent. Once every attribute check has passed, <see cref="Validate"/>
-/// applies the email and full-name bounds to the trimmed values. The password and full-name lengths count Unicode
-/// scalar values, not UTF-16 code units. Error messages are fixed sentences that never echo the input.
+/// Body of <c>POST /api/auth/register</c>. Each member carries its required check and one bounds check, and every
+/// check runs on every request, so a 400 reports each invalid member, with at most one error per member. The email
+/// and full-name bounds apply to the trimmed values, the password bounds to the value as sent. The password and
+/// full-name lengths count Unicode scalar values, not UTF-16 code units. Error messages are fixed sentences that
+/// never echo the input.
 /// </summary>
 /// <param name="Email">
 /// Required. After trimming: printable ASCII only (U+0021 to U+007E), at most 254 characters (the RFC 5321 path
@@ -33,8 +34,10 @@ namespace SmartHotel.Api.Modules.Auth;
 /// only; the domain is never resolved or contacted.
 /// </param>
 /// <param name="Password">
-/// Required, 8 to 128 characters, and not trimmed. A whitespace-only value is rejected as missing. Both bounds count
-/// Unicode scalar values, so a character outside the Basic Multilingual Plane counts once.
+/// Required, 8 to 128 characters, free of the null character (U+0000), and not trimmed. A whitespace-only value is
+/// rejected as missing. Both length bounds count Unicode scalar values, so a character outside the Basic Multilingual
+/// Plane counts once. The null character is refused because the hash's HMAC pads a short key with zero bytes, so a
+/// password followed by null characters would match the password's own hash.
 /// </param>
 /// <param name="FullName">
 /// Required. After trimming: not blank, at most 200 characters, and free of the null character (U+0000), which
@@ -44,15 +47,16 @@ namespace SmartHotel.Api.Modules.Auth;
 public sealed partial record RegisterRequest(
     [ModelBinder(Name = RegisterRequest.EmailMember)]
     [Required(ErrorMessage = "A value is required.")]
+    [RegisterRequest.EmailBounds]
     string? Email,
     [ModelBinder(Name = RegisterRequest.PasswordMember)]
     [Required(ErrorMessage = "A value is required.")]
-    [RegisterRequest.PasswordLength(ErrorMessage = "The value must be 8 to 128 characters long.")]
+    [RegisterRequest.PasswordBounds]
     string? Password,
     [ModelBinder(Name = RegisterRequest.FullNameMember)]
     [Required(ErrorMessage = "A value is required.")]
+    [RegisterRequest.FullNameBounds]
     string? FullName)
-    : IValidatableObject
 {
     private const int MaxEmailLength = 254;
     private const int MaxLocalPartLength = 64;
@@ -63,8 +67,7 @@ public sealed partial record RegisterRequest(
     // The IPv6-address-literal tag, compared without regard to case.
     private const string IPv6Tag = "IPv6:";
 
-    // The camelCase JSON names. They key both the attribute errors (through ModelBinder) and the Validate
-    // errors, whose member names MVC uses verbatim.
+    // The camelCase JSON names, which key the attribute errors through ModelBinder.
     private const string EmailMember = "email";
     private const string PasswordMember = "password";
     private const string FullNameMember = "fullName";
@@ -73,39 +76,10 @@ public sealed partial record RegisterRequest(
     // that field beside the message.
     private const string EmailMessage =
         "The value must be a valid email address of at most 254 characters, using only ASCII characters.";
+    private const string PasswordLengthMessage = "The value must be 8 to 128 characters long.";
+    private const string PasswordNulMessage = "The value contains a character that is not allowed.";
     private const string FullNameMessage = "The value must not be blank and must be at most 200 characters.";
     private const string FullNameNulMessage = "The value contains a character that is not allowed.";
-
-    /// <summary>
-    /// Applies the email and full-name bounds to the trimmed values, yielding at most one error per field.
-    /// A <see langword="null"/> member is skipped, because its <see cref="RequiredAttribute"/> reports it.
-    /// </summary>
-    /// <param name="validationContext">The context supplied by the validator; the checks do not use it.</param>
-    /// <returns>The failed checks, keyed <c>email</c> and <c>fullName</c>.</returns>
-    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
-    {
-        if (Email is not null && !IsAcceptableEmail(Email.Trim()))
-        {
-            yield return new ValidationResult(EmailMessage, [EmailMember]);
-        }
-
-        if (FullName is not null)
-        {
-            string trimmed = FullName.Trim();
-
-            // Length counts UTF-16 code units, so it would count a character outside the Basic Multilingual Plane
-            // twice; the column's varchar(200) limit counts characters, which are Unicode scalar values.
-            if (trimmed.Length == 0 || !IsWithinFullNameLength(trimmed))
-            {
-                yield return new ValidationResult(FullNameMessage, [FullNameMember]);
-            }
-            else if (trimmed.Contains('\0'))
-            {
-                // JSON can carry U+0000, but PostgreSQL text cannot store it, so the insert would fail.
-                yield return new ValidationResult(FullNameNulMessage, [FullNameMember]);
-            }
-        }
-    }
 
     // Whether value holds at most MaxFullNameLength Unicode scalar values. Each scalar value takes one or two UTF-16
     // code units, so only a value of MaxFullNameLength + 1 to 2 * MaxFullNameLength code units needs counting, and
@@ -135,30 +109,77 @@ public sealed partial record RegisterRequest(
     }
 
     // Internal rather than private: the compiler rejects a private nested attribute's constructor on the record's own
-    // positional parameters (CS0122).
+    // positional parameters (CS0122), and a base class is at least as accessible as the attributes derived from it.
     /// <summary>
-    /// Validates that a password holds <see cref="MinPasswordLength"/> to <see cref="MaxPasswordLength"/> Unicode
-    /// scalar values. <see langword="null"/> and a whitespace-only value are valid, because
-    /// <see cref="RequiredAttribute"/> reports them.
+    /// Checks one member's bounds, in the same validation pass as every other member's attributes.
+    /// <see langword="null"/> and a whitespace-only value are valid, because <see cref="RequiredAttribute"/> reports
+    /// them. Any other value fails with the fixed message of the first bound it breaks, so the member gets at most one
+    /// error.
+    /// </summary>
+    internal abstract class MemberBoundsAttribute : ValidationAttribute
+    {
+        /// <inheritdoc/>
+        protected override ValidationResult? IsValid(object? value, ValidationContext validationContext)
+        {
+            string? message = value switch
+            {
+                null => null,
+                string text => string.IsNullOrWhiteSpace(text) ? null : FindViolation(text),
+                _ => throw new InvalidOperationException(
+                    $"{GetType().Name} validates only strings, not {value.GetType().Name}."),
+            };
+
+            // No member name: MVC files a result without one under the member's own key, the ModelBinder name.
+            return message is null ? ValidationResult.Success : new ValidationResult(message);
+        }
+
+        /// <summary>Checks a value against the member's bounds, in order.</summary>
+        /// <param name="value">The value as sent; neither <see langword="null"/> nor whitespace only.</param>
+        /// <returns>
+        /// The fixed message of the first bound <paramref name="value"/> breaks, or <see langword="null"/> when it
+        /// meets them all.
+        /// </returns>
+        protected abstract string? FindViolation(string value);
+    }
+
+    /// <summary>
+    /// The email bounds, applied to the trimmed value: printable ASCII only, at most <see cref="MaxEmailLength"/>
+    /// characters, and an RFC 5321 mailbox.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Parameter)]
+    internal sealed class EmailBoundsAttribute : MemberBoundsAttribute
+    {
+        /// <inheritdoc/>
+        protected override string? FindViolation(string value)
+        {
+            return IsAcceptableEmail(value.Trim()) ? null : EmailMessage;
+        }
+    }
+
+    /// <summary>
+    /// The password bounds, applied to the value as sent: <see cref="MinPasswordLength"/> to
+    /// <see cref="MaxPasswordLength"/> Unicode scalar values, then no null character (U+0000).
     /// </summary>
     /// <remarks>
     /// <see cref="StringLengthAttribute"/> counts UTF-16 code units, so it counts a character outside the Basic
     /// Multilingual Plane twice. The value is never trimmed: the bounds apply to the exact value that
-    /// <c>AuthService</c> hashes. As an attribute rather than a <see cref="Validate"/> check, its error is reported
-    /// together with the other members' required checks.
+    /// <c>AuthService</c> hashes. That hash is PBKDF2 over HMAC-SHA512, which pads a key shorter than its 128-byte
+    /// block with zero bytes, so a password and the same password followed by null characters, while both fit the
+    /// block, derive the same hash. No stored password contains the character, and login refuses every password that
+    /// does.
     /// </remarks>
     [AttributeUsage(AttributeTargets.Parameter)]
-    internal sealed class PasswordLengthAttribute : ValidationAttribute
+    internal sealed class PasswordBoundsAttribute : MemberBoundsAttribute
     {
-        public override bool IsValid(object? value)
+        /// <inheritdoc/>
+        protected override string? FindViolation(string value)
         {
-            return value switch
+            if (!IsWithinPasswordLength(value))
             {
-                null => true,
-                string password => string.IsNullOrWhiteSpace(password) || IsWithinPasswordLength(password),
-                _ => throw new InvalidOperationException(
-                    $"{nameof(PasswordLengthAttribute)} validates only strings, not {value.GetType().Name}."),
-            };
+                return PasswordLengthMessage;
+            }
+
+            return value.Contains('\0') ? PasswordNulMessage : null;
         }
 
         // Whether value holds MinPasswordLength to MaxPasswordLength Unicode scalar values. Each scalar value takes one
@@ -188,6 +209,30 @@ public sealed partial record RegisterRequest(
             }
 
             return scalarValues >= MinPasswordLength;
+        }
+    }
+
+    /// <summary>
+    /// The full-name bounds, applied to the trimmed value: at most <see cref="MaxFullNameLength"/> Unicode scalar
+    /// values, then no null character (U+0000). The value is not blank, so neither is its trimmed form.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Parameter)]
+    internal sealed class FullNameBoundsAttribute : MemberBoundsAttribute
+    {
+        /// <inheritdoc/>
+        protected override string? FindViolation(string value)
+        {
+            string trimmed = value.Trim();
+
+            // Length counts UTF-16 code units, so it would count a character outside the Basic Multilingual Plane
+            // twice; the column's varchar(200) limit counts characters, which are Unicode scalar values.
+            if (!IsWithinFullNameLength(trimmed))
+            {
+                return FullNameMessage;
+            }
+
+            // JSON can carry U+0000, but PostgreSQL text cannot store it, so the insert would fail.
+            return trimmed.Contains('\0') ? FullNameNulMessage : null;
         }
     }
 

@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 
@@ -72,8 +73,16 @@ public static class ProblemResults
     }
 
     /// <summary>
-    /// Creates a 401 Unauthorized problem.
+    /// Creates a 401 Unauthorized problem that carries the bare challenge <c>WWW-Authenticate: Bearer</c>.
     /// </summary>
+    /// <remarks>
+    /// RFC 9110, section 15.5.2, requires every 401 response to carry at least one challenge. The API authenticates
+    /// only with JwtBearer, so the challenge is the one JwtBearer itself sends for a missing or rejected token: the
+    /// <c>Bearer</c> scheme with no parameters, such as <c>realm</c>, <c>error</c> or <c>error_description</c>. The
+    /// header is set as the result executes, just before the body is written, the way <see cref="CreatedResult"/>
+    /// sets <c>Location</c>, and it replaces any challenge already on the response, so the response carries exactly
+    /// one. The body is the same problem the other helpers build.
+    /// </remarks>
     /// <param name="controller">The controller answering the request.</param>
     /// <param name="title">A fixed, short summary of the problem.</param>
     /// <param name="detail">A fixed sentence explaining the problem to the caller.</param>
@@ -84,7 +93,8 @@ public static class ProblemResults
     /// </exception>
     public static ObjectResult UnauthorizedProblem(this ControllerBase controller, string title, string detail)
     {
-        return Create(controller, StatusCodes.Status401Unauthorized, title, detail);
+        return new BearerChallengeProblemResult(
+            Create(controller, StatusCodes.Status401Unauthorized, title, detail));
     }
 
     /// <summary>
@@ -148,5 +158,28 @@ public static class ProblemResults
 
         // No type or instance is passed: ClientErrorMapping and the shared defaults supply type.
         return controller.Problem(detail: detail, statusCode: statusCode, title: title);
+    }
+
+    // A problem result that adds the bearer challenge when it executes, so the header travels with the result instead
+    // of being written to the response when the helper runs.
+    private sealed class BearerChallengeProblemResult : ObjectResult
+    {
+        // Takes over everything the problem result carries, so the body and its negotiation stay exactly as built.
+        public BearerChallengeProblemResult(ObjectResult problem)
+            : base(problem.Value)
+        {
+            StatusCode = problem.StatusCode;
+            DeclaredType = problem.DeclaredType;
+            ContentTypes = problem.ContentTypes;
+            Formatters = problem.Formatters;
+        }
+
+        public override void OnFormatting(ActionContext context)
+        {
+            base.OnFormatting(context);
+
+            // JwtBearer's default challenge is its scheme name. Assigned, not appended, so it is the only challenge.
+            context.HttpContext.Response.Headers.WWWAuthenticate = JwtBearerDefaults.AuthenticationScheme;
+        }
     }
 }

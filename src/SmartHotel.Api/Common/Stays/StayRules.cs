@@ -5,8 +5,9 @@ using SmartHotel.Data.Entities;
 namespace SmartHotel.Api.Common.Stays;
 
 /// <summary>
-/// The rules every stay obeys: the longest stay that can be searched or booked, and the overlap rule that decides
-/// whether an existing booking blocks a requested stay.
+/// The rules every stay obeys: the longest stay that can be searched or booked, the overlap rule that decides
+/// whether an existing booking blocks a requested stay, and the check-in rule that decides whether a booked stay's
+/// check-in date has passed, after which the booking can no longer be cancelled.
 /// </summary>
 /// <remarks>
 /// A stay is the half-open date range [checkIn, checkOut): the guest occupies the room on every night from the
@@ -96,5 +97,31 @@ public static class StayRules
         // The comparison restates Overlaps rather than calling it: EF Core cannot translate a call to an
         // application method into SQL, so the predicate must remain a plain expression tree.
         return b => b.Status == BookingStatus.Confirmed && b.CheckIn < checkOut && checkIn < b.CheckOut;
+    }
+
+    /// <summary>
+    /// Determines whether a booked stay's check-in date has passed, after which the booking can no longer be cancelled.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// "Today" is the current UTC calendar date, whatever the hotel's city. A check-in date has passed only when it is
+    /// earlier than today, so a stay that starts today can be cancelled until the end of that day (UTC), and from the
+    /// first instant of the next UTC day it cannot. <see cref="StayPeriod.TryCreate"/> applies the same boundary to a
+    /// new stay, whose check-in may be today but not earlier.
+    /// </para>
+    /// <para>
+    /// The caller reads the clock and passes the date in, so the rule itself reads no clock and gives the same answer
+    /// for the same two dates.
+    /// </para>
+    /// </remarks>
+    /// <param name="checkIn">The booked stay's check-in day, its first occupied night.</param>
+    /// <param name="today">The current UTC calendar date.</param>
+    /// <returns>
+    /// <see langword="true"/> when <paramref name="checkIn"/> is earlier than <paramref name="today"/>; otherwise
+    /// <see langword="false"/>, including when the stay starts today.
+    /// </returns>
+    public static bool HasCheckInPassed(DateOnly checkIn, DateOnly today)
+    {
+        return checkIn < today;
     }
 }

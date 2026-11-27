@@ -3,9 +3,13 @@ using System.Data.Common;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -33,8 +37,27 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     private const string ValidPassword = "Passw0rd!x";
     private const string ValidFullName = "Test Guest";
 
+    // The fixed field messages of the registration contract, one per broken bound. None names its field: the
+    // errors key does.
+    private const string EmailMessage =
+        "The value must be a valid email address of at most 254 characters, using only ASCII characters.";
+    private const string PasswordLengthMessage = "The value must be 8 to 128 characters long.";
+    private const string PasswordNulMessage = "The value contains a character that is not allowed.";
+    private const string FullNameRequiredMessage = "A value is required.";
+    private const string FullNameLengthMessage = "The value must not be blank and must be at most 200 characters.";
+    private const string FullNameNulMessage = "The value contains a character that is not allowed.";
+
+    // RFC 5321's limits, which registration applies: an address of at most 254 characters, a local part of at most 64,
+    // and domain labels of at most 63 (RFC 1035).
+    private const int MaxEmailLength = 254;
+    private const int MaxLocalPartLength = 64;
+    private const int MaxDomainLabelLength = 63;
+
+    // The registration limit on the trimmed full name, in characters (Unicode scalar values).
+    private const int MaxFullNameLength = 200;
+
     // U+1F600, a character outside the Basic Multilingual Plane: one Unicode scalar value but two UTF-16 code units,
-    // so a password built from it meets the registration bounds only when they count characters.
+    // so a password or full name built from it meets the registration bounds only when they count characters.
     private const string SupplementaryCharacter = "\U0001F600";
 
     // ASP.NET Core Identity's V3 hash layout: a 0x01 marker, then three big-endian uint32 values (PRF, iteration
@@ -48,10 +71,18 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     [Theory]
     [InlineData("email-not-an-address", "email")]
     [InlineData("email-non-ascii", "email")]
+    [InlineData("email-too-long", "email")]
+    [InlineData("email-local-part-too-long", "email")]
     [InlineData("password-too-short", "password")]
     [InlineData("password-supplementary-too-short", "password")]
     [InlineData("password-supplementary-too-long", "password")]
+    [InlineData("password-nul-inside", "password")]
+    [InlineData("password-nul-appended", "password")]
     [InlineData("fullname-missing", "fullName")]
+    [InlineData("fullname-blank", "fullName")]
+    [InlineData("fullname-too-long", "fullName")]
+    [InlineData("fullname-supplementary-too-long", "fullName")]
+    [InlineData("fullname-nul", "fullName")]
     [InlineData("empty-json-body", "$")]
     [InlineData("malformed-json", null)]
     public async Task Register_InvalidInput_Returns400(string caseLabel, string? expectedErrorKey)
@@ -64,7 +95,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.BadRequest, expectedErrorKey, ct);
     }
 
-    // The password bound is an attribute check like Required, so it is reported in the same 400 as a missing
+    // Every field check is an attribute, like Required, so the password bound is reported in the same 400 as a missing
     // fullName, and the register page can show both field errors at once.
     [Fact]
     public async Task Register_ShortPasswordAndMissingFullName_Returns400WithBothKeys()
@@ -87,6 +118,67 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             problem.GetProperty("errors").TryGetProperty("fullName", out JsonElement fullNameMessages)
                 && fullNameMessages.GetArrayLength() > 0,
             "Expected errors to contain fullName, with at least one message, as well as password.");
+    }
+
+    // One submission that breaks several fields reports every one of them, each with exactly the one fixed message of
+    // the bound it breaks, so the guest can correct them all in one round trip.
+    [Theory]
+    [InlineData("email-and-short-password")]
+    [InlineData("email-and-blank-fullname")]
+    [InlineData("email-and-long-fullname")]
+    [InlineData("every-field")]
+    public async Task Register_SeveralInvalidFields_Returns400WithEveryKey(string caseLabel)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        ApiTestClient client = factory.CreateApiClient();
+        (object body, (string Key, string Message)[] expected) = caseLabel switch
+        {
+            "email-and-short-password" => (
+                (object)new { email = "not-an-email", password = "short77", fullName = ValidFullName },
+                new[] { ("email", EmailMessage), ("password", PasswordLengthMessage) }),
+            "email-and-blank-fullname" => (
+                new { email = "not-an-email", password = ValidPassword, fullName = " \t " },
+                new[] { ("email", EmailMessage), ("fullName", FullNameRequiredMessage) }),
+            "email-and-long-fullname" => (
+                new
+                {
+                    email = "not-an-email",
+                    password = ValidPassword,
+                    fullName = new string('n', MaxFullNameLength + 1),
+                },
+                new[] { ("email", EmailMessage), ("fullName", FullNameLengthMessage) }),
+            "every-field" => (
+                new { email = "not-an-email", password = $"{ValidPassword}\u0000", fullName = "Test\u0000Guest" },
+                new[] { ("email", EmailMessage), ("password", PasswordNulMessage), ("fullName", FullNameNulMessage) }),
+            _ => throw new ArgumentOutOfRangeException(nameof(caseLabel), caseLabel, "Unknown registration case."),
+        };
+
+        using HttpResponseMessage response = await client.RegisterAsync(body, ct);
+
+        JsonElement problem = await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.BadRequest,
+            expected[0].Key,
+            ct);
+
+        // ProblemAssert has checked that errors is an object of message-string arrays with no repeated key. The keys
+        // and messages are compared in memory, and a failure names only the test's own fixed key.
+        JsonElement errors = problem.GetProperty("errors");
+        string[] keys = [.. errors.EnumerateObject().Select(static entry => entry.Name).Order(StringComparer.Ordinal)];
+        string[] expectedKeys = [.. expected.Select(static entry => entry.Key).Order(StringComparer.Ordinal)];
+        Assert.True(
+            keys.SequenceEqual(expectedKeys, StringComparer.Ordinal),
+            $"Expected errors to hold exactly the {expectedKeys.Length} broken fields' keys but it holds {keys.Length} "
+                + "key(s) that differ from them.");
+
+        foreach ((string key, string message) in expected)
+        {
+            JsonElement messages = errors.GetProperty(key);
+            Assert.True(
+                messages.GetArrayLength() == 1
+                    && string.Equals(message, messages[0].GetString(), StringComparison.Ordinal),
+                $"Expected errors.{key} to hold exactly the one fixed message of the bound the case breaks.");
+        }
     }
 
     [Fact]
@@ -126,89 +218,141 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
 
         TimeSpan observationLimit = TimeSpan.FromSeconds(30);
         TimeSpan drainLimit = TimeSpan.FromSeconds(30);
+
+        // Bounds each cleanup step that is otherwise immediate: the release, the stop of the requests cancelled at the
+        // drain limit, the host's finishing of the requests whose calls have ended, and the holder's disposal.
+        TimeSpan cleanupStepLimit = TimeSpan.FromSeconds(10);
         string authServiceCategory = typeof(AuthService).FullName!;
 
         CancellationToken ct = TestContext.Current.CancellationToken;
         SmartHotelApiFactory.LogCapture capture = new();
-        await using SmartHotelApiFactory variant = factory.CreateLogCaptureVariant(
+        ServerRequestTracker serverRequests = new();
+        SmartHotelApiFactory variant = factory.CreateLogCaptureVariant(
             capture,
             SmartHotelApiFactory.LogCapture.DataLayerRules,
-            additionalOverrides: null);
+            additionalOverrides: services => services.AddSingleton<IStartupFilter>(serverRequests));
 
-        // A hand-built factory is not a fixture, so it is started here.
-        await variant.InitializeAsync();
-        ApiTestClient client = variant.CreateApiClient();
-        string email = UniqueEmail("race");
-
-        await using NpgsqlConnection holder = new(variant.DatabaseConnectionString);
-        await holder.OpenAsync(ct);
-        await using NpgsqlTransaction holderTx = await holder.BeginTransactionAsync(ct);
-        await using (NpgsqlCommand lockGuests = new(lockGuestsSql, holder, holderTx))
-        {
-            await lockGuests.ExecuteNonQueryAsync(ct);
-        }
-
-        int mark = capture.Count;
-
-        // ToArray starts every request at once, each with the same address.
-        Task<HttpResponseMessage>[] requests = Enumerable.Range(0, raceSize)
-            .Select(_ => client.RegisterAsync(new { email, password = ValidPassword, fullName = ValidFullName }, ct))
-            .ToArray();
-
-        long waiting = -1;
-        HttpResponseMessage[] responses;
+        // Every failure is kept in the order it occurs, the test's own and the cleanup's alike, and all of them are
+        // reported together at the end, so a failing cleanup step never hides an earlier failure.
+        List<Exception> failures = [];
+        List<Task<HttpResponseMessage>> requests = new(raceSize);
+        List<HttpResponseMessage> responses = new(raceSize);
         try
         {
-            waiting = await WaitForInsertWaitersAsync(
-                variant.DatabaseConnectionString,
-                holder.ProcessID,
-                raceSize,
-                observationLimit,
-                ct);
-        }
-        finally
-        {
-            // Runs on every path. The holder changed nothing, so the rollback only releases the lock, even while the
-            // test is being cancelled, and every request is drained before the variant host is disposed.
-            await holderTx.RollbackAsync(CancellationToken.None);
-            responses = await Task.WhenAll(requests).WaitAsync(drainLimit, ct);
-        }
+            // A hand-built factory is not a fixture, so it is started here.
+            await variant.InitializeAsync();
+            ApiTestClient client = variant.CreateApiClient();
+            string email = UniqueEmail("race");
+            int mark;
 
-        try
-        {
-            if (waiting != raceSize)
+            // Disposed by the finally below rather than by await using, whose disposal can block after a failed
+            // release, so that the wait for it is bounded like every other cleanup step.
+            NpgsqlConnection holder = new(variant.DatabaseConnectionString);
+            NpgsqlTransaction? holderTx = null;
+            try
             {
-                Assert.Fail(string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"{raceSize} registrations queued at their insert were not observed within "
-                    + $"{observationLimit.TotalSeconds} s (last count: {waiting})."));
+                await holder.OpenAsync(ct);
+                holderTx = await holder.BeginTransactionAsync(ct);
+                await using (NpgsqlCommand lockGuests = new(lockGuestsSql, holder, holderTx))
+                {
+                    await lockGuests.ExecuteNonQueryAsync(ct);
+                }
+
+                mark = capture.Count;
+
+                // The requests' own token: the test's cancellation reaches them, and so does the drain's cancellation
+                // of the requests still running at its limit, which must not cancel the test's other work.
+                using CancellationTokenSource requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                try
+                {
+                    // Started without awaiting, so every request is in flight at once, each with the same address, and
+                    // inside the try, so the ones already started are drained even when starting another fails.
+                    for (int started = 0; started < raceSize; started++)
+                    {
+                        requests.Add(client.RegisterAsync(
+                            new { email, password = ValidPassword, fullName = ValidFullName },
+                            requestCancellation.Token));
+                    }
+
+                    (bool observed, long lastCount) = await WaitForInsertWaitersAsync(
+                        variant,
+                        holder.ProcessID,
+                        raceSize,
+                        observationLimit,
+                        ct);
+                    if (!observed)
+                    {
+                        failures.Add(FailException.ForFailure(string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"{raceSize} registrations queued at their insert were not observed within "
+                            + $"{observationLimit.TotalSeconds} s (last count: {lastCount}).")));
+                    }
+                }
+                catch (Exception exception)
+                {
+                    // Kept, and reported only once the lock is released and the requests are drained.
+                    failures.Add(exception);
+                }
+                finally
+                {
+                    // Runs on success, on the observation timeout and on any failure, the test's cancellation included.
+                    // No step throws, so each one runs whatever the one before it did. While the test runs, each step
+                    // is bounded by its limit and by the test's token. Once that token is cancelled, before a step or
+                    // during it, the step goes on bounded by its limit alone, so a cancelled test still releases the
+                    // lock, drains the requests and waits for the host to finish them; a step the cancellation
+                    // interrupts records it with the other failures, so the test still reports the cancellation.
+                    await ReleaseLockAsync(holder, holderTx, cleanupStepLimit, failures, ct);
+                    await DrainRequestsAsync(
+                        requests,
+                        requestCancellation,
+                        drainLimit,
+                        cleanupStepLimit,
+                        responses,
+                        failures,
+                        ct);
+                    await WaitForServerRequestsAsync(serverRequests, cleanupStepLimit, failures, ct);
+                }
+            }
+            finally
+            {
+                // After the host's wait, so a disposal that blocks holds up neither the drain nor that wait. Bounded
+                // like the steps above.
+                await DisposeHolderAsync(holder, holderTx, cleanupStepLimit, failures, ct);
             }
 
-            Assert.Single(responses, static response => response.StatusCode == HttpStatusCode.Created);
-            Assert.Equal(
-                raceSize - 1,
-                responses.Count(static response => response.StatusCode == HttpStatusCode.Conflict));
-            foreach (HttpResponseMessage conflict in responses.Where(
-                static response => response.StatusCode == HttpStatusCode.Conflict))
+            // The outcome is asserted only after a complete, observed race.
+            if (failures.Count == 0)
             {
-                await ProblemAssert.AssertProblemAsync(conflict, HttpStatusCode.Conflict, cancellationToken: ct);
+                Assert.Single(responses, static response => response.StatusCode == HttpStatusCode.Created);
+                Assert.Equal(
+                    raceSize - 1,
+                    responses.Count(static response => response.StatusCode == HttpStatusCode.Conflict));
+                foreach (HttpResponseMessage conflict in responses.Where(
+                    static response => response.StatusCode == HttpStatusCode.Conflict))
+                {
+                    await ProblemAssert.AssertProblemAsync(conflict, HttpStatusCode.Conflict, cancellationToken: ct);
+                }
+
+                int stored = await variant.ExecuteDbAsync(
+                    (db, token) => db.Guests.AsNoTracking().CountAsync(guest => guest.Email == email, token),
+                    ct);
+                Assert.Equal(1, stored);
+
+                // The winner's record shows that the provider receives the application's records; the losers add
+                // none at Error. The host has finished every request, so each request's records are all in.
+                IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Since(mark);
+                Assert.Single(
+                    records,
+                    record => record.Category == authServiceCategory && record.EventId == guestRegisteredEventId);
+                SmartHotelApiFactory.LogCapture.AssertNone(
+                    records,
+                    static record => record.Level >= LogLevel.Error,
+                    "Error or Critical record");
             }
-
-            int stored = await variant.ExecuteDbAsync(
-                (db, token) => db.Guests.AsNoTracking().CountAsync(guest => guest.Email == email, token),
-                ct);
-            Assert.Equal(1, stored);
-
-            // The winner's record shows that the provider receives the application's records; the losers add none
-            // at Error.
-            IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Since(mark);
-            Assert.Single(
-                records,
-                record => record.Category == authServiceCategory && record.EventId == guestRegisteredEventId);
-            SmartHotelApiFactory.LogCapture.AssertNone(
-                records,
-                static record => record.Level >= LogLevel.Error,
-                "Error or Critical record");
+        }
+        catch (Exception exception)
+        {
+            failures.Add(exception);
         }
         finally
         {
@@ -216,13 +360,41 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             {
                 response.Dispose();
             }
+
+            // DisposeAsync stops the host and drops its database whatever the test's token says, so it runs only once
+            // no request is running in the host: every call has ended, after which no request can reach the host, and
+            // the host has finished each request it received. Otherwise the disposal is handed over to run once that
+            // holds, and the test reports why.
+            Task requestsEnded = Task.WhenAll(requests.Select(EndedAsync));
+            if (requestsEnded.IsCompleted && serverRequests.WhenIdleAsync().IsCompleted)
+            {
+                try
+                {
+                    await variant.DisposeAsync();
+                }
+                catch (Exception exception)
+                {
+                    failures.Add(exception);
+                }
+            }
+            else
+            {
+                failures.Add(FailException.ForFailure(
+                    "Registration requests were still running when the test ended, so the API host and its database "
+                    + "are disposed only once every one of them has ended."));
+                _ = DisposeWhenIdleAsync(variant, requestsEnded, serverRequests, TestContext.Current);
+            }
         }
 
+        ThrowFailures(failures);
+
         // Polls until expected sessions of the database, other than the holder and the observer itself, wait on a
-        // lock while inserting a guest, or the limit passes, and returns the last count. No transaction is opened:
-        // each poll is its own autocommit statement and so reads a fresh pg_stat_activity snapshot.
-        static async Task<long> WaitForInsertWaitersAsync(
-            string connectionString,
+        // lock while inserting a guest. One deadline bounds opening the observer, every poll and every pause, and a
+        // count read after it is not accepted. Returns whether the waiters were seen in time, with the last count
+        // read in time (-1 for none). No transaction is opened: each poll is its own autocommit statement and so
+        // reads a fresh pg_stat_activity snapshot.
+        static async Task<(bool Observed, long LastCount)> WaitForInsertWaitersAsync(
+            SmartHotelApiFactory host,
             int holderPid,
             int expected,
             TimeSpan limit,
@@ -234,26 +406,430 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
                 + "AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO \"Guests\"%'";
             TimeSpan pollInterval = TimeSpan.FromMilliseconds(50);
 
-            await using NpgsqlConnection observer = new(connectionString);
-            await observer.OpenAsync(cancellationToken);
-            await using NpgsqlCommand countWaiters = new(countInsertWaitersSql, observer);
-            countWaiters.Parameters.AddWithValue("holderPid", holderPid);
-
             Stopwatch elapsed = Stopwatch.StartNew();
-            long count;
-            do
+            using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(limit);
+            long lastCount = -1;
+            try
             {
-                count = (long)(await countWaiters.ExecuteScalarAsync(cancellationToken))!;
-                if (count == expected)
+                await using NpgsqlConnection observer = await host.OpenDatabaseConnectionAsync(deadline.Token);
+                await using NpgsqlCommand countWaiters = new(countInsertWaitersSql, observer);
+                countWaiters.Parameters.AddWithValue("holderPid", holderPid);
+
+                while (true)
                 {
-                    break;
+                    long count = (long)(await countWaiters.ExecuteScalarAsync(deadline.Token))!;
+                    if (elapsed.Elapsed >= limit)
+                    {
+                        // Read after the deadline, so it cannot show the waiters in time.
+                        return (false, lastCount);
+                    }
+
+                    lastCount = count;
+                    if (count == expected)
+                    {
+                        return (true, count);
+                    }
+
+                    await Task.Delay(pollInterval, deadline.Token);
+                }
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested
+                && !cancellationToken.IsCancellationRequested)
+            {
+                // The deadline passed while opening the observer, polling or pausing. The test's own cancellation is
+                // not caught.
+                return (false, lastCount);
+            }
+        }
+
+        // Rolls back the holder's transaction, which changed nothing, so the lock is released. The rollback's token is
+        // limited to limit and, while the test runs, linked to the test's; when the test has been cancelled before the
+        // rollback starts, the limit alone bounds it. When the rollback fails, passes its limit or is interrupted by
+        // the test's cancellation, closing the holder's connection still ends the transaction. CloseAsync takes no
+        // token, so the wait for it is bounded instead, as EndsWithinAsync bounds a wait; a close still running then
+        // is recorded as such and left to finish on its own. Failures, an interruption included, are recorded for the
+        // caller, never thrown.
+        static async Task ReleaseLockAsync(
+            NpgsqlConnection holder,
+            NpgsqlTransaction holderTx,
+            TimeSpan limit,
+            List<Exception> failures,
+            CancellationToken cancellationToken)
+        {
+            // Once the test is cancelled, the rollback departs from the convention of passing the test's token to every
+            // call that takes one, because that token would stop it before the lock is released.
+            using CancellationTokenSource deadline = cancellationToken.IsCancellationRequested
+                ? new CancellationTokenSource()
+                : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(limit);
+            try
+            {
+                await holderTx.RollbackAsync(deadline.Token);
+                return;
+            }
+            catch (Exception rollbackFailure)
+            {
+                failures.Add(rollbackFailure);
+            }
+
+            await AwaitWithinAsync(
+                CloseConnectionAsync(holder),
+                limit,
+                "The holder's connection had not closed",
+                "after its rollback failed",
+                failures,
+                cancellationToken);
+        }
+
+        // Closes the connection; a failure, even one thrown before the close starts, faults the returned task.
+        static async Task CloseConnectionAsync(NpgsqlConnection connection)
+        {
+            await connection.CloseAsync();
+        }
+
+        // Disposes the holder's transaction, if one was begun, then its connection. Either disposal can block after a
+        // failed release, so the wait for them is bounded as EndsWithinAsync bounds a wait; one still running then is
+        // recorded as such and left to finish on its own. Failures are recorded for the caller, never thrown.
+        static async Task DisposeHolderAsync(
+            NpgsqlConnection holder,
+            NpgsqlTransaction? holderTx,
+            TimeSpan limit,
+            List<Exception> failures,
+            CancellationToken cancellationToken)
+        {
+            await AwaitWithinAsync(
+                DisposeConnectionAsync(holder, holderTx),
+                limit,
+                "The holder's connection had not been disposed",
+                "after its disposal began",
+                failures,
+                cancellationToken);
+        }
+
+        // Disposes the transaction, if any, and then the connection, even when the transaction's disposal fails.
+        static async Task DisposeConnectionAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction)
+        {
+            try
+            {
+                if (transaction is not null)
+                {
+                    await transaction.DisposeAsync();
+                }
+            }
+            finally
+            {
+                await connection.DisposeAsync();
+            }
+        }
+
+        // Waits for an operation that takes no token, as EndsWithinAsync bounds the wait, and records its failure, or a
+        // fixed message naming what had not finished within the limit. One that has not finished is left to run;
+        // EndedAsync observes its failure when it ends. Never throws.
+        static async Task AwaitWithinAsync(
+            Task operation,
+            TimeSpan limit,
+            string unfinished,
+            string since,
+            List<Exception> failures,
+            CancellationToken cancellationToken)
+        {
+            if (!await EndsWithinAsync(EndedAsync(operation), limit, failures, cancellationToken))
+            {
+                failures.Add(FailException.ForFailure(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{unfinished} {limit.TotalSeconds} s {since}.")));
+                return;
+            }
+
+            try
+            {
+                // Already completed, so this does not wait.
+                await operation;
+            }
+            catch (Exception failure)
+            {
+                failures.Add(failure);
+            }
+        }
+
+        // Waits up to drainLimit for every request to end, as EndsWithinAsync bounds the wait: the test's cancellation
+        // reaches the requests through their own token, and a cancelled test still waits for them to stop. The
+        // requests still running at the limit are cancelled and waited for once more, up to stopLimit. Each request
+        // is then harvested on its own: every response is collected for the caller to dispose, whatever happened to
+        // the others, and each failed or cancelled request is recorded. One still running is recorded as not stopped
+        // and disposes its response if it ends later. Failures are recorded for the caller, never thrown.
+        static async Task DrainRequestsAsync(
+            List<Task<HttpResponseMessage>> requests,
+            CancellationTokenSource requestCancellation,
+            TimeSpan drainLimit,
+            TimeSpan stopLimit,
+            List<HttpResponseMessage> responses,
+            List<Exception> failures,
+            CancellationToken cancellationToken)
+        {
+            // Completes once every request has ended, however each one ended, and never faults.
+            Task allEnded = Task.WhenAll(requests.Select(EndedAsync));
+            if (!await EndsWithinAsync(allEnded, drainLimit, failures, cancellationToken))
+            {
+                try
+                {
+                    requestCancellation.Cancel();
+                }
+                catch (AggregateException cancellationFailure)
+                {
+                    // Thrown once every cancellation callback has run, so every request has been told to stop.
+                    failures.Add(cancellationFailure);
                 }
 
-                await Task.Delay(pollInterval, cancellationToken);
+                await EndsWithinAsync(allEnded, stopLimit, failures, cancellationToken);
             }
-            while (elapsed.Elapsed < limit);
 
-            return count;
+            List<Exception> requestFailures = [];
+            int stillRunning = 0;
+            foreach (Task<HttpResponseMessage> request in requests)
+            {
+                if (!request.IsCompleted)
+                {
+                    stillRunning++;
+                    _ = DisposeWhenEndedAsync(request);
+                    continue;
+                }
+
+                try
+                {
+                    // Already completed, so this does not wait.
+                    responses.Add(await request);
+                }
+                catch (Exception exception)
+                {
+                    requestFailures.Add(exception);
+                }
+            }
+
+            if (requestFailures.Count > 0)
+            {
+                failures.Add(new AggregateException(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"{requestFailures.Count} of {requests.Count} registration requests failed or were cancelled."),
+                    requestFailures));
+            }
+
+            if (stillRunning > 0)
+            {
+                failures.Add(FailException.ForFailure(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{stillRunning} of {requests.Count} registration requests had not ended "
+                    + $"{drainLimit.TotalSeconds} s after the release, nor {stopLimit.TotalSeconds} s after being "
+                    + $"cancelled; each disposes its response if it ends later.")));
+            }
+        }
+
+        // Completes when the request ends, however it ends, and never throws.
+        static async Task EndedAsync(Task request)
+        {
+            await request.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+
+        // Whether the task, which never faults, completes within the limit. While the test runs, the wait also ends at
+        // the test's cancellation, which is then recorded; from the cancellation on, the wait goes on bounded by the
+        // limit alone, so the cleanup step it belongs to still finishes while the test is being cancelled.
+        static async Task<bool> EndsWithinAsync(
+            Task task,
+            TimeSpan limit,
+            List<Exception> failures,
+            CancellationToken cancellationToken)
+        {
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await task.WaitAsync(limit, cancellationToken);
+                    return true;
+                }
+                catch (TimeoutException)
+                {
+                    return false;
+                }
+                catch (OperationCanceledException interrupted) when (cancellationToken.IsCancellationRequested)
+                {
+                    failures.Add(interrupted);
+                }
+            }
+
+            // Departs from the convention of passing the test's token to every call that takes one: the test is
+            // cancelled by now, and that token would end the wait before the cleanup step finishes.
+            try
+            {
+                await task.WaitAsync(limit, CancellationToken.None);
+                return true;
+            }
+            catch (TimeoutException)
+            {
+                return false;
+            }
+        }
+
+        // Takes over a request still running when the drain ended, and disposes its response if one arrives.
+        static async Task DisposeWhenEndedAsync(Task<HttpResponseMessage> request)
+        {
+            await EndedAsync(request);
+            if (request.IsCompletedSuccessfully)
+            {
+                (await request).Dispose();
+            }
+        }
+
+        // Waits up to limit for the host to finish every request it received, as EndsWithinAsync bounds the wait. A
+        // call ends once its response has started, before the host has run the rest of the pipeline and released the
+        // request's services, so ended calls alone do not show that no request is still running in the host. Failures
+        // are recorded for the caller, never thrown.
+        static async Task WaitForServerRequestsAsync(
+            ServerRequestTracker serverRequests,
+            TimeSpan limit,
+            List<Exception> failures,
+            CancellationToken cancellationToken)
+        {
+            if (!await EndsWithinAsync(serverRequests.WhenIdleAsync(), limit, failures, cancellationToken))
+            {
+                failures.Add(FailException.ForFailure(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{serverRequests.Active} requests were still running in the API host "
+                    + $"{limit.TotalSeconds} s after the drain.")));
+            }
+        }
+
+        // Takes over disposing the variant when the test ends with requests still running. It waits for every call to
+        // end, after which no request can reach the host, then for the host to finish each request it received, and
+        // only then stops the host and drops its database, so neither goes away under a running request. A host whose
+        // requests never end is therefore deliberately left undisposed, its database in place, rather than dropping
+        // the database under them. The test has reported its outcome by then, so a failure here is caught and sent as
+        // a diagnostic message naming only its type.
+        static async Task DisposeWhenIdleAsync(
+            SmartHotelApiFactory host,
+            Task requestsEnded,
+            ServerRequestTracker serverRequests,
+            ITestContext testContext)
+        {
+            try
+            {
+                await requestsEnded;
+                await serverRequests.WhenIdleAsync();
+                await host.DisposeAsync();
+            }
+            catch (Exception exception)
+            {
+                testContext.SendDiagnosticMessage(
+                    "Disposing the registration race's API host after its requests ended failed with {0}.",
+                    exception.GetType().FullName);
+            }
+        }
+
+        // Rethrows a single failure as it was first thrown, or reports several together in the order they occurred.
+        static void ThrowFailures(List<Exception> failures)
+        {
+            if (failures.Count == 1)
+            {
+                ExceptionDispatchInfo.Throw(failures[0]);
+            }
+
+            if (failures.Count > 1)
+            {
+                throw new AggregateException(failures);
+            }
+        }
+    }
+
+    // Counts the requests the API host is running, and signals when it runs none. Registered as a startup filter, its
+    // middleware runs ahead of everything Program adds, so a request is counted before its response can start. The
+    // test server ends a call only once the response has started or the pipeline has thrown, a cancelled call
+    // included, so every request the host received whose call has ended has been counted. A request is counted out
+    // once the server has completed its response and run its completion callbacks, the disposal of the request's
+    // services among them, or once the pipeline throws, when the test server runs no completion callback.
+    private sealed class ServerRequestTracker : IStartupFilter
+    {
+        private readonly object _gate = new();
+        private int _active;
+
+        // Pending while the host runs a request, and completed when the last running one is counted out; null while
+        // none runs.
+        private TaskCompletionSource? _idle;
+
+        public int Active
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _active;
+                }
+            }
+        }
+
+        // Completes once the host runs no request, at once when it runs none now, and never faults. A request the
+        // host receives later is not waited for, so once every call has ended, after which no request can reach the
+        // host, it completes only when the host has finished every request.
+        public Task WhenIdleAsync()
+        {
+            lock (_gate)
+            {
+                return _idle?.Task ?? Task.CompletedTask;
+            }
+        }
+
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next)
+        {
+            return app =>
+            {
+                app.Use(TrackAsync);
+                next(app);
+            };
+        }
+
+        private async Task TrackAsync(HttpContext context, RequestDelegate next)
+        {
+            lock (_gate)
+            {
+                _active++;
+
+                // Its waiters resume on the thread pool, never inside this lock or the request that ends last.
+                _idle ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+
+            int ended = 0;
+            try
+            {
+                // Registered before anything the pipeline adds, so it runs last: completion callbacks run in the
+                // reverse order of their registration.
+                context.Response.OnCompleted(() =>
+                {
+                    End(ref ended);
+                    return Task.CompletedTask;
+                });
+                await next(context);
+            }
+            catch (Exception)
+            {
+                End(ref ended);
+                throw;
+            }
+        }
+
+        // Counts a request out once, however many of its ends run, and signals the waiters when it was the last one.
+        private void End(ref int ended)
+        {
+            if (Interlocked.Exchange(ref ended, 1) == 0)
+            {
+                lock (_gate)
+                {
+                    if (--_active == 0)
+                    {
+                        _idle?.TrySetResult();
+                        _idle = null;
+                    }
+                }
+            }
         }
     }
 
@@ -265,11 +841,21 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         string rawEmail = $"  Mixed.Case+{Guid.NewGuid():N}@Example.TEST  ";
         string expectedEmail = rawEmail.Trim().ToLowerInvariant();
 
+        // Surrounding white space, so the stored value shows that the full name is trimmed.
         using HttpResponseMessage response = await client.RegisterAsync(
-            new { email = rawEmail, password = ValidPassword, fullName = ValidFullName },
+            new { email = rawEmail, password = ValidPassword, fullName = $" \t{ValidFullName}  " },
             ct);
 
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        // Compared in memory with a fixed message, so the response's own media type never reaches the test output.
+        string? mediaType = response.Content.Headers.ContentType?.MediaType;
+        Assert.True(
+            string.Equals(JsonMediaType, mediaType, StringComparison.Ordinal),
+            mediaType is null
+                ? $"Expected the registration response's media type to be {JsonMediaType} but it has no valid "
+                    + "Content-Type."
+                : $"Expected the registration response's media type to be {JsonMediaType} but it has a different one.");
 
         // A boolean with a fixed message rather than Assert.Null, which would print a regressed Location URI, and a
         // URI that identifies a guest could carry the email.
@@ -290,7 +876,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             "Expected the stored email to be the submitted email trimmed and in lower case.");
         Assert.True(
             string.Equals(ValidFullName, guest.FullName, StringComparison.Ordinal),
-            "Expected the stored full name to equal the submitted full name.");
+            "Expected the stored full name to be the submitted full name trimmed.");
         Assert.Equal(DateTimeKind.Utc, guest.CreatedAt.Kind);
 
         Assert.False(string.IsNullOrEmpty(guest.PasswordHash), "Expected a stored password hash.");
@@ -315,7 +901,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         CancellationToken ct = TestContext.Current.CancellationToken;
         ApiTestClient client = factory.CreateApiClient();
         string email = UniqueEmail("supplementary");
-        string password = SupplementaryPassword(characterCount);
+        string password = SupplementaryText(characterCount);
 
         using HttpResponseMessage registered = await client.RegisterAsync(
             new { email, password, fullName = ValidFullName },
@@ -328,19 +914,84 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         Assert.Equal(HttpStatusCode.OK, loggedIn.StatusCode);
     }
 
+    // Each case puts one input exactly at its bound and keeps the others valid. The full-name limit counts characters
+    // of the trimmed value, so 200 supplementary characters (400 UTF-16 code units) and 200 characters inside
+    // surrounding white space are within it.
+    [Theory]
+    [InlineData("fullname-at-limit")]
+    [InlineData("fullname-supplementary-at-limit")]
+    [InlineData("fullname-padded-at-limit")]
+    [InlineData("email-at-limit")]
+    [InlineData("email-local-part-at-limit")]
+    public async Task Register_InputAtBound_Returns201AndStoresTrimmedValues(string caseLabel)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        ApiTestClient client = factory.CreateApiClient();
+        (string email, string fullName) = caseLabel switch
+        {
+            "fullname-at-limit" => (UniqueEmail("name"), new string('n', MaxFullNameLength)),
+            "fullname-supplementary-at-limit" => (UniqueEmail("name"), SupplementaryText(MaxFullNameLength)),
+            "fullname-padded-at-limit" => (UniqueEmail("name"), $" \t {new string('n', MaxFullNameLength)}\n "),
+            "email-at-limit" => (EmailOfLength(MaxEmailLength), ValidFullName),
+            "email-local-part-at-limit" => ($"{UniqueLocalPart(MaxLocalPartLength)}@example.test", ValidFullName),
+            _ => throw new ArgumentOutOfRangeException(nameof(caseLabel), caseLabel, "Unknown registration case."),
+        };
+
+        using HttpResponseMessage response = await client.RegisterAsync(
+            new { email, password = ValidPassword, fullName },
+            ct);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        int guestId = await ReadGuestIdAsync(response, ct);
+
+        Guest guest = await factory.ExecuteDbAsync(
+            (db, token) => db.Guests.AsNoTracking().SingleAsync(g => g.Id == guestId, token),
+            ct);
+
+        // Fixed messages, so a failure never prints the email or the full name.
+        Assert.True(
+            string.Equals(email.Trim().ToLowerInvariant(), guest.Email, StringComparison.Ordinal),
+            "Expected the stored email to be the submitted email trimmed and in lower case.");
+        Assert.True(
+            string.Equals(fullName.Trim(), guest.FullName, StringComparison.Ordinal),
+            "Expected the stored full name to be the submitted full name trimmed.");
+    }
+
     private static string UniqueEmail(string prefix)
     {
         // Every test in the class shares one database and runs in any order, so each address must be new.
         return $"{prefix}+{Guid.NewGuid():N}@example.test";
     }
 
-    private static string SupplementaryPassword(int characterCount)
+    private static string SupplementaryText(int characterCount)
     {
         return string.Concat(Enumerable.Repeat(SupplementaryCharacter, characterCount));
     }
 
-    // Each case breaks exactly one input and keeps the others valid: MVC runs RegisterRequest.Validate, which reports
-    // the email errors, only after every attribute check has passed, so a second broken field would hide the key.
+    // A valid local part of exactly length characters (32 or more) that ends in a fresh GUID, so the address it starts
+    // is new to the class's shared database.
+    private static string UniqueLocalPart(int length)
+    {
+        string unique = Guid.NewGuid().ToString("N");
+        ArgumentOutOfRangeException.ThrowIfLessThan(length, unique.Length);
+
+        return new string('l', length - unique.Length) + unique;
+    }
+
+    // A new address of exactly length characters that breaks no bound but, past 254, its length: a local part of the
+    // most characters RFC 5321 allows, then a domain of two labels of the most characters a label may hold, a label of
+    // the remaining length and "test". length is 199 to 261, so that the remaining label holds 1 to 63 characters.
+    private static string EmailOfLength(int length)
+    {
+        string fullLabels = $"{new string('a', MaxDomainLabelLength)}.{new string('b', MaxDomainLabelLength)}.";
+        const string topLevelLabel = ".test";
+        int lastLabelLength = length - MaxLocalPartLength - "@".Length - fullLabels.Length - topLevelLabel.Length;
+        ArgumentOutOfRangeException.ThrowIfLessThan(lastLabelLength, 1, nameof(length));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(lastLabelLength, MaxDomainLabelLength, nameof(length));
+
+        return $"{UniqueLocalPart(MaxLocalPartLength)}@{fullLabels}{new string('c', lastLabelLength)}{topLevelLabel}";
+    }
+
+    // Each case breaks exactly one input and keeps the others valid, so its 400 can fail only for the stated reason.
     private static Task<HttpResponseMessage> SendInvalidRegistrationAsync(
         ApiTestClient client,
         string caseLabel,
@@ -359,18 +1010,61 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
                     fullName = ValidFullName,
                 },
                 cancellationToken),
+            // 255 characters in all, with a 64-character local part and domain labels within their limits.
+            "email-too-long" => client.RegisterAsync(
+                new { email = EmailOfLength(MaxEmailLength + 1), password = ValidPassword, fullName = ValidFullName },
+                cancellationToken),
+            "email-local-part-too-long" => client.RegisterAsync(
+                new
+                {
+                    email = $"{UniqueLocalPart(MaxLocalPartLength + 1)}@example.test",
+                    password = ValidPassword,
+                    fullName = ValidFullName,
+                },
+                cancellationToken),
             "password-too-short" => client.RegisterAsync(
                 new { email = UniqueEmail("short"), password = "Passw0r", fullName = ValidFullName },
                 cancellationToken),
             // 4 characters in 8 UTF-16 code units, and 129 characters in 258.
             "password-supplementary-too-short" => client.RegisterAsync(
-                new { email = UniqueEmail("short"), password = SupplementaryPassword(4), fullName = ValidFullName },
+                new { email = UniqueEmail("short"), password = SupplementaryText(4), fullName = ValidFullName },
                 cancellationToken),
             "password-supplementary-too-long" => client.RegisterAsync(
-                new { email = UniqueEmail("long"), password = SupplementaryPassword(129), fullName = ValidFullName },
+                new { email = UniqueEmail("long"), password = SupplementaryText(129), fullName = ValidFullName },
+                cancellationToken),
+            // Within the length bounds. A password followed by U+0000 would otherwise hash like the password itself.
+            "password-nul-inside" => client.RegisterAsync(
+                new { email = UniqueEmail("nul"), password = "Passw0rd\u0000!x", fullName = ValidFullName },
+                cancellationToken),
+            "password-nul-appended" => client.RegisterAsync(
+                new { email = UniqueEmail("nul"), password = $"{ValidPassword}\u0000", fullName = ValidFullName },
                 cancellationToken),
             "fullname-missing" => client.RegisterAsync(
                 new { email = UniqueEmail("noname"), password = ValidPassword },
+                cancellationToken),
+            "fullname-blank" => client.RegisterAsync(
+                new { email = UniqueEmail("blank"), password = ValidPassword, fullName = " \t\n " },
+                cancellationToken),
+            // 201 characters once the surrounding white space is trimmed.
+            "fullname-too-long" => client.RegisterAsync(
+                new
+                {
+                    email = UniqueEmail("longname"),
+                    password = ValidPassword,
+                    fullName = $"  {new string('n', MaxFullNameLength + 1)}  ",
+                },
+                cancellationToken),
+            // 201 characters in 402 UTF-16 code units.
+            "fullname-supplementary-too-long" => client.RegisterAsync(
+                new
+                {
+                    email = UniqueEmail("longname"),
+                    password = ValidPassword,
+                    fullName = SupplementaryText(MaxFullNameLength + 1),
+                },
+                cancellationToken),
+            "fullname-nul" => client.RegisterAsync(
+                new { email = UniqueEmail("nul"), password = ValidPassword, fullName = "Test\u0000Guest" },
                 cancellationToken),
             "empty-json-body" => PostRawJsonAsync(client, string.Empty, cancellationToken),
             "malformed-json" => PostRawJsonAsync(client, "{\"email\":", cancellationToken),

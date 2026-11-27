@@ -88,7 +88,7 @@ public sealed class AuthController(AuthService authService) : ControllerBase
     /// 401 for every bound request whose credentials do not match: a wrong password, an unknown email, or a
     /// missing, <see langword="null"/> or blank field. The title and detail are one fixed pair and there is no
     /// <c>errors</c> member, so the responses differ only in <c>traceId</c> and never reveal whether an account
-    /// exists.
+    /// exists. Each carries the bare challenge <c>WWW-Authenticate: Bearer</c>, as JwtBearer's own 401s do.
     /// </description></item>
     /// </list>
     /// </remarks>

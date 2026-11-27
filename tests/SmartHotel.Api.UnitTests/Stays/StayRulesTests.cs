@@ -51,6 +51,23 @@ public sealed class StayRulesTests
     /// </summary>
     public static TheoryData<DateOnly, DateOnly, bool> CrossMonthOverlapCases => new(CrossMonthBookings);
 
+    /// <summary>
+    /// Check-in dates as (check-in, today), each with whether that check-in date has passed. Only a check-in earlier
+    /// than today has passed, so a stay that starts today can still be cancelled.
+    /// </summary>
+    public static TheoryData<DateOnly, DateOnly, bool> CheckInPassedCases => new()
+    {
+        { new(2026, 12, 10), new(2026, 12, 10), false }, // check-in today: cancellable until the end of the day
+        { new(2026, 12, 11), new(2026, 12, 10), false }, // check-in tomorrow
+        { new(2026, 12, 9), new(2026, 12, 10), true },   // check-in yesterday
+        { new(2027, 1, 10), new(2026, 12, 10), false },  // a later year, with a lower month and the same day
+        { new(2026, 11, 30), new(2026, 12, 1), true },   // yesterday across a month boundary
+        { new(2026, 12, 1), new(2026, 11, 30), false },  // tomorrow across a month boundary
+        { new(2026, 12, 31), new(2027, 1, 1), true },    // yesterday across a year boundary
+        { new(2027, 1, 1), new(2026, 12, 31), false },   // tomorrow across a year boundary
+        { new(2027, 1, 1), new(2027, 1, 1), false },     // check-in today, on the first day of a year
+    };
+
     [Theory, MemberData(nameof(OverlapCases))]
     public void Overlaps_RequestedRange_MatchesHalfOpenRule(
         int requestedCheckInDay,
@@ -138,6 +155,15 @@ public sealed class StayRulesTests
         // status is the only reason the cancelled booking does not block the stay.
         Assert.Equal(expected, predicate(CreateBooking(BookingStatus.Confirmed)));
         Assert.False(predicate(CreateBooking(BookingStatus.Cancelled)));
+    }
+
+    [Theory, MemberData(nameof(CheckInPassedCases))]
+    public void HasCheckInPassed_CheckInAgainstToday_PassesOnlyBeforeToday(
+        DateOnly checkIn,
+        DateOnly today,
+        bool expected)
+    {
+        Assert.Equal(expected, StayRules.HasCheckInPassed(checkIn, today));
     }
 
     [Fact]

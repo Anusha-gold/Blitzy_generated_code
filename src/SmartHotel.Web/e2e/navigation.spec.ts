@@ -13,7 +13,16 @@
 // only then loads the list.
 import { test, expect, type Page, type Request } from '@playwright/test';
 
-import { apiUrl, expectSignedInAs, logIn, registerGuest, searchHotels, TEST_PASSWORD, uniqueEmail, utcDates } from './support/helpers';
+import {
+  apiUrl,
+  expectSignedInAs,
+  logIn,
+  registerGuest,
+  searchHotels,
+  uniqueEmail,
+  uniquePassword,
+  utcDates,
+} from './support/helpers';
 
 /**
  * Starts recording, in order, the requests the page sends to the API the run
@@ -58,6 +67,7 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
   test.setTimeout(90_000);
 
   const email = uniqueEmail();
+  const password = uniquePassword();
   const [checkIn, checkOut] = utcDates(20, 22);
   const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
 
@@ -112,13 +122,13 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
   });
 
   await test.step('register, log in, then nav "Search" opens /search', async () => {
-    await registerGuest(page, { email, password: TEST_PASSWORD, fullName: 'Navigation Guest' });
+    await registerGuest(page, { email, password, fullName: 'Navigation Guest' });
     await expect(page).toHaveURL(/\/login\?registered=1$/);
     await expect(h1('Log in')).toBeVisible();
     // The query string does not stop "Log in" marking its page.
     await expect(page.getByTestId('nav-login')).toHaveAttribute('aria-current', 'page');
 
-    await logIn(page, email, TEST_PASSWORD);
+    await logIn(page, email, password);
     await expectSignedInAs(page, email);
     await expect(page.getByTestId('nav-logout')).toHaveText('Log out');
     await expect(page).toHaveURL(/\/search$/);
@@ -190,7 +200,7 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(page.getByTestId('nav-login')).toHaveAttribute('aria-current', 'page');
     await expect(page.getByTestId('nav-bookings')).not.toHaveAttribute('aria-current');
 
-    await logIn(page, email, TEST_PASSWORD);
+    await logIn(page, email, password);
     await expect(page).toHaveURL(/\/bookings$/);
     await expect(h1('My bookings')).toBeVisible();
     await expect(page.getByTestId('bookings-empty')).toHaveText('You have no bookings yet.');
@@ -218,14 +228,15 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
 
 test('reloading My bookings signs the guest out and returns there after logging in again', async ({ page }) => {
   const email = uniqueEmail();
+  const password = uniquePassword();
   const api = new URL(apiUrl());
   const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
 
   await test.step('a signed-in guest opens My bookings', async () => {
     await page.goto('/register');
     await expect(h1('Register')).toBeVisible();
-    await registerGuest(page, { email, password: TEST_PASSWORD, fullName: 'Reload Guest' });
-    await logIn(page, email, TEST_PASSWORD);
+    await registerGuest(page, { email, password, fullName: 'Reload Guest' });
+    await logIn(page, email, password);
 
     const [list] = await Promise.all([
       page.waitForResponse((r) => {
@@ -256,7 +267,7 @@ test('reloading My bookings signs the guest out and returns there after logging 
     });
 
     await test.step('logging in again opens /bookings, which only then loads the list', async () => {
-      await logIn(page, email, TEST_PASSWORD);
+      await logIn(page, email, password);
       await expect(page).toHaveURL(/\/bookings$/);
       await expect(h1('My bookings')).toBeVisible();
       await expect(page.getByTestId('bookings-empty')).toHaveText('You have no bookings yet.');

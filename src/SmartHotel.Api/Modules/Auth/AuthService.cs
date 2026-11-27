@@ -171,7 +171,8 @@ public sealed partial class AuthService(
             {
                 // Runs after a transient failure, before any retry. The insert took effect exactly when a row carries
                 // this request's email and hash, whether or not its acknowledgement arrived. EF Core discards the
-                // result of an unsuccessful check and retries the unit, or rethrows the failure once no retry is left.
+                // result of an unsuccessful check and retries the unit, or, once no retry is left, throws a
+                // RetryLimitExceededException that wraps the failure.
                 state.FailedTransiently = true;
                 DetachAttemptGuest(state);
                 int? guestId = await FindRegisteredGuestIdAsync(state.Registration, token);
@@ -197,8 +198,11 @@ public sealed partial class AuthService(
     /// <remarks>
     /// <para>
     /// The response does not reveal whether an account exists. A <see langword="null"/> or blank email or password,
-    /// an email that no stored address can match because it holds a character outside printable ASCII, an unknown
-    /// email and a wrong password all return <see langword="null"/>, which the controller maps to one fixed 401.
+    /// a password containing the null character (U+0000), which registration refuses, an email that no stored
+    /// address can match because it holds a character outside printable ASCII, an unknown email and a wrong password
+    /// all return <see langword="null"/>, which the controller maps to one fixed 401. Refusing that password keeps a
+    /// registered password followed by null characters from logging in: the hash's HMAC pads a short key with zero
+    /// bytes, so such a value would otherwise verify against the registered password's hash.
     /// When no account can match, the password (or an empty string in place of <see langword="null"/>)
     /// is still verified against a dummy hash made with the same settings, so every rejection performs one PBKDF2
     /// verification. That makes the hashing work comparable, not the timing constant: the database lookup can
@@ -220,6 +224,14 @@ public sealed partial class AuthService(
         ArgumentNullException.ThrowIfNull(request);
 
         if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
+        {
+            return RejectWithoutAccount(request.Password);
+        }
+
+        // The hash's HMAC-SHA512 pads a key shorter than its block with zero bytes, so a registered password followed
+        // by null characters (U+0000) can verify against that password's hash. Registration accepts no password
+        // containing the character, so such a password matches no account and takes the no-account path unqueried.
+        if (request.Password.Contains('\0'))
         {
             return RejectWithoutAccount(request.Password);
         }
