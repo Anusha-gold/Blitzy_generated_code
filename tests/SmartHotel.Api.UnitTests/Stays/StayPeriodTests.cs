@@ -15,6 +15,7 @@ public sealed class StayPeriodTests
     [InlineData("2026-12-01", "2026-12-03", 2)]
     [InlineData("2026-12-01", "2026-12-31", 30)] // The 30-night maximum.
     [InlineData("2026-12-05", "2027-01-04", 30)] // The maximum across a year boundary.
+    [InlineData("9999-12-30", "9999-12-31", 1)] // The last representable check-out day stays accepted.
     public void TryCreate_ValidStay_ReturnsPeriodWithNights(string checkIn, string checkOut, int expectedNights)
     {
         Assert.True(StayPeriod.TryCreate(checkIn, checkOut, Today, out var period, out var errors));

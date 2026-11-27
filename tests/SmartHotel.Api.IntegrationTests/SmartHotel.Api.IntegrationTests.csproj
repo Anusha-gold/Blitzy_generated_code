@@ -25,4 +25,13 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <!--
+    This test executable hosts the API in-process and opens its own Npgsql connections before the host starts, so it
+    needs the API's runtime setting: Npgsql keeps DateOnly and DateTime MinValue and MaxValue finite instead of
+    writing them as -infinity and infinity.
+  -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Npgsql.DisableDateTimeInfinityConversions" Value="true" />
+  </ItemGroup>
+
 </Project>

@@ -68,7 +68,9 @@ public static class StayRules
     /// The expression is EF Core-translatable: it holds only member accesses, comparisons and two captured
     /// <see cref="DateOnly"/> values, which become query parameters. <c>AvailabilityQueries</c> composes it as
     /// <c>db.Bookings.Where(StayRules.ConfirmedOverlap(period))</c> and correlates that by <c>RoomId</c> into a
-    /// <c>NOT EXISTS</c> subquery, so the SQL and this rule share one predicate.
+    /// <c>NOT EXISTS</c> subquery, so the SQL and this rule share one predicate. The parameters carry the same finite
+    /// dates as <paramref name="period"/>, never <c>infinity</c>, so a requested check-out of 9999-12-31 stays
+    /// half-open against a booking that starts that day.
     /// </para>
     /// <para>
     /// The database enforces the same rule through the exclusion constraint <c>EX_Bookings_Room_NoOverlap</c>,

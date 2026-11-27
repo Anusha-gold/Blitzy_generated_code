@@ -43,13 +43,14 @@ public sealed class Booking
     public Room Room { get; set; } = null!;
 
     /// <summary>
-    /// Gets or sets the first night of the stay.
+    /// Gets or sets the first night of the stay. The database stores the same calendar date.
     /// </summary>
     public DateOnly CheckIn { get; set; }
 
     /// <summary>
     /// Gets or sets the departure date, which is exclusive: the room is free that night, so another stay may start
-    /// on it. It is always later than <see cref="CheckIn"/>.
+    /// on it. It is always later than <see cref="CheckIn"/>. The database stores the same calendar date,
+    /// <see cref="DateOnly.MaxValue"/> (9999-12-31) included, never <c>infinity</c>.
     /// </summary>
     public DateOnly CheckOut { get; set; }
 
@@ -72,10 +73,10 @@ public sealed class Booking
 
     /// <summary>
     /// Gets or sets the creation instant in UTC, by which a guest's bookings are listed newest first. Callers must
-    /// assign a finite instant with <see cref="DateTimeKind.Utc"/>, taken from the injected
-    /// <see cref="TimeProvider"/>. Npgsql rejects a finite value of any other kind for
-    /// <c>timestamp with time zone</c>, but stores <see cref="DateTime.MinValue"/>, which an unassigned property
-    /// holds, as <c>-infinity</c> and <see cref="DateTime.MaxValue"/> as <c>infinity</c>, whatever their kind.
+    /// assign an instant with <see cref="DateTimeKind.Utc"/>, taken from the injected <see cref="TimeProvider"/>.
+    /// Npgsql rejects a value of any other kind for <c>timestamp with time zone</c>, including the unassigned default
+    /// <see cref="DateTime.MinValue"/>. A UTC <see cref="DateTime.MinValue"/> or <see cref="DateTime.MaxValue"/> is
+    /// stored as the finite instant 0001-01-01 00:00:00Z or 9999-12-31 23:59:59.999999Z, never as an infinity.
     /// </summary>
     public DateTime CreatedAt { get; set; }
 }

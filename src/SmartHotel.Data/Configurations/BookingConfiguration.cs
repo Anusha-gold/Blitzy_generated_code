@@ -28,6 +28,11 @@ namespace SmartHotel.Data.Configurations;
 /// <c>CK_Bookings_Status</c> and the API's availability and cancellation queries all compare it with the literals
 /// <c>'Confirmed'</c> and <c>'Cancelled'</c>.
 /// </para>
+/// <para>
+/// <c>CheckIn</c> and <c>CheckOut</c> are stored and compared as the exact calendar dates, because the hosts disable
+/// Npgsql's infinity conversion. <c>CK_Bookings_Dates</c>, the exclusion constraint and the overlap queries therefore
+/// see a check-out of 9999-12-31 as that date, never as <c>infinity</c>.
+/// </para>
 /// </remarks>
 internal sealed class BookingConfiguration : IEntityTypeConfiguration<Booking>
 {

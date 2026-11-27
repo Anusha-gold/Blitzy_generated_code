@@ -17,6 +17,12 @@ namespace SmartHotel.Data;
 /// The connection string here is a passwordless placeholder. <c>dotnet ef migrations add</c> builds the model without
 /// ever connecting to it, and the API applies migrations itself at startup, so no credential belongs in this file.
 /// </para>
+/// <para>
+/// Like the runtime registration, the factory first requires the <c>Npgsql.DisableDateTimeInfinityConversions</c>
+/// switch, which keeps <see cref="DateOnly.MinValue"/> and <see cref="DateOnly.MaxValue"/> finite instead of
+/// <c>-infinity</c> and <c>infinity</c>. The tools run with the startup project's runtime configuration, and the API
+/// project enables the switch there, so the tools and the API convert dates the same way.
+/// </para>
 /// </remarks>
 public sealed class DesignTimeDbContextFactory : IDesignTimeDbContextFactory<SmartHotelDbContext>
 {
@@ -35,8 +41,14 @@ public sealed class DesignTimeDbContextFactory : IDesignTimeDbContextFactory<Sma
     /// configuration.
     /// </param>
     /// <returns>A new <see cref="SmartHotelDbContext"/> that has not opened a connection.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The startup project's runtime configuration, which the tools run with, does not enable the
+    /// <c>Npgsql.DisableDateTimeInfinityConversions</c> switch.
+    /// </exception>
     public SmartHotelDbContext CreateDbContext(string[] args)
     {
+        DataServiceCollectionExtensions.EnsureFiniteDateConversions();
+
         DbContextOptions<SmartHotelDbContext> options = new DbContextOptionsBuilder<SmartHotelDbContext>()
             .UseNpgsql(PlaceholderConnectionString)
             .Options;

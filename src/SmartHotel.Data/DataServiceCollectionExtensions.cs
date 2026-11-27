@@ -11,6 +11,10 @@ namespace SmartHotel.Data;
 /// </summary>
 public static class DataServiceCollectionExtensions
 {
+    // Npgsql and its EF Core provider read this switch once per process, at their first use, and cache it. Setting it
+    // in code after that has no effect, so each host sets it through its runtime configuration (runtimeconfig.json).
+    private const string DisableDateTimeInfinityConversionsSwitch = "Npgsql.DisableDateTimeInfinityConversions";
+
     /// <summary>
     /// Registers <see cref="SmartHotelDbContext"/> on the Npgsql provider, with its connection string resolved each
     /// time the context options are built rather than at registration.
@@ -43,6 +47,13 @@ public static class DataServiceCollectionExtensions
     /// whose message can quote database values, ahead of the host's sanitized exception record. Only their logging
     /// stops; the exceptions still propagate, and every other event, the command-failure record included, is kept.
     /// </para>
+    /// <para>
+    /// Registration first requires the <c>Npgsql.DisableDateTimeInfinityConversions</c> switch to be enabled in the
+    /// host's runtime configuration. Without it Npgsql writes <see cref="DateOnly.MinValue"/> and
+    /// <see cref="DateOnly.MaxValue"/> as <c>-infinity</c> and <c>infinity</c>, so a stay ending 9999-12-31 would be
+    /// stored and compared as infinity. Npgsql reads the switch once, at its first use in the process, so only the
+    /// runtime configuration sets it reliably, and a host without it fails here instead of storing infinite dates.
+    /// </para>
     /// </remarks>
     /// <param name="services">The service collection to add the data services to.</param>
     /// <param name="connectionString">
@@ -57,12 +68,16 @@ public static class DataServiceCollectionExtensions
     /// <exception cref="ArgumentNullException">
     /// <paramref name="services"/> or <paramref name="connectionString"/> is <see langword="null"/>.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The host's runtime configuration does not enable the <c>Npgsql.DisableDateTimeInfinityConversions</c> switch.
+    /// </exception>
     public static IServiceCollection AddSmartHotelData(
         this IServiceCollection services,
         Func<IServiceProvider, string?> connectionString)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(connectionString);
+        EnsureFiniteDateConversions();
 
         services.AddDbContext<SmartHotelDbContext>((serviceProvider, options) =>
         {
@@ -93,6 +108,28 @@ public static class DataServiceCollectionExtensions
         });
 
         return services;
+    }
+
+    /// <summary>
+    /// Ensures Npgsql keeps the calendar extremes finite in this process: <see cref="DateOnly.MaxValue"/> is sent and
+    /// stored as the date 9999-12-31, and <see cref="DateOnly.MinValue"/> as 0001-01-01, never as <c>infinity</c> or
+    /// <c>-infinity</c>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The process does not have the <c>Npgsql.DisableDateTimeInfinityConversions</c> switch enabled; each host enables
+    /// it in its runtime configuration.
+    /// </exception>
+    internal static void EnsureFiniteDateConversions()
+    {
+        if (AppContext.TryGetSwitch(DisableDateTimeInfinityConversionsSwitch, out bool enabled) && enabled)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "The " + DisableDateTimeInfinityConversionsSwitch + " switch must be enabled in the host's runtime "
+            + "configuration (a RuntimeHostConfigurationOption written to runtimeconfig.json), so that the calendar "
+            + "extremes are stored as finite dates rather than as infinity.");
     }
 
     // Npgsql's Include Error Detail copies PostgreSQL's DETAIL text, which can quote key values, into exception

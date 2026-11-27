@@ -12,4 +12,14 @@
     <ProjectReference Include="..\SmartHotel.Data\SmartHotel.Data.csproj" />
   </ItemGroup>
 
+  <!--
+    By default Npgsql writes DateOnly and DateTime MinValue and MaxValue as -infinity and infinity, so a stay ending
+    9999-12-31 would be stored and compared as infinity. The option is written to runtimeconfig.json, so it is in force
+    before any Npgsql use under dotnet run, in the published image, and under dotnet ef, whose tools run with the
+    startup project's runtimeconfig.json.
+  -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Npgsql.DisableDateTimeInfinityConversions" Value="true" />
+  </ItemGroup>
+
 </Project>

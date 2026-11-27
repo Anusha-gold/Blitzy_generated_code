@@ -37,12 +37,13 @@ public sealed class Guest
     public string FullName { get; set; } = string.Empty;
 
     /// <summary>
-    /// Registration instant in UTC. Callers must assign a finite instant with
+    /// Registration instant in UTC. Callers must assign an instant with
     /// <see cref="DateTimeKind.Utc"/>, taken from the injected <see cref="TimeProvider"/>.
-    /// Npgsql rejects a finite value of any other kind for <c>timestamp with time zone</c>,
-    /// but stores <see cref="DateTime.MinValue"/>, which an unassigned property holds, as
-    /// <c>-infinity</c> and <see cref="DateTime.MaxValue"/> as <c>infinity</c>, whatever
-    /// their kind.
+    /// Npgsql rejects a value of any other kind for <c>timestamp with time zone</c>,
+    /// including the unassigned default <see cref="DateTime.MinValue"/>. A UTC
+    /// <see cref="DateTime.MinValue"/> or <see cref="DateTime.MaxValue"/> is stored as the
+    /// finite instant 0001-01-01 00:00:00Z or 9999-12-31 23:59:59.999999Z, never as an
+    /// infinity.
     /// </summary>
     public DateTime CreatedAt { get; set; }
 }
