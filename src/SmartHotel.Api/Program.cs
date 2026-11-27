@@ -1,0 +1,149 @@
+using System.Text;
+using System.Text.Json.Serialization;
+
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Cors.Infrastructure;
+using Microsoft.AspNetCore.Mvc.ModelBinding.Metadata;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.JsonWebTokens;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.Net.Http.Headers;
+
+using SmartHotel.Api.Infrastructure;
+using SmartHotel.Api.Modules.Auth;
+using SmartHotel.Api.Modules.Availability;
+using SmartHotel.Api.Modules.Bookings;
+using SmartHotel.Api.Modules.Hotels;
+using SmartHotel.Data;
+
+// Nothing here reads configuration or resolves a service before builder.Build(). Every configuration-dependent
+// setting resolves lazily through DI, so the registrations a test host adds while the host is built (a replacement
+// ISecretSource or TimeProvider, in-memory Cors:AllowedOrigin, the Development environment) are in place before
+// anything reads them.
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
+
+// The one clock: today's UTC date, CreatedAt and the token times all come from it.
+builder.Services.AddSingleton(TimeProvider.System);
+
+// Secrets come only from the process environment; a test host registers its own source after this one.
+builder.Services.AddSingleton<ISecretSource, EnvironmentSecretSource>();
+
+// The signing key is overwritten from the secret source unconditionally, even with null, so a key placed in any
+// configuration source is ignored and validation fails when the environment supplies none.
+builder.Services
+    .AddOptions<JwtOptions>()
+    .BindConfiguration(JwtOptions.SectionName)
+    .PostConfigure<ISecretSource>(static (options, secrets) => options.SigningKey = secrets.JwtSigningKey);
+builder.Services.AddSingleton<IValidateOptions<JwtOptions>, JwtOptionsValidator>();
+builder.Services
+    .AddOptions<ApiCorsOptions>()
+    .BindConfiguration(ApiCorsOptions.SectionName);
+builder.Services.AddSingleton<IValidateOptions<ApiCorsOptions>, ApiCorsOptionsValidator>();
+
+builder.Services.AddSmartHotelData(
+    static serviceProvider => serviceProvider.GetRequiredService<ISecretSource>().DatabaseConnectionString);
+
+// Availability comes first: the Hotels and Bookings services consume its scoped queries.
+builder.Services
+    .AddAvailabilityModule()
+    .AddAuthModule()
+    .AddHotelsModule()
+    .AddBookingsModule();
+
+// ProblemDetailsService uses the first writer whose CanWrite is true, and AddControllers registers a writer of its
+// own. AddApiProblemDetails puts the API's always-JSON writer at the front; calling it first keeps that order plain.
+builder.Services.AddApiProblemDetails();
+builder.Services.AddExceptionHandler<ApiExceptionHandler>();
+
+// The metadata provider keys validation errors for body properties by their camelCase JSON names. No XML formatter
+// is added and ReturnHttpNotAcceptable stays false, so every problem negotiates to application/problem+json, even
+// for Accept: application/xml. The enum converter has no naming policy: statuses are written "Confirmed" and
+// "Cancelled" exactly.
+builder.Services
+    .AddControllers(static options =>
+        options.ModelMetadataDetailsProviders.Add(new SystemTextJsonValidationMetadataProvider()))
+    .AddJsonOptions(static options => options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+
+// The single-origin policy is built from the validated options when the policy provider first reads them, after
+// Build(). It allows no credentials.
+builder.Services.AddCors();
+builder.Services
+    .AddOptions<CorsOptions>()
+    .Configure<IOptions<ApiCorsOptions>>(static (cors, api) => cors.AddPolicy(
+        ApiCorsOptions.PolicyName,
+        policy => policy
+            .WithOrigins(api.Value.AllowedOrigin!)
+            .WithMethods(HttpMethods.Get, HttpMethods.Post, HttpMethods.Delete)
+            .WithHeaders(HeaderNames.Authorization, HeaderNames.ContentType)));
+
+// The default challenge is kept: a bodyless 401 with WWW-Authenticate, which status-code pages turn into a problem
+// without touching the header.
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer();
+builder.Services
+    .AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
+    .Configure<ISecretSource, IOptions<JwtOptions>>(static (bearer, secrets, jwtOptions) =>
+    {
+        // Reading Value runs JwtOptionsValidator first, so a missing or short key fails before key bytes are built.
+        JwtOptions jwt = jwtOptions.Value;
+
+        // Claims keep their JWT names, so the guest id is read from sub.
+        bearer.MapInboundClaims = false;
+        bearer.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = jwt.Issuer,
+            ValidateAudience = true,
+            ValidAudience = jwt.Audience,
+            ValidateLifetime = true,
+            RequireExpirationTime = true,
+            RequireSignedTokens = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secrets.JwtSigningKey!)),
+            ValidAlgorithms = [SecurityAlgorithms.HmacSha256],
+            ClockSkew = TimeSpan.Zero,
+            NameClaimType = JwtRegisteredClaimNames.Name,
+        };
+    });
+
+// No fallback policy: only the [Authorize] bookings endpoints require a token.
+builder.Services.AddAuthorization();
+
+WebApplication app = builder.Build();
+
+// Reading Value runs the options validation, after any test registrations and before any database work, so an
+// invalid key or origin stops the process with a non-zero exit. The validators' messages never contain the key.
+_ = app.Services.GetRequiredService<IOptions<JwtOptions>>().Value;
+_ = app.Services.GetRequiredService<IOptions<ApiCorsOptions>>().Value;
+
+// The exception handler is the first middleware added here, so it catches an exception before the Development
+// exception page that WebApplication wraps around the pipeline, and no stack trace reaches the response.
+app.UseExceptionHandler();
+app.UseStatusCodePages();
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHsts();
+    app.UseHttpsRedirection();
+}
+
+app.UseCors(ApiCorsOptions.PolicyName);
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();
+
+// The readiness probe matches GET only, so any other method gets routing's 405 as a problem.
+app.MapGet("/api/health", static () => Results.Text("Healthy", "text/plain"));
+
+// Migrate, then seed, before the server listens: once the probe answers, the database is ready.
+await DatabaseInitializer.InitializeAsync(app.Services, CancellationToken.None);
+
+app.Run();
+
+/// <summary>
+/// The API's entry-point type. It is public so the integration tests can host the API with
+/// <c>WebApplicationFactory&lt;Program&gt;</c>.
+/// </summary>
+public partial class Program;
