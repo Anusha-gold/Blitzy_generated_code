@@ -1,130 +1,28 @@
 /**
- * The web app's request states (R6) and both branches of the 401 rule,
- * exercised in Chromium against the stack at `baseURL`.
+ * The web app's request states, exercised in Chromium against the stack at
+ * `baseURL`: the loading indicator while a request is pending, the
+ * empty-result message, inline errors for 400, 409 and 401, and the redirect
+ * to login when a protected page is opened without a valid session.
  *
- * R6: the loading indicator while a request is pending, the empty-result
- * message, inline errors for 400, 409 and 401, and the redirect to login when
- * a protected page is opened without a valid session.
- *
- * Loading: a search is held at the network until the test releases it, with
- * no timer, so the indicator and the disabled Search button are asserted while
- * it is pending and gone once its results or its real 400 arrive. A hotel
- * page reused by a history traversal while its "Book" POST is held keeps the
- * indicator up and every "Book" disabled until that POST, and the
- * revalidation it starts, have answered, so the shared counter cannot fall
- * early. Every request still held when a test ends is aborted, so a held
- * booking never reaches the API afterwards.
- *
- * The 401 rule: a token the server rejects before its local expiry cannot be
- * caught by the route guard. These tests make the real API reject one by
- * rewriting the `Authorization` header of the app's own bookings requests,
- * so the 401 comes from the API's JwtBearer validation, not from a stub.
- * Entering My bookings must then redirect to login with the session-expired
- * notice. When the browser throws on that redirect's history update, so the
- * router rejects it, My bookings stays open instead with the 401 inline and a
- * "Log in again" that leads back to the list, and no error goes unhandled.
- * "Book" must stay on the hotel page with the 401 shown inline and a
- * "Log in again" link. "Cancel" is an action too: with only its DELETE
- * rejected, after a successful entry load, My bookings stays put and shows
- * the 401 inline with a focused "Log in again" back to
- * `/login?returnUrl=%2Fbookings`, the guest's bookings leave the screen with
- * the session while the booking stays `Confirmed` on the server, no reload
- * follows, and logging in again through that link returns to the list with
- * "Cancel" still offered. In every branch the auth interceptor has cleared
- * the session, so the nav bar offers "Log in" again.
- *
- * Auth and network errors: a password too short for the server's 8 to 128
- * rule shows the register page's 400 inline on the password field alone,
- * without leaving the page. The login form always sends a bindable body, so
- * a contract test rewrites the page's own POST to give `email` a JSON number:
- * the real API's 400, with its `$.email` field error, must show inline and
- * never as wrong credentials. A search the network refuses shows only "The
- * service is unreachable.", and Search again recovers with results.
- *
- * URL criteria: the search and hotel detail pages send the text their URL
- * holds, so the server's own binding judges a deep link such as a guests-only
- * search, `guests=2.0`, `guests=2e0` or an empty `guests`, and its 400 shows
- * inline. A hotel id that is not an integer literal, such as `1.0`, `abc` or a
- * NUL reached through the login page's return URL, matches no API route, so
- * the detail page sends no request and shows the client's local 404 inline,
- * which carries the API's unknown-hotel problem. These cases prove that local
- * answer, not the API's routing of such an id. A detail page reused by one
- * history traversal that changes both its hotel and its stay loads once, for
- * the hotel and stay it lands on.
- *
- * Search form state: the guest count is text, so a typed `2.0`, `2e0`, `1e`
- * or white space reaches the server as typed, on submit and on an unchanged
- * re-submit. A deep link's `guests=2.0` or explicit empty `guests=` stays in
- * the form, and its unchanged re-submit sends that text again: an unedited
- * empty from the URL is the one empty guest count sent. A field the guest
- * leaves empty or clears is left out, and the server uses 1. Leaving a
- * results page for bare `/search` through the brand, nav "Search" or
- * "Log out" resets the form to its initial criteria along with the results.
- *
- * Late bookings: a "Book" answer that arrives after a history traversal has
- * moved the reused hotel page to another stay of the same hotel leaves that
- * stay on screen. A 201 shows a confirmed notice with a link to My bookings
- * and revalidates the counts only when the stays overlap; a 401 shows inside
- * that notice with its own "Log in again", never as the screen's own error.
- *
- * "Book" states: signed out, "Book" sends no request and opens
- * `/login?returnUrl=` carrying the exact hotel path and query, and logging in
- * returns to that hotel and stay. It is disabled on room types too small for
- * the party and on a room type an isolated fixture guest has sold out. When
- * that guest takes the last free room after the page has shown it, "Book"
- * gets the API's real 409, shown above the room table on the same URL, and
- * the revalidation shows no room left and "Book" disabled.
- *
- * Auth pages: after a failed login or registration, focus returns to the
- * submit button that the pending state disabled, or moves to the field the
- * error marks; a resubmit keeps the error on screen until its own answer
- * shows it in a new alert; and editing a field the server rejected ends that
- * field's error. After a registration or a login, focus moves to the next
- * page's heading. A guest sent to log in by "Book" returns to the hotel even
- * after creating an account first, with the register and
- * `/login?registered=1` URLs unchanged, and Back after that login never shows
- * the login form again; a guest still signed in who goes Back to the register
- * page and creates another account gets the notice and the pre-filled email,
- * while Back to a `/login?registered=1` entry whose email was already used
- * moves a signed-in guest on without the form. A return URL that leads to
- * the login page itself, however it is written, sends the guest to `/search`
- * after logging in and when Back reaches its entry. A reload of My bookings
- * while signed out leads to the login page, logging in there returns to My
- * bookings without adding a history entry, and Back from it never shows the
- * login form and reaches the page before the reload within two steps.
- *
- * "Cancel" conflict: a booking the guest has cancelled elsewhere, through the
- * API, still shows `Confirmed` with "Cancel" on the open My bookings page.
- * Clicking it gets the API's real 409, shown above the list; the list is
- * reloaded, with no other request, so the row reads `Cancelled` without
- * "Cancel" and its status takes the focus the removed button held, the
- * guest's other booking keeps its "Cancel", and the guest stays signed in.
- *
- * Session expiry: with the browser's clock faked and moved past the token's
- * 60 minutes, the nav bar must show the guest signed out on the public page
- * they stayed on, without the app sending any API request, and focus left on
- * "Log out" must move to the "Log in" link that replaces it.
- *
- * Request deadline: a login or registration the API never answers must end,
- * once the faked clock passes the 30-second deadline, in the inline "The
- * service is unreachable." with the loading indicator hidden and the submit
- * button enabled again.
- *
- * Unusable success bodies: a 200 the page cannot read (a login body whose
- * token is not a compact signed JWT or whose expiry is not a real UTC
- * instant, a search body that is not a list of results or holds an id beyond
- * the API's 32-bit integers, a detail body missing its fields or holding a
- * date that is not a real calendar date) must show "The service sent an
- * unexpected response." inline. The guest stays signed out on the login page,
- * and no hotel renders.
- *
- * Fixtures: bookings a test arranges or reads go straight to the API under
- * a guest's own token, which no diagnostic prints, and every booking a test
- * creates, through the API or the web app, is cancelled after it, also when
- * it fails, so no `Confirmed` booking is left on a reused stack.
+ * Both branches of the 401 rule are proved with a real server rejection: the
+ * app's own bookings requests have their `Authorization` header rewritten, so
+ * the 401 comes from the API's JwtBearer validation, not from a stub.
+ * Entering My bookings then redirects to login with the session-expired
+ * notice, or, when the browser throws on that redirect's history update,
+ * stays open with the 401 inline and a "Log in again" back to the list. An
+ * action, "Book" or "Cancel", stays on its page with the 401 inline. The
+ * remaining tests cover related page states, such as the auth pages, URL
+ * criteria, late answers, the request deadline and unusable response bodies.
  *
  * Every test runs in a fresh browser context and therefore starts signed
- * out, because the session lives only in memory.
+ * out, because the session lives only in memory. Every guest is registered
+ * by the test that uses it, under a unique email, and the bookings a test
+ * arranges or reads go straight to the API under that guest's own token,
+ * which no diagnostic prints.
+ *
+ * After each test, cleanup attempts to cancel the bookings it created,
+ * through the API or the web app, and warns when it cannot. Best-effort
+ * cleanup can leave bookings on a reused stack.
  */
 import {
   expect,
@@ -138,6 +36,7 @@ import {
 } from '@playwright/test';
 
 import {
+  apiRequest,
   apiUrl,
   displayDate,
   expectControlValue,
@@ -607,8 +506,8 @@ interface FixtureRoomType {
 
 /**
  * The bookings the fixtures created through the API, each with the session
- * that may cancel it. The `afterEach` hook cancels every one still
- * `Confirmed`, also after a failed or timed-out test, so no booking is left
+ * that may cancel it. The `afterEach` hook attempts to cancel each one, also
+ * after a failed or timed-out test; its failures warn and may leave bookings
  * behind on a reused stack. A module variable, because the hook must reach it
  * when a test body never returns; the suite runs one test at a time
  * (`workers: 1`). Bookings the web app makes are found by
@@ -645,7 +544,7 @@ async function fixtureRequest(step: string, send: () => Promise<APIResponse>): P
 async function apiRegisterGuest(request: APIRequestContext): Promise<GuestCredentials> {
   const guest: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
   const response = await fixtureRequest('registering a fixture guest', () =>
-    request.post(`${apiUrl()}/auth/register`, {
+    apiRequest(request, 'POST', '/auth/register', {
       data: { email: guest.email, password: guest.password, fullName: 'Fixture Guest' },
     }),
   );
@@ -659,7 +558,7 @@ async function apiRegisterGuest(request: APIRequestContext): Promise<GuestCreden
  */
 async function apiSignIn(request: APIRequestContext, guest: GuestCredentials): Promise<ApiSession> {
   const response = await fixtureRequest('logging in', () =>
-    request.post(`${apiUrl()}/auth/login`, { data: { email: guest.email, password: guest.password } }),
+    apiRequest(request, 'POST', '/auth/login', { data: { email: guest.email, password: guest.password } }),
   );
   expect(response.status(), 'the fixture login returns 200').toBe(200);
   const body: unknown = await response.json();
@@ -691,10 +590,11 @@ interface GuestToReconcile {
 /**
  * The guests the web app books for, each unique to its test, so every booking
  * one holds is that test's own. A hook lists each guest's bookings through the
- * API after the test and cancels every one still `Confirmed`, also after a
- * failed or timed-out test. The API commits a booking before it answers, so
- * this finds the booking even when the test never decoded its 201. A module
- * variable for the same reason as {@link bookingsToCancel}.
+ * API after the test and attempts to cancel every one still `Confirmed`, also
+ * after a failed or timed-out test; its failures warn and may leave bookings
+ * behind. The API commits a booking before it answers, so a list taken once
+ * the booking request has settled shows it even when the test never decoded
+ * its 201. A module variable for the same reason as {@link bookingsToCancel}.
  */
 const guestsToReconcile: GuestToReconcile[] = [];
 
@@ -724,7 +624,7 @@ function cancelGuestBookingsAfterTest(page: Page, session: ApiSession): void {
  */
 async function apiBook(request: APIRequestContext, session: ApiSession, booking: FixtureBookingRequest): Promise<number> {
   const response = await fixtureRequest('creating a booking', () =>
-    request.post(`${apiUrl()}/bookings`, { headers: session.headers, data: booking }),
+    apiRequest(request, 'POST', '/bookings', { headers: session.headers, data: booking }),
   );
   expect(response.status(), 'the fixture booking returns 201').toBe(201);
   const body: unknown = await response.json();
@@ -743,7 +643,7 @@ async function apiBook(request: APIRequestContext, session: ApiSession, booking:
  */
 async function apiBookingStatus(request: APIRequestContext, session: ApiSession, id: number): Promise<string | null> {
   const response = await fixtureRequest('listing bookings', () =>
-    request.get(`${apiUrl()}/bookings`, { headers: session.headers }),
+    apiRequest(request, 'GET', '/bookings', { headers: session.headers }),
   );
   expect(response.status(), 'the fixture booking list returns 200').toBe(200);
   const list: unknown = await response.json();
@@ -754,11 +654,13 @@ async function apiBookingStatus(request: APIRequestContext, session: ApiSession,
 
 /**
  * Reads one hotel's room types for a stay through the API, in the server's
- * order. The dates are exact `yyyy-MM-dd` text, so they need no escaping.
+ * order.
  */
 async function apiRoomTypes(request: APIRequestContext, hotelId: number, stay: Stay): Promise<FixtureRoomType[]> {
-  const query = `checkIn=${stay.checkIn}&checkOut=${stay.checkOut}&guests=${stay.guests}`;
-  const response = await fixtureRequest('reading a hotel', () => request.get(`${apiUrl()}/hotels/${hotelId}?${query}`));
+  const params = { checkIn: stay.checkIn, checkOut: stay.checkOut, guests: stay.guests };
+  const response = await fixtureRequest('reading a hotel', () =>
+    apiRequest(request, 'GET', `/hotels/${hotelId}`, { params }),
+  );
   expect(response.status(), 'the fixture hotel read returns 200').toBe(200);
   const body: unknown = await response.json();
   const roomTypes = isRecord(body) ? body['roomTypes'] : undefined;
@@ -782,15 +684,15 @@ async function apiRoomTypes(request: APIRequestContext, hotelId: number, stay: S
 }
 
 /**
- * Cancels one booking after a test, under the session that may cancel it. It
- * never throws. A 204, or a 409 for a booking the test itself already
- * cancelled, ends it; any other status, or a request that fails, is printed as
- * a warning naming only the booking and the HTTP status or the error type.
+ * Attempts to cancel one booking after a test, under the session that may
+ * cancel it. It never throws. Cleanup accepts 204 and 409 as terminal; 409
+ * does not distinguish already cancelled from check-in passed. Any other
+ * status, or a request that fails, is printed as a warning naming only the
+ * booking and the HTTP status or the error type.
  */
 async function cancelInCleanup(request: APIRequestContext, session: ApiSession, id: number): Promise<void> {
   try {
-    const response = await request.delete(`${apiUrl()}/bookings/${id}`, { headers: session.headers });
-    // 409 is a booking the test itself already cancelled.
+    const response = await apiRequest(request, 'DELETE', `/bookings/${id}`, { headers: session.headers });
     if (response.status() !== 204 && response.status() !== 409) {
       console.warn(`ui-states cleanup: cancelling booking ${id} returned HTTP ${response.status()}.`);
     }
@@ -943,7 +845,7 @@ async function confirmedBookingIds(request: APIRequestContext, session: ApiSessi
   const remain = 'its Confirmed bookings may remain.';
   let list: unknown;
   try {
-    const response = await request.get(`${apiUrl()}/bookings`, { headers: session.headers });
+    const response = await apiRequest(request, 'GET', '/bookings', { headers: session.headers });
     if (response.status() !== 200) {
       console.warn(`ui-states cleanup: listing a guest's bookings returned HTTP ${response.status()}; ${remain}`);
       return [];
@@ -974,8 +876,8 @@ async function confirmedBookingIds(request: APIRequestContext, session: ApiSessi
 
 // Declared after the hook that aborts held requests, so it runs after that
 // one: a booking request still held by then never reaches the API, and every
-// other is awaited until it settles, so the list already shows any booking it
-// committed.
+// other is awaited for at most CREATES_SETTLE_MS, so the list shows any
+// booking it committed by then.
 test.afterEach(async ({ request }) => {
   for (const guest of guestsToReconcile.splice(0)) {
     if (!(await settleWithin(guest.creates, CREATES_SETTLE_MS))) {
@@ -2397,7 +2299,7 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     const stay: Stay = { checkIn, checkOut, guests: 1 };
 
     const search = await fixtureRequest('searching hotels', () =>
-      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', ...stay } }),
+      apiRequest(request, 'GET', '/hotels', { params: { city: 'Seattle', ...stay } }),
     );
     expect(search.status(), 'the fixture search returns 200').toBe(200);
     const hotels: unknown = await search.json();
@@ -2507,7 +2409,7 @@ test('Cancel answering a real 409 shows it above the list and reloads the row as
     const otherStay: Stay = { checkIn: otherIn, checkOut: otherOut, guests: 1 };
 
     const search = await fixtureRequest('searching hotels', () =>
-      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', ...staleStay } }),
+      apiRequest(request, 'GET', '/hotels', { params: { city: 'Seattle', ...staleStay } }),
     );
     expect(search.status(), 'the fixture search returns 200').toBe(200);
     const hotels: unknown = await search.json();
@@ -2548,7 +2450,7 @@ test('Cancel answering a real 409 shows it above the list and reloads the row as
   await test.step('cancel the booking elsewhere: the open page still offers it', async () => {
     // The guest's other tab or device; nothing tells this page about it.
     const cancelled = await fixtureRequest('cancelling a booking', () =>
-      request.delete(`${apiUrl()}/bookings/${stale}`, { headers: session.headers }),
+      apiRequest(request, 'DELETE', `/bookings/${stale}`, { headers: session.headers }),
     );
     expect(cancelled.status(), 'the cancel elsewhere returns 204').toBe(204);
     await expect(page.getByTestId(`booking-status-${stale}`)).toHaveText('Confirmed');
@@ -2867,12 +2769,17 @@ test('Book answering a real 409 shows it above the room table and refreshes the 
     );
     await expect(page.getByTestId('inline-error')).toHaveCount(1);
     await expect(page.getByTestId('late-booking')).toHaveCount(0);
-    const errorBox = await error.boundingBox();
-    const tableBox = await table.boundingBox();
-    expect(
-      errorBox !== null && tableBox !== null && errorBox.y + errorBox.height <= tableBox.y,
-      'the error sits above the room table',
-    ).toBe(true);
+    // Both rectangles are read in one evaluation, because focus can scroll the page between separate reads.
+    const errorAboveTable = await table.evaluate(
+      (tableEl, errorEl) =>
+        // An element that is hidden or no longer in the document has no client rects.
+        errorEl !== null &&
+        errorEl.getClientRects().length > 0 &&
+        tableEl.getClientRects().length > 0 &&
+        errorEl.getBoundingClientRect().bottom <= tableEl.getBoundingClientRect().top,
+      await error.elementHandle(),
+    );
+    expect(errorAboveTable, 'the error sits above the room table').toBe(true);
     await expect(page).toHaveURL(hotelUrl);
     await expect(page.getByTestId('nav-logout')).toBeVisible();
   });

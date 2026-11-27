@@ -33,12 +33,11 @@
  * the hotel detail page reached from the repeated search.
  *
  * On the way the web app calls all seven interface endpoints along the real
- * request path. The journey ends with its booking cancelled; when it fails
- * before that, the `afterEach` hook cancels through the API whatever the guest
- * still holds, so no `Confirmed` booking is left behind on a reused stack. The
- * create is tracked from before the "Book" click, and the hook first waits, for
- * a bounded time, until it settles, so a booking whose create was still in
- * flight when the journey failed is listed and cancelled too.
+ * request path. The journey ends with its booking cancelled. On failure,
+ * cleanup waits briefly for the tracked create and attempts to cancel
+ * remaining confirmed bookings. Cleanup failures warn and may leave bookings
+ * behind. The create is tracked from before the "Book" click, so a booking
+ * whose create is answered within that wait is included in that attempt.
  *
  * The cancel boundary: "Cancel" is offered on a `Confirmed` booking whose
  * check-in is the current UTC date or later. A second test arranges, through
@@ -47,8 +46,8 @@
  * the page clock to noon UTC on B's check-in day, when the local date is
  * already the next day. B must still offer "Cancel" and A must not, so a page
  * that reads the local date, treats today's check-in as passed, or offers
- * "Cancel" on yesterday's check-in fails it. Its own `afterEach` hook cancels
- * both bookings the same way.
+ * "Cancel" on yesterday's check-in fails it. Its own `afterEach` hook attempts
+ * the same best-effort cleanup of both bookings.
  */
 import {
   test,
@@ -61,6 +60,7 @@ import {
 } from '@playwright/test';
 
 import {
+  apiRequest,
   apiUrl,
   displayDate,
   expectControlValue,
@@ -460,22 +460,24 @@ async function settledCreateId(create: Promise<CreateResponse | null>, label: st
 }
 
 /**
- * Cancels, through the API, every `Confirmed` booking a run's guest still
- * holds. The guest is unique to the run, so each one is the run's own
- * booking, including one created before the page showed its id. The run's
- * tracked create is awaited first ({@link settledCreateId}), so the list is
- * taken only once that create has committed or failed, or once the wait for
- * it has ended with a warning; a list taken earlier would miss a booking the
- * create commits later.
+ * Best-effort cleanup after a run: waits briefly for the tracked create and
+ * attempts to cancel, through the API, the remaining confirmed bookings of
+ * the run's guest. Cleanup failures warn and may leave bookings behind.
+ * The guest is unique to the run, so each listed booking is the run's own,
+ * including one created before the page showed its id. The list is taken
+ * only after the wait for the create ({@link settledCreateId}), which is
+ * bounded: a create still unanswered when it ends is warned about, and a
+ * booking it commits later stays `Confirmed`.
  *
  * It never throws, so the run's own failure stays the one reported. Each
  * problem is logged as a warning prefixed with `label` and naming the step,
  * the HTTP status, a booking id or the error type, never the email, the
- * password, the token or a response body: a failed login, a list that is not
- * an array (it says nothing about what the guest holds), a listed entry
- * without a numeric id, a listed booking whose status is neither `Confirmed`
- * nor `Cancelled` (it is left as it is), a booking the run created that the
- * list does not show, and a cancel not answered 204.
+ * password, the token or a response body: a login or a list not answered
+ * 200, a login answer without a token, a list that is not an array (it says
+ * nothing about what the guest holds), a listed entry without a numeric id,
+ * a listed booking whose status is neither `Confirmed` nor `Cancelled` (it is
+ * left as it is), a booking the run created that the list does not show, and
+ * a cancel not answered 204.
  *
  * @param guest - The run's guest and its tracked create.
  * @param knownIds - The bookings the run already knows it created.
@@ -495,13 +497,12 @@ async function cancelLeftoverBookings(
     }
   }
 
-  const api = apiUrl();
   let step = 'logging in';
   try {
-    const login = await request.post(`${api}/auth/login`, {
+    const login = await apiRequest(request, 'POST', '/auth/login', {
       data: { email: guest.email, password: guest.password },
     });
-    if (!login.ok()) {
+    if (login.status() !== 200) {
       console.warn(`${label}: login returned HTTP ${login.status()}; a Confirmed booking may remain.`);
       return;
     }
@@ -514,8 +515,8 @@ async function cancelLeftoverBookings(
     const headers = { Authorization: `Bearer ${token}` };
 
     step = 'listing bookings';
-    const list = await request.get(`${api}/bookings`, { headers });
-    if (!list.ok()) {
+    const list = await apiRequest(request, 'GET', '/bookings', { headers });
+    if (list.status() !== 200) {
       console.warn(`${label}: listing bookings returned HTTP ${list.status()}; a Confirmed booking may remain.`);
       return;
     }
@@ -550,7 +551,7 @@ async function cancelLeftoverBookings(
 
     for (const id of confirmedIds) {
       step = `cancelling booking ${id}`;
-      const response = await request.delete(`${api}/bookings/${id}`, { headers });
+      const response = await apiRequest(request, 'DELETE', `/bookings/${id}`, { headers });
       if (response.status() !== 204) {
         console.warn(`${label}: cancelling booking ${id} returned HTTP ${response.status()}.`);
       }
@@ -872,16 +873,15 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
     const reference = new Date(`${d2}T12:00:00Z`);
     const email = uniqueEmail();
     const password = uniquePassword();
-    const api = apiUrl();
 
     const [bookingA, bookingB] = await test.step('arrange bookings A and B through the API', async () => {
       const registered = await arrange('registering the guest', () =>
-        request.post(`${api}/auth/register`, { data: { email, password, fullName: 'Boundary Guest' } }),
+        apiRequest(request, 'POST', '/auth/register', { data: { email, password, fullName: 'Boundary Guest' } }),
       );
       expect(registered.status, 'POST /api/auth/register status').toBe(201);
 
       const login = await arrange('logging in', () =>
-        request.post(`${api}/auth/login`, { data: { email, password } }),
+        apiRequest(request, 'POST', '/auth/login', { data: { email, password } }),
       );
       expect(login.status, 'POST /api/auth/login status').toBe(200);
       const token = isRecord(login.body) ? login.body['token'] : undefined;
@@ -892,7 +892,7 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
 
       const stay = { checkIn: d1, checkOut: d3, guests: 1 };
       const search = await arrange('searching Seattle', () =>
-        request.get(`${api}/hotels`, { params: { city: 'Seattle', ...stay } }),
+        apiRequest(request, 'GET', '/hotels', { params: { city: 'Seattle', ...stay } }),
       );
       expect(search.status, 'GET /api/hotels status').toBe(200);
       const first: unknown = Array.isArray(search.body) ? (search.body as unknown[])[0] : undefined;
@@ -902,7 +902,7 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
       }
 
       const detail = await arrange('reading the hotel', () =>
-        request.get(`${api}/hotels/${hotelId}`, { params: stay }),
+        apiRequest(request, 'GET', `/hotels/${hotelId}`, { params: stay }),
       );
       expect(detail.status, 'GET /api/hotels/{id} status').toBe(200);
       const roomTypes: unknown[] =
@@ -921,7 +921,7 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
       const state: BoundaryState = { email, password, create: null, bookingIds: [] };
       boundary = state;
       const book = async (label: string, checkIn: string, checkOut: string): Promise<number> => {
-        const sending = request.post(`${api}/bookings`, {
+        const sending = apiRequest(request, 'POST', '/bookings', {
           headers,
           data: { hotelId, roomTypeId: roomType['id'], checkIn, checkOut, guests: 1 },
         });

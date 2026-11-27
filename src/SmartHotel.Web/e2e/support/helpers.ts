@@ -35,7 +35,7 @@
  */
 import { randomBytes } from 'node:crypto';
 
-import { expect, type Page } from '@playwright/test';
+import { expect, type APIRequestContext, type APIResponse, type Page } from '@playwright/test';
 
 import { resolveStackTarget } from './stack-target';
 
@@ -203,6 +203,62 @@ export function isApiEndpoint(
 }
 
 /**
+ * Sends one request a spec makes to the API directly rather than through the
+ * web app, such as a fixture's registration, login, booking, read or cleanup
+ * cancel, and never follows a redirect.
+ *
+ * Playwright's request client follows up to 20 redirects by default. On a 307
+ * or 308 it resends the method, the body and every header but `Cookie` to the
+ * `Location` target, dropping `Authorization` only when the origin changes,
+ * so a redirect could carry a test guest's password to another origin, or
+ * a bearer token to another path of the API's origin. This helper sends with
+ * `maxRedirects: 0`, so a redirect comes back as its own 3xx response, which
+ * fails the caller's check of the status it expects. The URL is
+ * {@link apiUrl} followed by `endpoint`, and `endpoint` must be a path, so a
+ * request cannot name another origin either.
+ *
+ * It logs nothing. A request that gets no response rejects with Playwright's
+ * error, whose message carries the call log and so can include the headers;
+ * a caller reports such a failure by its error type only.
+ *
+ * @param request - The request context to send with, such as a test's
+ *   `request` fixture.
+ * @param method - The HTTP method.
+ * @param endpoint - The endpoint's path below the API base, starting with `/`,
+ *   for example `/auth/login` or `/bookings/7`.
+ * @param options - What the request carries, each part optional: `headers`,
+ *   the request headers, such as the `Authorization` header of a guest's
+ *   session; `data`, the body, sent as JSON when it is an object; and
+ *   `params`, the query parameters, which Playwright encodes into the URL.
+ *   The default sends none of them.
+ * @returns The response as the API answered it; a 3xx is returned as it is,
+ *   never followed.
+ * @throws Error, as a rejection of the returned promise, when `endpoint` does
+ *   not start with `/`.
+ */
+export async function apiRequest(
+  request: APIRequestContext,
+  method: 'GET' | 'POST' | 'DELETE',
+  endpoint: string,
+  options: {
+    headers?: Readonly<Record<string, string>>;
+    data?: unknown;
+    params?: Readonly<Record<string, string | number | boolean>>;
+  } = {},
+): Promise<APIResponse> {
+  if (!endpoint.startsWith('/')) {
+    throw new Error('apiRequest expects an endpoint path that starts with /.');
+  }
+  return request.fetch(`${apiUrl()}${endpoint}`, {
+    method,
+    headers: options.headers,
+    data: options.data,
+    params: options.params,
+    maxRedirects: 0,
+  });
+}
+
+/**
  * Returns the UTC calendar dates the given numbers of days from today, all
  * from one reading of the clock.
  *
@@ -284,7 +340,8 @@ export function uniqueEmail(): string {
  * password and none is known from source. The bytes are written as base64url
  * after the fixed prefix `e2e-`, giving 28 characters of `A–Z`, `a–z`, `0–9`,
  * `-` and `_`: within registration's bound of 8 to 128 characters, with no
- * whitespace, so the API stores it exactly as sent.
+ * whitespace, so the API hashes it exactly as submitted, with its salted
+ * PBKDF2 password hasher, and stores only the hash.
  *
  * The caller keeps the value for the guest's later logins and never prints
  * it; {@link fillBound} keeps it out of Playwright's diagnostics.
@@ -304,10 +361,9 @@ export function uniquePassword(): string {
  * email to the login page in memory, never in the URL.
  *
  * @param page - The page showing the register page.
- * @param guest - The account to create.
- * @param guest.email - The email address, for example from {@link uniqueEmail}.
- * @param guest.password - The password, for example from {@link uniquePassword}.
- * @param guest.fullName - The guest's full name.
+ * @param guest - The account to create: `email`, the email address, for
+ *   example from {@link uniqueEmail}; `password`, the password, for example
+ *   from {@link uniquePassword}; and `fullName`, the guest's full name.
  * @returns A promise that settles once the login page's URL is shown.
  */
 export async function registerGuest(
@@ -362,12 +418,10 @@ export async function logIn(page: Page, email: string, password: string): Promis
  * and the wait cannot hang.
  *
  * @param page - The page showing the search page.
- * @param criteria - The search criteria to enter.
- * @param criteria.city - The city, for example `Seattle`.
- * @param criteria.checkIn - The check-in date as `yyyy-MM-dd`, for example
- *   from {@link utcDates}; the date input accepts this form.
- * @param criteria.checkOut - The check-out date as `yyyy-MM-dd`.
- * @param criteria.guests - The party size.
+ * @param criteria - The search criteria to enter: `city`, the city, for
+ *   example `Seattle`; `checkIn`, the check-in date as `yyyy-MM-dd`, for
+ *   example from {@link utcDates}, a form the date input accepts; `checkOut`,
+ *   the check-out date as `yyyy-MM-dd`; and `guests`, the party size.
  * @returns A promise that settles once the search outcome is visible.
  */
 export async function searchHotels(
