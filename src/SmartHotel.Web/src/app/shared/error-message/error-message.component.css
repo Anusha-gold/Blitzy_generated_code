@@ -1,4 +1,5 @@
-/* Inline error alert: a tinted, bordered box holding the title, detail, field errors and projected actions. */
+/* Inline error: a tinted, bordered box holding the text-only alert region (title, detail, field errors)
+   and, after it, any projected actions. */
 :host {
   display: block;
 }
@@ -19,6 +20,14 @@
   border-radius: var(--sh-radius);
   /* About 8% of --sh-color-error over white, kept literal for browsers without color-mix(). */
   background-color: #f9ebed;
+}
+
+/* The role="alert" subtree, spaced like the box so its text and the actions after it keep one rhythm. */
+.inline-error__message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.375rem;
 }
 
 .inline-error strong {
