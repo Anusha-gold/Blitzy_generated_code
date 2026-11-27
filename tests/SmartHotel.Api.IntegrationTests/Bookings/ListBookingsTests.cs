@@ -28,6 +28,10 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
         @"(?s)\bFROM ""Bookings"" AS (?<booking>\w+)\b.*"
         + @"\bORDER BY \k<booking>\.""CreatedAt"" DESC, \k<booking>\.""Id"" DESC\s*\z";
 
+    // Authentication's lookup of the token's guest by primary key.
+    private const string GuestLookupPattern =
+        @"(?s)\bFROM ""Guests"" AS (?<guest>\w+)\b.*\bWHERE \k<guest>\.""Id"" = @\w+";
+
     private readonly ApiTestClient _client;
     private readonly TestPostgres _postgres;
 
@@ -162,11 +166,13 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
         List<ApiTestClient.Booking> listA = await ListOkAsync(client, guestA.Token, ct);
         List<string> listCommands = [.. commandLog.ExecutedCommands];
 
-        // One query reads the caller's bookings, sorted by createdAt descending and then by id descending. The SQL
-        // shows both keys on every run, whereas without the id key the tied pair below comes back in the expected
-        // order only by chance. Sensitive-data logging is off, so the parameter shows as a placeholder and only the
-        // SQL text is checked.
-        string listCommand = Assert.Single(listCommands);
+        // Authentication looks up the token's guest once, and then one query reads the caller's bookings, sorted by
+        // createdAt descending and then by id descending. The SQL shows both keys on every run, whereas without the id
+        // key the tied pair below comes back in the expected order only by chance. Sensitive-data logging is off, so
+        // the parameter shows as a placeholder and only the SQL text is checked.
+        Assert.Equal(2, listCommands.Count);
+        Assert.Matches(GuestLookupPattern, listCommands[0]);
+        string listCommand = listCommands[1];
         Assert.Matches(CallerFilterPattern, listCommand);
         Assert.Matches(NewestFirstOrderPattern, listCommand);
 

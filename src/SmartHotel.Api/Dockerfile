@@ -15,6 +15,8 @@ COPY src/SmartHotel.Data/SmartHotel.Data.csproj src/SmartHotel.Data/
 COPY src/SmartHotel.Api/SmartHotel.Api.csproj src/SmartHotel.Api/
 RUN dotnet restore src/SmartHotel.Api/SmartHotel.Api.csproj
 
+# The root .dockerignore allowlist limits these folders to the project files, the C# sources, appsettings.json and
+# docker-entrypoint.sh, so no local settings, dotenv, certificate or key file is copied or published.
 COPY src/SmartHotel.Data/ src/SmartHotel.Data/
 COPY src/SmartHotel.Api/ src/SmartHotel.Api/
 

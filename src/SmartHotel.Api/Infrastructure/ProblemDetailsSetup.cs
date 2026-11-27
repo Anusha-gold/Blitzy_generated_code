@@ -61,9 +61,14 @@ public static class ProblemDetailsSetup
     /// <see cref="ApiExceptionHandler.ServerErrorLogBridge"/> as a log provider, with a filter rule of its own
     /// that lets it receive the Error records of Kestrel's general category, which <c>appsettings.json</c>
     /// and <see cref="ApiExceptionHandler.FrameworkLogRedaction"/> keep away from every other provider. The
-    /// redaction is registered as a post-configuration of the logger filter options, so it withholds the framework
-    /// records that carry request values or exception text from every provider, whatever log levels the
-    /// configuration sets.
+    /// redaction is registered as a post-configuration of the logger filter options, so whatever log levels the
+    /// configuration sets, no provider but the bridge receives the listed levels of the framework categories that
+    /// write request values or exception text, while every other category and level stays under the configuration's
+    /// control. Because the redaction refuses the hosting diagnostics category's Critical records, the level that
+    /// would otherwise have hosting start each request activity,
+    /// <see cref="ApiExceptionHandler.RequestActivityListener"/> is registered as a startup filter that adds no
+    /// middleware: its listener on the host's activity source has hosting start each served request's activity, whose
+    /// id becomes the request's <c>traceId</c> when it is a W3C id.
     /// </para>
     /// <para>
     /// <see cref="ApiExceptionHandler.DeveloperPageProblemFilter"/> answers every exception that reaches the
@@ -105,11 +110,20 @@ public static class ProblemDetailsSetup
                 LogLevel.Error));
 
         // A log level is configuration that any source can lower, so it is not a redaction boundary. The redaction
-        // runs after every configured filter rule is in place and keeps the framework records that carry request
-        // values or exception text away from every provider, the bridge alone excepted.
+        // runs after every configured filter rule is in place and refuses, for every provider but the bridge, the
+        // listed levels of the framework categories that write request values or exception text.
         services.TryAddEnumerable(ServiceDescriptor.Singleton<
             IPostConfigureOptions<LoggerFilterOptions>,
             ApiExceptionHandler.FrameworkLogRedaction>());
+
+        // The redaction withholds the hosting diagnostics category's Critical records, the level at which hosting
+        // would otherwise start each served request's activity, whose id becomes the request's traceId when it is a
+        // W3C id. A listener on the host's activity source has hosting start it instead. The listener is a startup
+        // filter only so that the web host adds it as it starts, before the server accepts a connection; it adds no
+        // middleware.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<
+            IStartupFilter,
+            ApiExceptionHandler.RequestActivityListener>());
 
         // In Development the framework's exception page answers what the exception handler could not, and it
         // would publish the exception's message, stack trace and the request headers. The filter writes the

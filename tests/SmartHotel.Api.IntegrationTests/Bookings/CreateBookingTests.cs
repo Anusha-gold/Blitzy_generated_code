@@ -126,9 +126,22 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
     // The InitialCreate migration's foreign key from a booking to its guest.
     private const string BookingGuestForeignKeyName = "FK_Bookings_Guests_GuestId";
 
-    // Removes a guest's row while the guest's token stays valid, so the API's insert of a booking for that guest
-    // violates BookingGuestForeignKeyName. Only a guest with no bookings can be removed.
-    private const string DeleteGuestSql = "DELETE FROM \"Guests\" WHERE \"Id\" = @guestId";
+    // Removes the booking's guest row just before each row is inserted into Bookings, after the request has passed
+    // authentication, which rejects a token whose guest is already gone. The insert then violates
+    // BookingGuestForeignKeyName. Only a guest with no bookings can be removed, and the request's rollback restores it.
+    private const string DeleteBookingGuestFunctionSql =
+        """
+        CREATE FUNCTION it_delete_booking_guest() RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+            DELETE FROM "Guests" WHERE "Id" = NEW."GuestId";
+            RETURN NEW;
+        END
+        $function$
+        """;
+
+    private const string DeleteBookingGuestTriggerSql =
+        "CREATE TRIGGER it_delete_booking_guest BEFORE INSERT ON \"Bookings\" "
+        + "FOR EACH ROW EXECUTE FUNCTION it_delete_booking_guest()";
 
     // A second exclusion constraint on Bookings, beside EX_Bookings_Room_NoOverlap: no guest holds two confirmed
     // bookings whose stays overlap. An insert that breaks it fails with the same SqlState, 23P01, under another name.
@@ -1108,7 +1121,7 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
 
     // Only a 23P01 on EX_Bookings_Room_NoOverlap is a booking conflict. In each case the room type has free rooms, so
     // the request passes the free-room check under its row lock, and its insert then fails with another database
-    // error: a foreign-key violation (23503), because the booker's guest row was removed after the token was issued,
+    // error: a foreign-key violation (23503), because the booker's guest row is removed after authentication found it,
     // or a violation of a second exclusion constraint with the same SqlState, 23P01, because the booker already holds a
     // confirmed booking of another room type for the same stay. Either error propagates and becomes the sanitized 500,
     // whose one Error record is the exception handler's event naming that SqlState and constraint, and the rollback
@@ -1140,13 +1153,8 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         switch (caseLabel)
         {
             case "foreign-key-violation":
-                // The guest has no bookings, so no row references it, and the token stays valid without it.
-                int deleted = await ExecuteSqlAsync(
-                    variant.DatabaseConnectionString,
-                    DeleteGuestSql,
-                    [("guestId", booker.GuestId)],
-                    ct);
-                Assert.Equal(1, deleted);
+                await ExecuteSqlAsync(variant.DatabaseConnectionString, DeleteBookingGuestFunctionSql, ct);
+                await ExecuteSqlAsync(variant.DatabaseConnectionString, DeleteBookingGuestTriggerSql, ct);
                 expectedSqlState = PostgresErrorCodes.ForeignKeyViolation;
                 expectedConstraint = BookingGuestForeignKeyName;
                 break;

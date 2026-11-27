@@ -14,6 +14,7 @@ using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Hosting;
@@ -126,6 +127,7 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private const string JwtBearerCategory = "Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerHandler";
     private const string ActionInvokerCategory = "Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker";
     private const string HostCategory = "Microsoft.Extensions.Hosting.Internal.Host";
+    private const string HostingDiagnosticsCategory = "Microsoft.AspNetCore.Hosting.Diagnostics";
 
     // The configuration lets this category through only from Warning, so its unredacted Trace level shows that
     // configuration still quiets a category the redaction covers. The in-process test server never writes to it.
@@ -175,7 +177,7 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     [
         (HostCategory, [LogLevel.Debug, LogLevel.Error, LogLevel.Critical]),
         ("Microsoft.Extensions.Hosting.Internal.ApplicationLifetime", [LogLevel.Critical]),
-        ("Microsoft.AspNetCore.Hosting.Diagnostics", [LogLevel.Information]),
+        (HostingDiagnosticsCategory, [LogLevel.Information, LogLevel.Critical]),
         ("Microsoft.AspNetCore.HostFiltering.HostFilteringMiddleware", [LogLevel.Trace, LogLevel.Information]),
         ("Microsoft.AspNetCore.HttpsPolicy.HttpsRedirectionMiddleware", [LogLevel.Debug]),
         (KestrelCategory, [LogLevel.Trace, LogLevel.Information, LogLevel.Warning, LogLevel.Error, LogLevel.Critical]),
@@ -394,14 +396,20 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     }
 
     // The exception handler is the first middleware of the API's pipeline. A startup filter's middleware runs ahead of
-    // everything Program adds, so the API must register none: its handling of the server's rejections lives in the
-    // connection pipeline instead.
+    // everything Program adds, so every startup filter the API registers must hand the pipeline configuration on
+    // unchanged: its handling of the server's rejections lives in the connection pipeline instead, and its request
+    // activity listener is a startup filter only for when the web host adds it.
     [Fact]
     public void Api_RegistersNoStartupFilterAheadOfExceptionHandler()
     {
-        IEnumerable<IStartupFilter> filters = _factory.Services.GetServices<IStartupFilter>();
+        Action<IApplicationBuilder> next = static _ => { };
+        IStartupFilter[] apiFilters =
+        [
+            .. _factory.Services.GetServices<IStartupFilter>()
+                .Where(static filter => filter.GetType().Assembly == typeof(Program).Assembly),
+        ];
 
-        Assert.DoesNotContain(filters, static filter => filter.GetType().Assembly == typeof(Program).Assembly);
+        Assert.All(apiFilters, filter => Assert.Same(next, filter.Configure(next)));
     }
 
     [Fact]
@@ -873,6 +881,49 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             records,
             static record => record.Category == HostCategory && record.Level >= LogLevel.Error,
             "host failure record");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            record => record.Text.Contains(_marker, StringComparison.OrdinalIgnoreCase),
+            "record carrying the marker");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => record.HasException,
+            "record carrying an exception");
+    }
+
+    // A startup filter whose pipeline configuration throws stands for any failure while the web host builds the request
+    // pipeline: the web host reports it, with its exception, under its diagnostics category at Critical. The capture
+    // admits that category at every level, yet no such record reaches it, no record carries the exception or its text,
+    // and the failure still stops the host from starting.
+    [Fact]
+    public async Task PipelineFailsToBuild_StartupFailsWithoutExceptionTextInAnyRecord()
+    {
+        SmartHotelApiFactory.LogCapture capture = new();
+        FailingPipeline pipeline = new(_marker + " pipeline fault");
+        await using SmartHotelApiFactory variant = _factory.CreateLogCaptureVariant(
+            capture,
+            [(HostingDiagnosticsCategory, LogLevel.Trace)],
+            services => services.AddSingleton<IStartupFilter>(pipeline));
+
+        // The host's start fails while it builds the pipeline, so the factory never serves a request. The factory
+        // reports the failure by its exception types alone, so its message carries no marker either.
+        InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await variant.InitializeAsync());
+        Assert.True(pipeline.Configured, "The failing pipeline configuration was never invoked.");
+        Assert.StartsWith("Starting the API host failed.", failure.Message, StringComparison.Ordinal);
+        Assert.False(
+            failure.Message.Contains(_marker, StringComparison.Ordinal),
+            "Expected the factory's failure message not to carry the pipeline's exception text.");
+
+        // The seed record shows that the capture received the host's records at the configured levels.
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Records;
+        Assert.Contains(
+            records,
+            static record => record.Category == DatabaseInitializerCategory && record.EventId == SeedInsertedEventId);
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => record.Category == HostingDiagnosticsCategory && record.Level == LogLevel.Critical,
+            "web host startup failure record");
         SmartHotelApiFactory.LogCapture.AssertNone(
             records,
             record => record.Text.Contains(_marker, StringComparison.OrdinalIgnoreCase),
@@ -1875,8 +1926,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         }
     }
 
-    // The problem's traceId is the W3C id of the request activity, which hosting starts only while its diagnostics
-    // category is enabled at Critical.
+    // The callers' requests reach the pipeline and send no trace header, so the problem's traceId is the W3C id of the
+    // request activity. The redaction withholds the hosting diagnostics category's Critical records, so hosting starts
+    // that activity only for the API's listener on its activity source.
     private static async Task AssertServerErrorWithW3CTraceIdAsync(
         HttpResponseMessage response,
         CancellationToken cancellationToken)
@@ -2024,6 +2076,24 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         public Task StopAsync(CancellationToken cancellationToken)
         {
             return Task.CompletedTask;
+        }
+    }
+
+    // A startup filter whose pipeline configuration fails with the given message, as building the request pipeline does
+    // when a middleware or its registration throws.
+    private sealed class FailingPipeline(string message) : IStartupFilter
+    {
+        private int _configured;
+
+        public bool Configured => Volatile.Read(ref _configured) == 1;
+
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next)
+        {
+            return _ =>
+            {
+                Volatile.Write(ref _configured, 1);
+                throw new InvalidOperationException(message);
+            };
         }
     }
 

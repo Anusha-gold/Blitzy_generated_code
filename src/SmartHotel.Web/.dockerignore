@@ -1,13 +1,53 @@
-# Build context for the web image. Host-installed packages, earlier build output,
-# the Angular cache and Playwright artifacts stay out, so the image's `npm ci` and
-# `ng build` always run from the current sources.
-node_modules
-dist
-.angular
-test-results
-playwright-report
-blob-report
+# Build context for the web image, whose context is this folder (src/SmartHotel.Web).
+# An allowlist: exclude everything, then re-include only the files `npm ci`, `ng build`
+# and the nginx stage read, by name or by source type. The last matching rule wins.
+# Any other local file, such as an .env variant, a secrets file or a certificate or key
+# file under src, stays out of the context and the image. TLS for the web origin
+# terminates in the hosting environment, so certificates and other private material
+# are supplied there at run time, never through the build context.
+*
+
+# Package manifests for `npm ci`
+!package.json
+!package-lock.json
+
+# Angular workspace and compiler configuration
+!angular.json
+!tsconfig.json
+!tsconfig.app.json
+
+# Application sources: the three entry files angular.json names and the
+# components under src/app. angular.json lists no assets, so no other file is read.
+!src/index.html
+!src/main.ts
+!src/styles.css
+!src/app/**/*.ts
+!src/app/**/*.html
+!src/app/**/*.css
+
+# The runtime stage's nginx server template, which also serves /config.json
+!nginx/default.conf.template
+
+# Host-installed packages, earlier build output, the Angular cache and Playwright
+# artifacts stay out at any depth, even where a re-include above matches them, so
+# the image's `npm ci` and `ng build` always run from the current sources.
+# These rules follow the re-includes so that they win, and end in /** so that they
+# match the files themselves: BuildKit does not apply a folder rule to a file that a
+# re-include matched inside an already excluded folder.
+**/node_modules/**
+**/dist/**
+**/.angular/**
+**/test-results/**
+**/playwright-report/**
+**/blob-report/**
 
 # Local dotenv files can hold credentials and never enter the image build.
 # **/ matches them at any depth; .env.example is not matched.
 **/.env
+
+# Local override and environment files can hold credentials too. The app takes its
+# settings at run time from /config.json, so neither is ever a build input, and
+# both stay out at any depth, even where a source re-include above matches them.
+**/*.local
+**/*.local.*
+**/environments/**

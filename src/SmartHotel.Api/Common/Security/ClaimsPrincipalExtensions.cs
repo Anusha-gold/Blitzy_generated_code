@@ -18,9 +18,9 @@ public static class ClaimsPrincipalExtensions
     /// When this method returns <see langword="true"/>, the guest id, which is at least 1; otherwise 0.
     /// </param>
     /// <returns>
-    /// <see langword="true"/> when the first <c>sub</c> claim is a positive integer written in invariant-culture
-    /// digits only, with no sign, white space or separator; <see langword="false"/> when the claim is missing or is
-    /// anything else.
+    /// <see langword="true"/> when the first <c>sub</c> claim parses as an <see cref="int"/> of at least 1 under
+    /// <see cref="NumberStyles.None"/> and the invariant culture; <see langword="false"/> when the claim is missing or
+    /// does not.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="principal"/> is <see langword="null"/>.</exception>
     /// <remarks>
@@ -51,7 +51,8 @@ public static class ClaimsPrincipalExtensions
     /// <returns>The guest id, which is at least 1.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="principal"/> is <see langword="null"/>.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The <c>sub</c> claim is missing, or is not a positive integer written in invariant-culture digits.
+    /// The <c>sub</c> claim is missing, or the first one does not parse as an <see cref="int"/> of at least 1 under
+    /// <see cref="NumberStyles.None"/> and the invariant culture.
     /// </exception>
     /// <remarks>
     /// The claim is read by the rule of <see cref="TryGetGuestId"/>. JwtBearer already rejects every token that fails

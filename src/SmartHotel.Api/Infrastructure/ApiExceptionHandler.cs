@@ -18,21 +18,17 @@ namespace SmartHotel.Api.Infrastructure;
 /// <remarks>
 /// <para>
 /// The event carries only the trace identifier, the request method, the matched route template (or
-/// "unmatched"), the type names of the exception and of its inner exceptions, their stack frames reduced to
-/// type and method names, two truncation flags and, for the first <see cref="PostgresException"/> among all
-/// the collected exceptions, its <see cref="PostgresException.SqlState"/> and
-/// <see cref="PostgresException.ConstraintName"/>. The exceptions are collected breadth-first over
-/// <see cref="Exception.InnerException"/> and every <see cref="AggregateException.InnerExceptions"/> item,
-/// each distinct exception once. At most 65,536 exception references are examined: the exception itself, each
-/// inner exception and each aggregate item, repeats included. That budget bounds the work, and TypesTruncated
-/// is <see langword="true"/> only when it leaves a reference unexamined. The type list holds one entry for each
-/// of the first 256 collected exceptions, in breadth-first order, followed once, in first-seen order, by each
-/// type of the further collected exceptions that those entries do not already name, so every type reached is
-/// named. At most 200 frames are listed in total across the first 256 collected exceptions, and
-/// FramesTruncated is <see langword="true"/> when that cap leaves a frame out or when further exceptions were
-/// collected, whose frames are not described. Exception messages, <see cref="Exception.Data"/>, the formatted
-/// stack trace, the path, route and query values, headers, the body, claims and connection details are never
-/// logged, because any of them can carry personal data or secrets.
+/// "unmatched"), the type names of the exception and of the exceptions it holds through
+/// <see cref="Exception.InnerException"/> and <see cref="AggregateException.InnerExceptions"/>, their stack
+/// frames reduced to type and method names, the truncation flags TypesTruncated and FramesTruncated and, for
+/// the first <see cref="PostgresException"/> among the collected exceptions, its
+/// <see cref="PostgresException.SqlState"/> and <see cref="PostgresException.ConstraintName"/>. Exception
+/// messages, <see cref="Exception.Data"/>, the formatted stack trace, the path, route and query values, headers,
+/// the body, claims and connection details are never logged, because any of them can carry personal data or
+/// secrets. The work and the event's type and frame lists are bounded however large the exception graph is:
+/// TypesTruncated is <see langword="true"/> when the bound on the work left an exception reference unexamined,
+/// and FramesTruncated when the frame list leaves out a frame or does not describe every collected exception.
+/// The helpers that collect and describe the exceptions set those bounds and the order of each list.
 /// </para>
 /// <para>
 /// Some exceptions never reach this handler or leave the request pipeline without a problem response: the
@@ -50,9 +46,13 @@ namespace SmartHotel.Api.Infrastructure;
 /// reachable from one through inner exceptions, writes nothing. The framework's own records of these
 /// exceptions, from the exception handler middleware, the Development exception page and Kestrel's general
 /// category, carry the raw exception. <c>appsettings.json</c> filters them out, and
-/// <see cref="FrameworkLogRedaction"/> withholds them from every provider whatever log levels the configuration
-/// sets. A rule of the bridge's own, which the redaction exempts, lets it alone receive Kestrel's records, and it
-/// forwards neither their exception nor their message, so this event is the only one written.
+/// <see cref="FrameworkLogRedaction"/> refuses them whatever log levels the configuration sets. For every provider
+/// but the bridge, the redaction refuses the listed levels of the framework categories at which ASP.NET Core
+/// 8.0.34 and its generic host write request values or exception text, these records' levels among them, and
+/// leaves every other category and level to the configuration. The bridge alone receives the Error records of
+/// Kestrel's general category, through a rule of its own. It translates only the application errors among them
+/// and forwards neither their exception nor their message, so this event is the only record of these exceptions
+/// that is written.
 /// </para>
 /// </remarks>
 /// <param name="logger">The logger that receives the sanitized event.</param>
@@ -280,7 +280,7 @@ public sealed partial class ApiExceptionHandler(
     /// Describes <paramref name="exception"/> as the sanitized Error event does: the type names of the collected
     /// exceptions, the <see cref="PostgresException.SqlState"/> and <see cref="PostgresException.ConstraintName"/>
     /// of the first <see cref="PostgresException"/> among them, and their stack frames reduced to type and method
-    /// names, each list with its truncation flag, under the bounds the class remarks set.
+    /// names, each list with its truncation flag, under the bounds the collection and description helpers set.
     /// </summary>
     /// <remarks>
     /// No message, <see cref="Exception.Data"/>, formatted stack trace or file information is read, so the
@@ -648,8 +648,9 @@ public sealed partial class ApiExceptionHandler(
     }
 
     /// <summary>
-    /// Withholds, from every log provider, the framework log records that carry request values or exception text,
-    /// whatever log levels the configuration sets.
+    /// Refuses, for every log provider but <see cref="ServerErrorLogBridge"/>, the listed levels of the framework
+    /// categories at which ASP.NET Core 8.0.34 and its generic host write request values or exception text, whatever
+    /// log levels the configuration sets. Every other category and level stays under the configuration's control.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -659,8 +660,15 @@ public sealed partial class ApiExceptionHandler(
     /// <c>Host</c>, <c>Origin</c>, <c>Accept</c> and <c>Content-Type</c> header values, action arguments, or the
     /// messages of JSON, token-validation, server and host exceptions. Some of them pass even the default levels,
     /// such as the generic host's Error record of a hosted service that failed to start, which carries the exception
-    /// of a server that could not bind its configured address. A level threshold therefore cannot keep them out of
-    /// the logs; this boundary does, in code, at the logger factory, before any provider receives a record.
+    /// of a server that could not bind its configured address, and the web host's Critical record of a request
+    /// pipeline it could not build. A level threshold therefore cannot keep them out of the logs; this boundary does,
+    /// in code, at the logger factory, before any provider receives a record.
+    /// </para>
+    /// <para>
+    /// The boundary is a mask of exact category names, each with the levels at which that category writes such text.
+    /// A category the mask does not name, and a level it does not list, reach whichever providers the configuration
+    /// admits them to, so a framework record outside the inventory, such as one a later framework release adds, is
+    /// not refused.
     /// </para>
     /// <para>
     /// <see cref="ProblemDetailsSetup.AddApiProblemDetails"/> registers the redaction, once however often it is
@@ -679,8 +687,16 @@ public sealed partial class ApiExceptionHandler(
     /// record included.
     /// </para>
     /// <para>
-    /// <see cref="ServerErrorLogBridge"/> is exempt. It receives Kestrel's general records only to replace each report
-    /// of an unhandled exception with the sanitized event, and it forwards neither their exception nor their message.
+    /// Hosting starts the activity of a request its pipeline serves, whose id becomes that request's <c>traceId</c>
+    /// when it is a W3C id, only on a trigger such as its diagnostics category being enabled at Critical. The
+    /// redaction refuses that level, so <see cref="RequestActivityListener"/> gives hosting another trigger, a
+    /// listener on the host's activity source, and request correlation does not depend on any log level.
+    /// </para>
+    /// <para>
+    /// <see cref="ServerErrorLogBridge"/> is exempt. It creates a logger only for Kestrel's general category, which
+    /// its own rule admits from Error, and acts only on the application errors among those records: it replaces each
+    /// with the sanitized event and forwards neither its exception nor its message. Its logger for every other
+    /// category is never enabled.
     /// </para>
     /// </remarks>
     internal sealed class FrameworkLogRedaction : IPostConfigureOptions<LoggerFilterOptions>
@@ -694,12 +710,13 @@ public sealed partial class ApiExceptionHandler(
         // generates, and stay under the configuration's control.
         private static readonly FrozenDictionary<string, int> RedactedLevels = new Dictionary<string, int>
         {
-            // Request starting, request finished and request unhandled: method, host, path and query string.
-            // Critical stays open, although its records, the web host's startup failures, carry their exception:
-            // hosting starts the request activity, whose W3C id is every problem's traceId, only while this category
-            // is enabled at Critical, so keeping exception text out of the logs yields here to that correlation. The
-            // records are written before any request is served.
-            ["Microsoft.AspNetCore.Hosting.Diagnostics"] = Levels(LogLevel.Information),
+            // Request starting, request finished and request unhandled at Information: method, host, path and query
+            // string. The web host's startup failures at Critical, a pipeline that could not be built and a hosting
+            // startup assembly that could not be loaded, each with its exception. Request correlation does not depend
+            // on this category: RequestActivityListener has hosting start each served request's activity, whose id
+            // becomes the request's traceId when it is a W3C id. A startup failure that stops the host is still
+            // reported by Program's HostRunFailed event, which names the exception types only.
+            ["Microsoft.AspNetCore.Hosting.Diagnostics"] = Levels(LogLevel.Information, LogLevel.Critical),
 
             // A request host that matches no allowed host, or that matches one: the Host header value.
             ["Microsoft.AspNetCore.HostFiltering.HostFilteringMiddleware"] = Levels(
@@ -854,6 +871,88 @@ public sealed partial class ApiExceptionHandler(
 
             return (provider, category, level) =>
                 !IsRedacted(provider, category, level) && filter(provider, category, level);
+        }
+    }
+
+    /// <summary>
+    /// Has the web host start an activity for every request its pipeline serves, so that request's problem
+    /// <c>traceId</c> and sanitized event carry the activity's W3C id whatever log levels the configuration sets,
+    /// unless the request names a parent that is not a W3C id, in which case they carry the server's request
+    /// identifier. A request Kestrel rejects before the pipeline runs gets no activity, so its problem carries the
+    /// server's request identifier as well.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Hosting starts the request activity only while its diagnostics category is enabled at Critical, while a
+    /// diagnostic listener asks for the request event, or while its activity source has a listener.
+    /// <see cref="FrameworkLogRedaction"/> withholds that category's Critical records, the web host's startup
+    /// failures with their exceptions, and the API asks for no request event, so this type supplies the third: one
+    /// activity listener on the host's own <see cref="ActivitySource"/>, matched by reference rather than by name, so
+    /// another host in the same process is unaffected. The listener asks only for propagation data, the least that
+    /// still creates the activity: its trace and span ids and the incoming trace context.
+    /// </para>
+    /// <para>
+    /// It is a startup filter for its timing alone: the web host calls <see cref="Configure"/> as it starts, before it
+    /// builds the request pipeline and before the server accepts a connection. The filter returns the pipeline
+    /// configuration unchanged, so it adds no middleware and the exception handler stays the first. The listener is
+    /// removed when the host's services are disposed.
+    /// </para>
+    /// </remarks>
+    /// <param name="hostSource">
+    /// The web host's activity source, the singleton from which hosting creates every request activity.
+    /// </param>
+    internal sealed class RequestActivityListener(ActivitySource hostSource) : IStartupFilter, IDisposable
+    {
+        private readonly object _gate = new();
+        private ActivityListener? _listener;
+        private bool _disposed;
+
+        /// <summary>
+        /// Adds the activity listener on the first call, unless the filter is already disposed, and returns
+        /// <paramref name="next"/> unchanged.
+        /// </summary>
+        /// <param name="next">The pipeline configuration of the filters after this one and of the application.</param>
+        /// <returns><paramref name="next"/> itself, so the pipeline gains no middleware.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="next"/> is <see langword="null"/>.</exception>
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next)
+        {
+            ArgumentNullException.ThrowIfNull(next);
+
+            lock (_gate)
+            {
+                if (_listener is null && !_disposed)
+                {
+                    // Sample serves a request with a W3C traceparent header or with no parent at all.
+                    // SampleUsingParentId serves any other parent id, such as a hierarchical Request-Id header, so
+                    // that request still has its activity; that activity's id is hierarchical, so the server's request
+                    // id is published instead.
+                    ActivityListener listener = new()
+                    {
+                        ShouldListenTo = source => ReferenceEquals(source, hostSource),
+                        Sample = static (ref ActivityCreationOptions<ActivityContext> _) =>
+                            ActivitySamplingResult.PropagationData,
+                        SampleUsingParentId = static (ref ActivityCreationOptions<string> _) =>
+                            ActivitySamplingResult.PropagationData,
+                    };
+                    ActivitySource.AddActivityListener(listener);
+                    _listener = listener;
+                }
+            }
+
+            return next;
+        }
+
+        /// <summary>
+        /// Removes the activity listener, so the host's activity source no longer creates request activities for it.
+        /// </summary>
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                _disposed = true;
+                _listener?.Dispose();
+                _listener = null;
+            }
         }
     }
 }

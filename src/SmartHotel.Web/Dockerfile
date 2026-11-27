@@ -9,7 +9,12 @@ ENV NG_CLI_ANALYTICS=false PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY angular.json tsconfig.json tsconfig.app.json ./
-COPY src ./src
+# Only the build's inputs are copied: the entry files angular.json names and the
+# components under src/app, which the .dockerignore allowlist limits to their
+# .ts, .html and .css files, so no local dotenv, override, environment, secrets,
+# certificate or key file is copied.
+COPY src/index.html src/main.ts src/styles.css ./src/
+COPY src/app ./src/app
 RUN npx ng build --configuration production
 
 FROM nginx:1.30.7-alpine3.24

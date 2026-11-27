@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json.Serialization;
 
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
@@ -159,19 +160,40 @@ builder.Services
             NameClaimType = JwtRegisteredClaimNames.Name,
         };
 
-        // A token that passes every check above but carries no valid guest id in sub fails authentication here, with a
-        // fixed reason that holds no claim value. Authorization then challenges with the standard 401 before MVC binds
-        // the body, so such a token never reaches an action that reads the caller's id.
+        // A token that passes every check above fails authentication here, with a fixed reason that holds no claim
+        // value, when its sub carries no valid guest id or, on an endpoint that requires authorization, names no
+        // registered guest, such as a token signed before the database was reset. Authorization then challenges with
+        // the standard 401 before MVC binds the body, so such a token never reaches an action, and no booking is
+        // inserted for a guest that does not exist. Routing has already matched the endpoint, and the existence check
+        // runs only when that endpoint requires authorization: public routes such as hotel search, hotel detail and the
+        // readiness probe read no guest id, so a token sent to them costs no database round trip, and a failed lookup
+        // cannot fail them. The check is one primary-key query on the request's database context, and a database
+        // failure propagates like any other.
         bearer.Events = new JwtBearerEvents
         {
-            OnTokenValidated = static context =>
+            OnTokenValidated = static async context =>
             {
-                if (context.Principal is null || !context.Principal.TryGetGuestId(out _))
+                if (context.Principal is null || !context.Principal.TryGetGuestId(out int guestId))
                 {
                     context.Fail("The token carries no valid guest identifier.");
+                    return;
                 }
 
-                return Task.CompletedTask;
+                Endpoint? endpoint = context.HttpContext.GetEndpoint();
+                if (endpoint?.Metadata.GetMetadata<IAuthorizeData>() is null
+                    || endpoint.Metadata.GetMetadata<IAllowAnonymous>() is not null)
+                {
+                    return;
+                }
+
+                SmartHotelDbContext db = context.HttpContext.RequestServices.GetRequiredService<SmartHotelDbContext>();
+                bool registered = await db.Guests
+                    .AsNoTracking()
+                    .AnyAsync(guest => guest.Id == guestId, context.HttpContext.RequestAborted);
+                if (!registered)
+                {
+                    context.Fail("The token names no registered guest.");
+                }
             },
         };
     });

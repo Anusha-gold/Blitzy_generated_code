@@ -35,8 +35,8 @@ namespace SmartHotel.Api.Modules.Bookings;
 /// Registered scoped, beside the request's <see cref="SmartHotelDbContext"/>, which it shares with
 /// <see cref="AvailabilityQueries"/>, so the free-room query runs inside the transaction that holds the lock. Its log
 /// events carry booking ids, room type ids and <c>yyyy-MM-dd</c> dates only: never a guest id, an email, a price or an
-/// exception message. They are written once the outcome is final. A log provider that fails while writing one loses
-/// only its own copy of the event, the failure goes unreported, and the outcome stands.
+/// exception message. They are written once the outcome is final. A logging failure leaves the booking outcome
+/// unchanged and goes unreported, but the event can be lost.
 /// </para>
 /// </remarks>
 /// <param name="db">The request's database session, shared with <paramref name="availability"/>.</param>
@@ -185,11 +185,9 @@ public sealed partial class BookingService(
                 // the interleaving. It is also the safety net for a writer that does not take this lock: when such a
                 // writer takes the chosen room first, the constraint rejects the insert and the catch below returns
                 // 409, even though another room of the type may still be free. A booking row cannot be locked before
-                // it exists, so the parent RoomTypes row is locked, and creators for other room types never wait on
-                // it. SERIALIZABLE isolation was rejected because its 40001 failures need whole-transaction retries,
-                // which make "exactly one success for the last room" harder to keep deterministic.
-                // No operator may be composed onto this query: any would wrap the statement in a subquery, and it must
-                // reach PostgreSQL exactly as written.
+                // it exists, so the parent RoomTypes row is locked, and creators for other room types never wait on it.
+                // Do not add SQL-composing LINQ operators; the FOR UPDATE statement must execute directly. Composing
+                // would wrap it in a subquery.
                 await db.RoomTypes
                     .FromSql($"SELECT * FROM \"RoomTypes\" WHERE \"Id\" = {roomTypeId} FOR UPDATE")
                     .AsNoTracking()
@@ -311,9 +309,9 @@ public sealed partial class BookingService(
     /// </summary>
     /// <remarks>
     /// One SQL statement reads the bookings with their room, room type and hotel, ordered by creation instant and then
-    /// by id, both descending, which <c>IX_Bookings_GuestId_CreatedAt</c> serves. Each row is materialized straight
-    /// into its <see cref="BookingResponse"/>, so the result is the only list allocated. The nights are not a column:
-    /// EF Core evaluates that part of the projection in memory, from the dates the row read, with
+    /// by id, both descending, which <c>IX_Bookings_GuestId_CreatedAt</c> serves. Each row is projected directly into
+    /// its <see cref="BookingResponse"/>, without a separate list of <see cref="Booking"/> entities. The nights are not
+    /// a column: EF Core evaluates that part of the projection in memory, from the dates the row read, with
     /// <see cref="StayPeriod.Nights"/>.
     /// </remarks>
     /// <param name="guestId">The caller's guest id, from the bearer token's <c>sub</c> claim.</param>
@@ -549,8 +547,6 @@ public sealed partial class BookingService(
         }
         catch (AggregateException)
         {
-            // The booking is already committed. A failed write loses only the failing providers' copies of the event,
-            // and the failure goes unreported because the logger is the channel that failed.
         }
     }
 
@@ -562,8 +558,6 @@ public sealed partial class BookingService(
         }
         catch (AggregateException)
         {
-            // The transaction is already rolled back. A failed write loses only the failing providers' copies of the
-            // event, and the failure goes unreported because the logger is the channel that failed.
         }
     }
 
@@ -575,8 +569,6 @@ public sealed partial class BookingService(
         }
         catch (AggregateException)
         {
-            // The cancellation is already committed. A failed write loses only the failing providers' copies of the
-            // event, and the failure goes unreported because the logger is the channel that failed.
         }
     }
 

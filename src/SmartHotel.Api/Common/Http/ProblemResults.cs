@@ -24,9 +24,10 @@ namespace SmartHotel.Api.Common.Http;
 /// an extension method on the current instance.
 /// </para>
 /// <para>
-/// Titles and details are fixed English text. A detail may name non-secret domain values, such as a room type
-/// name and dates ("No Standard room is free from 2026-12-07 to 2026-12-09."). It never contains secrets,
-/// password hashes, tokens, email addresses or exception text.
+/// The helpers copy the titles, details and validation messages they are given into the response unchanged and
+/// redact nothing, so callers must supply safe text: fixed English sentences, which may name non-secret domain
+/// values such as a room type name and dates ("No Standard room is free from 2026-12-07 to 2026-12-09."). Callers
+/// must never pass raw request values, credentials, password hashes, tokens, email addresses or exception text.
 /// </para>
 /// </remarks>
 public static class ProblemResults
@@ -41,10 +42,14 @@ public static class ProblemResults
     /// controller's own <c>ModelState</c> is neither read nor changed.
     /// </remarks>
     /// <param name="controller">The controller answering the request.</param>
-    /// <param name="errors">The validation messages per request field name. Each message is a fixed sentence.</param>
+    /// <param name="errors">
+    /// The validation messages per request field name. Each message is copied unchanged, so it must be safe text, as
+    /// the class remarks define it.
+    /// </param>
     /// <param name="detail">
-    /// A fixed sentence describing the failure, or <see langword="null"/> to use the API's default 400 detail,
-    /// which <c>ProblemDetailsSetup.ApplyDefaults</c> supplies.
+    /// A sentence describing the failure, or <see langword="null"/> to use the API's default 400 detail, which
+    /// <c>ProblemDetailsSetup.ApplyDefaults</c> supplies. A supplied sentence is copied unchanged, so it must be safe
+    /// text.
     /// </param>
     /// <returns>The 400 result for the action to return.</returns>
     /// <exception cref="ArgumentNullException">
@@ -84,8 +89,10 @@ public static class ProblemResults
     /// one. The body is the same problem the other helpers build.
     /// </remarks>
     /// <param name="controller">The controller answering the request.</param>
-    /// <param name="title">A fixed, short summary of the problem.</param>
-    /// <param name="detail">A fixed sentence explaining the problem to the caller.</param>
+    /// <param name="title">A short summary of the problem. It is copied unchanged, so it must be safe text.</param>
+    /// <param name="detail">
+    /// A sentence explaining the problem to the caller. It is copied unchanged, so it must be safe text.
+    /// </param>
     /// <returns>The 401 result for the action to return.</returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="controller"/>, <paramref name="title"/> or <paramref name="detail"/> is
@@ -105,8 +112,10 @@ public static class ProblemResults
     /// the body is this domain problem.
     /// </remarks>
     /// <param name="controller">The controller answering the request.</param>
-    /// <param name="title">A fixed, short summary of the problem.</param>
-    /// <param name="detail">A fixed sentence explaining the problem to the caller.</param>
+    /// <param name="title">A short summary of the problem. It is copied unchanged, so it must be safe text.</param>
+    /// <param name="detail">
+    /// A sentence explaining the problem to the caller. It is copied unchanged, so it must be safe text.
+    /// </param>
     /// <returns>The 403 result for the action to return.</returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="controller"/>, <paramref name="title"/> or <paramref name="detail"/> is
@@ -121,8 +130,10 @@ public static class ProblemResults
     /// Creates a 404 Not Found problem.
     /// </summary>
     /// <param name="controller">The controller answering the request.</param>
-    /// <param name="title">A fixed, short summary of the problem.</param>
-    /// <param name="detail">A fixed sentence explaining the problem to the caller.</param>
+    /// <param name="title">A short summary of the problem. It is copied unchanged, so it must be safe text.</param>
+    /// <param name="detail">
+    /// A sentence explaining the problem to the caller. It is copied unchanged, so it must be safe text.
+    /// </param>
     /// <returns>The 404 result for the action to return.</returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="controller"/>, <paramref name="title"/> or <paramref name="detail"/> is
@@ -137,8 +148,10 @@ public static class ProblemResults
     /// Creates a 409 Conflict problem.
     /// </summary>
     /// <param name="controller">The controller answering the request.</param>
-    /// <param name="title">A fixed, short summary of the problem.</param>
-    /// <param name="detail">A fixed sentence explaining the problem to the caller.</param>
+    /// <param name="title">A short summary of the problem. It is copied unchanged, so it must be safe text.</param>
+    /// <param name="detail">
+    /// A sentence explaining the problem to the caller. It is copied unchanged, so it must be safe text.
+    /// </param>
     /// <returns>The 409 result for the action to return.</returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="controller"/>, <paramref name="title"/> or <paramref name="detail"/> is
