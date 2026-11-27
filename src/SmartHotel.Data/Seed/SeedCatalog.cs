@@ -93,17 +93,17 @@ public static class SeedCatalog
     /// each hotel numbered before it.
     /// </summary>
     /// <param name="hotelNumber">The hotel's <see cref="HotelEntry.Number"/>, from 1 to the number of hotels.</param>
-    /// <param name="basePrice">The room type's <see cref="RoomTypeEntry.BasePrice"/> in USD, not negative.</param>
+    /// <param name="basePrice">The room type's <see cref="RoomTypeEntry.BasePrice"/> in USD, 0 or more.</param>
     /// <returns>The nightly price in USD, for example 149.00 for a Standard room in hotel 3.</returns>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="hotelNumber"/> is outside 1 to the number of hotels, or <paramref name="basePrice"/> is
-    /// negative.
+    /// less than 0.
     /// </exception>
     public static decimal NightlyPrice(int hotelNumber, decimal basePrice)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(hotelNumber, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(hotelNumber, Hotels.Count);
-        ArgumentOutOfRangeException.ThrowIfNegative(basePrice);
+        ArgumentOutOfRangeException.ThrowIfLessThan(basePrice, 0m);
 
         return basePrice + ((hotelNumber - 1) * HotelPriceStep);
     }

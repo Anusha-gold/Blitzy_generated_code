@@ -27,6 +27,16 @@ public sealed class PriceCalculatorTests
     };
 
     /// <summary>
+    /// Products with a fraction of a cent below or above the half cent, which round to the nearest cent. Rounding up
+    /// (ToPositiveInfinity) would give 10.01 for the first row, and truncation (ToZero) 10.00 for the second.
+    /// </summary>
+    public static TheoryData<decimal, int, decimal> NonMidpointTotals => new()
+    {
+        { 10.004m, 1, 10.00m },
+        { 10.006m, 1, 10.01m },
+    };
+
+    /// <summary>
     /// Prices outside the 0 to 99,999.99 bound.
     /// </summary>
     public static TheoryData<decimal> OutOfRangePrices =>
@@ -46,6 +56,13 @@ public sealed class PriceCalculatorTests
     [Theory]
     [MemberData(nameof(MidpointTotals))]
     public void Total_MidpointProduct_RoundsAwayFromZero(decimal nightlyPrice, int nights, decimal expected)
+    {
+        Assert.Equal(expected, PriceCalculator.Total(nightlyPrice, nights));
+    }
+
+    [Theory]
+    [MemberData(nameof(NonMidpointTotals))]
+    public void Total_NonMidpointProduct_RoundsToNearestCent(decimal nightlyPrice, int nights, decimal expected)
     {
         Assert.Equal(expected, PriceCalculator.Total(nightlyPrice, nights));
     }
