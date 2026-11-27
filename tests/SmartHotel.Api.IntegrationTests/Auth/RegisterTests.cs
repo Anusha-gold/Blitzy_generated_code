@@ -1,11 +1,23 @@
 using System.Buffers.Binary;
+using System.Data.Common;
+using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
 
+using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+using Npgsql;
 
 using SmartHotel.Api.IntegrationTests.Infrastructure;
+using SmartHotel.Api.Modules.Auth;
+using SmartHotel.Data;
 using SmartHotel.Data.Entities;
 
 using Xunit.Sdk;
@@ -95,6 +107,154 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             ct);
 
         await ProblemAssert.AssertProblemAsync(second, HttpStatusCode.Conflict, cancellationToken: ct);
+    }
+
+    // A holder locks Guests against inserts before any request starts. Seeing every request queued at its INSERT
+    // proves that each one passed the email pre-check, so every loser is refused by UX_Guests_Email's 23505, the race
+    // path, and none by the pre-check.
+    [Fact]
+    public async Task Register_ConcurrentDuplicateEmail_ReturnsOneCreatedAndConflictsWithoutErrorRecords()
+    {
+        const int raceSize = 10;
+
+        // AuthService's GuestRegistered.
+        const int guestRegisteredEventId = 1001;
+
+        // SHARE mode conflicts with the ROW EXCLUSIVE lock an INSERT takes and with nothing a SELECT takes, so every
+        // registration passes its email pre-check and then queues at its insert behind the holder.
+        const string lockGuestsSql = "LOCK TABLE \"Guests\" IN SHARE MODE";
+
+        TimeSpan observationLimit = TimeSpan.FromSeconds(30);
+        TimeSpan drainLimit = TimeSpan.FromSeconds(30);
+        string authServiceCategory = typeof(AuthService).FullName!;
+
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        SmartHotelApiFactory.LogCapture capture = new();
+        await using SmartHotelApiFactory variant = factory.CreateLogCaptureVariant(
+            capture,
+            SmartHotelApiFactory.LogCapture.DataLayerRules,
+            additionalOverrides: null);
+
+        // A hand-built factory is not a fixture, so it is started here.
+        await variant.InitializeAsync();
+        ApiTestClient client = variant.CreateApiClient();
+        string email = UniqueEmail("race");
+
+        await using NpgsqlConnection holder = new(variant.DatabaseConnectionString);
+        await holder.OpenAsync(ct);
+        await using NpgsqlTransaction holderTx = await holder.BeginTransactionAsync(ct);
+        await using (NpgsqlCommand lockGuests = new(lockGuestsSql, holder, holderTx))
+        {
+            await lockGuests.ExecuteNonQueryAsync(ct);
+        }
+
+        int mark = capture.Count;
+
+        // ToArray starts every request at once, each with the same address.
+        Task<HttpResponseMessage>[] requests = Enumerable.Range(0, raceSize)
+            .Select(_ => client.RegisterAsync(new { email, password = ValidPassword, fullName = ValidFullName }, ct))
+            .ToArray();
+
+        long waiting = -1;
+        HttpResponseMessage[] responses;
+        try
+        {
+            waiting = await WaitForInsertWaitersAsync(
+                variant.DatabaseConnectionString,
+                holder.ProcessID,
+                raceSize,
+                observationLimit,
+                ct);
+        }
+        finally
+        {
+            // Runs on every path. The holder changed nothing, so the rollback only releases the lock, even while the
+            // test is being cancelled, and every request is drained before the variant host is disposed.
+            await holderTx.RollbackAsync(CancellationToken.None);
+            responses = await Task.WhenAll(requests).WaitAsync(drainLimit, ct);
+        }
+
+        try
+        {
+            if (waiting != raceSize)
+            {
+                Assert.Fail(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{raceSize} registrations queued at their insert were not observed within "
+                    + $"{observationLimit.TotalSeconds} s (last count: {waiting})."));
+            }
+
+            Assert.Single(responses, static response => response.StatusCode == HttpStatusCode.Created);
+            Assert.Equal(
+                raceSize - 1,
+                responses.Count(static response => response.StatusCode == HttpStatusCode.Conflict));
+            foreach (HttpResponseMessage conflict in responses.Where(
+                static response => response.StatusCode == HttpStatusCode.Conflict))
+            {
+                await ProblemAssert.AssertProblemAsync(conflict, HttpStatusCode.Conflict, cancellationToken: ct);
+            }
+
+            int stored = await variant.ExecuteDbAsync(
+                (db, token) => db.Guests.AsNoTracking().CountAsync(guest => guest.Email == email, token),
+                ct);
+            Assert.Equal(1, stored);
+
+            // The winner's record shows that the provider receives the application's records; the losers add none
+            // at Error.
+            IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Since(mark);
+            Assert.Single(
+                records,
+                record => record.Category == authServiceCategory && record.EventId == guestRegisteredEventId);
+            SmartHotelApiFactory.LogCapture.AssertNone(
+                records,
+                static record => record.Level >= LogLevel.Error,
+                "Error or Critical record");
+        }
+        finally
+        {
+            foreach (HttpResponseMessage response in responses)
+            {
+                response.Dispose();
+            }
+        }
+
+        // Polls until expected sessions of the database, other than the holder and the observer itself, wait on a
+        // lock while inserting a guest, or the limit passes, and returns the last count. No transaction is opened:
+        // each poll is its own autocommit statement and so reads a fresh pg_stat_activity snapshot.
+        static async Task<long> WaitForInsertWaitersAsync(
+            string connectionString,
+            int holderPid,
+            int expected,
+            TimeSpan limit,
+            CancellationToken cancellationToken)
+        {
+            const string countInsertWaitersSql =
+                "SELECT count(*) FROM pg_stat_activity "
+                + "WHERE datname = current_database() AND pid <> @holderPid AND pid <> pg_backend_pid() "
+                + "AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO \"Guests\"%'";
+            TimeSpan pollInterval = TimeSpan.FromMilliseconds(50);
+
+            await using NpgsqlConnection observer = new(connectionString);
+            await observer.OpenAsync(cancellationToken);
+            await using NpgsqlCommand countWaiters = new(countInsertWaitersSql, observer);
+            countWaiters.Parameters.AddWithValue("holderPid", holderPid);
+
+            Stopwatch elapsed = Stopwatch.StartNew();
+            long count;
+            do
+            {
+                count = (long)(await countWaiters.ExecuteScalarAsync(cancellationToken))!;
+                if (count == expected)
+                {
+                    break;
+                }
+
+                await Task.Delay(pollInterval, cancellationToken);
+            }
+            while (elapsed.Elapsed < limit);
+
+            return count;
+        }
     }
 
     [Fact]
@@ -264,5 +424,211 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         Assert.True(guestId > 0, "Expected guestId to be a positive integer.");
 
         return guestId;
+    }
+
+    [Theory]
+    [InlineData("acknowledgement-lost")]
+    [InlineData("commit-after-check")]
+    public async Task Register_CommitAcknowledgementLost_ReturnsCreatedWithoutSecondGuest(string caseLabel)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        InsertLoss loss = caseLabel switch
+        {
+            "acknowledgement-lost" => InsertLoss.AcknowledgementLost,
+            "commit-after-check" => InsertLoss.CommitAfterCheck,
+            _ => throw new ArgumentOutOfRangeException(nameof(caseLabel), caseLabel, "Unknown acknowledgement case."),
+        };
+        string email = UniqueEmail("lost-ack");
+        LoseGuestInsertAcknowledgement interceptor = new(loss, email, UnpooledConnectionString());
+
+        RegisterResult result = await RegisterLosingFirstInsertAsync(email, interceptor, ct);
+
+        Assert.True(interceptor.FailureReported, "No transient failure was reported for the guest insert.");
+        Assert.Equal(loss == InsertLoss.CommitAfterCheck, interceptor.LateInsertCommitted);
+        RegisterResult.Created created = Assert.IsType<RegisterResult.Created>(result);
+
+        // The committed insert was recognized as this request's own: the result names its row, and no second guest
+        // was stored.
+        List<int> guestIds = await factory.ExecuteDbAsync(
+            (db, token) => db.Guests
+                .AsNoTracking()
+                .Where(g => g.Email == email)
+                .Select(static g => g.Id)
+                .ToListAsync(token),
+            ct);
+        Assert.Equal(created.GuestId, Assert.Single(guestIds));
+    }
+
+    [Fact]
+    public async Task Register_CompetitorTakesEmailWhileLostInsertRetries_ReturnsEmailTaken()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string email = UniqueEmail("lost-ack-race");
+        LoseGuestInsertAcknowledgement interceptor = new(
+            InsertLoss.CompetitorAfterCheck,
+            email,
+            UnpooledConnectionString());
+
+        RegisterResult result = await RegisterLosingFirstInsertAsync(email, interceptor, ct);
+
+        Assert.True(interceptor.FailureReported, "No transient failure was reported for the guest insert.");
+        Assert.True(interceptor.LateInsertCommitted, "The competing registration was not stored.");
+
+        // The retry's insert met a row without this request's hash, so another registration won the race: a transient
+        // failure on the way does not turn that 409 into a 201.
+        Assert.IsType<RegisterResult.EmailTaken>(result);
+
+        List<string> fullNames = await factory.ExecuteDbAsync(
+            (db, token) => db.Guests
+                .AsNoTracking()
+                .Where(g => g.Email == email)
+                .Select(static g => g.FullName)
+                .ToListAsync(token),
+            ct);
+        Assert.Equal(LoseGuestInsertAcknowledgement.CompetitorFullName, Assert.Single(fullNames));
+    }
+
+    // No request can lose an acknowledgement on purpose, so the service runs here on a context of its own, under the
+    // API's retrying strategy, with an interceptor that reports one transient failure for the first guest insert.
+    private async Task<RegisterResult> RegisterLosingFirstInsertAsync(
+        string email,
+        LoseGuestInsertAcknowledgement interceptor,
+        CancellationToken cancellationToken)
+    {
+        DbContextOptions<SmartHotelDbContext> options = new DbContextOptionsBuilder<SmartHotelDbContext>()
+            .UseNpgsql(
+                UnpooledConnectionString(),
+                npgsql => npgsql.EnableRetryOnFailure(3, TimeSpan.FromSeconds(2), errorCodesToAdd: null))
+            .AddInterceptors(interceptor)
+            .Options;
+
+        await using SmartHotelDbContext db = new(options);
+        AuthService service = new(
+            db,
+            factory.Services.GetRequiredService<IPasswordHasher<Guest>>(),
+            factory.Services.GetRequiredService<TokenService>(),
+            TimeProvider.System,
+            NullLogger<AuthService>.Instance);
+        return await service.RegisterAsync(new RegisterRequest(email, ValidPassword, ValidFullName), cancellationToken);
+    }
+
+    // The test's own sessions bypass the pool the API draws from.
+    private string UnpooledConnectionString()
+    {
+        return new NpgsqlConnectionStringBuilder(factory.DatabaseConnectionString) { Pooling = false }
+            .ConnectionString;
+    }
+
+    // How the first attempt's guest insert is lost.
+    private enum InsertLoss
+    {
+        // The insert commits, and the failure is reported before its acknowledgement arrives.
+        AcknowledgementLost,
+
+        // The insert is held back when the failure is reported, and a copy of it commits after the check that follows
+        // the failure, as an insert that the server completes late would.
+        CommitAfterCheck,
+
+        // The insert is held back when the failure is reported and never commits. Another registration of the same
+        // email commits after the check that follows the failure.
+        CompetitorAfterCheck,
+    }
+
+    // Reports one transient failure for the first guest insert, as a connection lost after the server received the
+    // insert would. A late insert, when the case has one, commits on a session of its own just before the next guest
+    // insert is sent.
+    private sealed class LoseGuestInsertAcknowledgement(InsertLoss loss, string email, string connectionString)
+        : DbCommandInterceptor
+    {
+        public const string CompetitorFullName = "Competing Guest";
+
+        // The competitor's hash is never verified, so any text stands in for one.
+        private const string CompetingInsertSql =
+            "INSERT INTO \"Guests\" (\"Email\", \"PasswordHash\", \"FullName\", \"CreatedAt\") "
+            + "VALUES (@email, 'competing-registration', @fullName, now())";
+
+        private int _failed;
+        private int _lateCommitted;
+        private NpgsqlCommand? _lateInsert;
+
+        public bool FailureReported => Volatile.Read(ref _failed) == 1;
+
+        public bool LateInsertCommitted => Volatile.Read(ref _lateCommitted) == 1;
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (loss == InsertLoss.AcknowledgementLost || !IsGuestInsert(command))
+            {
+                return result;
+            }
+
+            if (Interlocked.Exchange(ref _failed, 1) == 0)
+            {
+                // Nothing is sent. What commits later is a copy of this insert or the competitor's.
+                _lateInsert = loss == InsertLoss.CommitAfterCheck
+                    ? ((NpgsqlCommand)command).Clone()
+                    : CompetingInsert();
+                throw ConnectionLost();
+            }
+
+            if (_lateInsert is NpgsqlCommand lateInsert)
+            {
+                _lateInsert = null;
+                await using (lateInsert)
+                {
+                    await using NpgsqlConnection connection = new(connectionString);
+                    await connection.OpenAsync(cancellationToken);
+                    lateInsert.Connection = connection;
+                    await lateInsert.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                Volatile.Write(ref _lateCommitted, 1);
+            }
+
+            return result;
+        }
+
+        public override async ValueTask<DbDataReader> ReaderExecutedAsync(
+            DbCommand command,
+            CommandExecutedEventData eventData,
+            DbDataReader result,
+            CancellationToken cancellationToken = default)
+        {
+            if (loss != InsertLoss.AcknowledgementLost
+                || !IsGuestInsert(command)
+                || Interlocked.Exchange(ref _failed, 1) == 1)
+            {
+                return result;
+            }
+
+            // Closing the reader reads the server's replies to the end of the statement, so the insert's implicit
+            // transaction has committed before the failure is reported.
+            await result.CloseAsync();
+            throw ConnectionLost();
+        }
+
+        private static bool IsGuestInsert(DbCommand command)
+        {
+            return command.CommandText.Contains("INSERT INTO \"Guests\"", StringComparison.Ordinal);
+        }
+
+        private static NpgsqlException ConnectionLost()
+        {
+            return new NpgsqlException(
+                "The connection was lost before the insert was acknowledged.",
+                new IOException("The connection was reset."));
+        }
+
+        private NpgsqlCommand CompetingInsert()
+        {
+            NpgsqlCommand insert = new(CompetingInsertSql);
+            insert.Parameters.AddWithValue("email", email);
+            insert.Parameters.AddWithValue("fullName", CompetitorFullName);
+            return insert;
+        }
     }
 }

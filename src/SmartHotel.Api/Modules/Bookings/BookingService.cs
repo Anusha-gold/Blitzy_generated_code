@@ -71,6 +71,16 @@ public sealed partial class BookingService(
     /// <see cref="CreateBookingResult.NoRoomAvailable"/>; in the second case another room of the type may still be
     /// free. Any other database error propagates.
     /// </para>
+    /// <para>
+    /// The transaction runs as one retriable unit of the context's execution strategy. A transient failure inside it,
+    /// such as a session the database ended, abandons the attempt and runs the whole unit again from the start: a new
+    /// transaction, a new lock and a new free-room query. A commit whose acknowledgement was lost is recognized by its
+    /// booking's row. The check that follows the failure looks for it; so does every retry once it holds the room
+    /// type's lock, which waits for the failed attempt's transaction to end, so a commit that takes effect only after
+    /// that check is found as well. A found booking is the result, and nothing more is inserted, so a retry never
+    /// creates a second booking. A transient failure that outlasts the strategy's retries propagates like any other
+    /// database error.
+    /// </para>
     /// </remarks>
     /// <param name="guestId">The caller's guest id, from the bearer token's <c>sub</c> claim.</param>
     /// <param name="request">
@@ -135,82 +145,155 @@ public sealed partial class BookingService(
             return new CreateBookingResult.CapacityExceeded(roomType.MaxGuests);
         }
 
-        await using IDbContextTransaction transaction =
-            await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
+        // The context's retrying execution strategy rejects a transaction begun outside it, so the transaction runs
+        // inside the strategy as one retriable unit. A transient failure anywhere in an attempt, such as a session the
+        // database ended, abandons the attempt, whose transaction the server then rolls back unless its commit was
+        // already under way, and the next attempt starts again from BEGIN: under a new lock and with a new free-room
+        // query, never with a decision taken under a lock it no longer holds.
+        IExecutionStrategy strategy = db.Database.CreateExecutionStrategy();
+        CreationAttempt attempt = new();
+        CreateBookingResult result = await strategy.ExecuteAsync(
+            attempt,
+            async (state, token) =>
+            {
+                // A failed attempt can leave its booking tracked: Added when its save failed, Unchanged when its
+                // commit did. Detaching it limits this attempt's save to its own insert.
+                if (state.Booking is not null)
+                {
+                    db.Entry(state.Booking).State = EntityState.Detached;
+                    state.Booking = null;
+                }
 
-        // The row lock gives predictable allocation. Concurrent creators for this room type take turns here, and under
-        // READ COMMITTED each one's free-room query then sees every booking committed before it. Among creators that
-        // take this lock, each is therefore given a distinct room, and a 409 from the free-room check below means that
-        // no room of the type was free in that query's snapshot. The lock is not the guarantee against double booking:
-        // EX_Bookings_Room_NoOverlap alone guarantees that, whatever the interleaving. It is also the safety net for a
-        // writer that does not take this lock: when such a writer takes the chosen room first, the constraint rejects
-        // the insert and the catch below returns 409, even though another room of the type may still be free. A
-        // booking row cannot be locked before it exists, so the parent RoomTypes row is locked, and creators for other
-        // room types never wait on it. SERIALIZABLE isolation was rejected because its 40001 failures need
-        // whole-transaction retries, which make "exactly one success for the last room" harder to keep deterministic.
-        // No operator may be composed onto this query: any would wrap the statement in a subquery, and it must reach
-        // PostgreSQL exactly as written.
-        await db.RoomTypes
-            .FromSql($"SELECT * FROM \"RoomTypes\" WHERE \"Id\" = {roomTypeId} FOR UPDATE")
-            .AsNoTracking()
-            .ToListAsync(cancellationToken);
+                await using IDbContextTransaction transaction =
+                    await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, token);
 
-        Room? room = await availability.FindFreeRoomAsync(roomTypeId, period, cancellationToken);
-        if (room is null)
+                // The row lock gives predictable allocation. Concurrent creators for this room type take turns here,
+                // and under READ COMMITTED each one's free-room query then sees every booking committed before it.
+                // Among creators that take this lock, each is therefore given a distinct room, and a 409 from the
+                // free-room check below means that no room of the type was free in that query's snapshot. The lock is
+                // not the guarantee against double booking: EX_Bookings_Room_NoOverlap alone guarantees that, whatever
+                // the interleaving. It is also the safety net for a writer that does not take this lock: when such a
+                // writer takes the chosen room first, the constraint rejects the insert and the catch below returns
+                // 409, even though another room of the type may still be free. A booking row cannot be locked before
+                // it exists, so the parent RoomTypes row is locked, and creators for other room types never wait on
+                // it. SERIALIZABLE isolation was rejected because its 40001 failures need whole-transaction retries,
+                // which make "exactly one success for the last room" harder to keep deterministic.
+                // No operator may be composed onto this query: any would wrap the statement in a subquery, and it must
+                // reach PostgreSQL exactly as written.
+                await db.RoomTypes
+                    .FromSql($"SELECT * FROM \"RoomTypes\" WHERE \"Id\" = {roomTypeId} FOR UPDATE")
+                    .AsNoTracking()
+                    .ToListAsync(token);
+
+                // After a transient failure, the commit of an earlier attempt's saved booking can take effect after
+                // the check that followed the failure, while the server was still completing it. That attempt held
+                // this lock until its transaction ended, so taking the lock waited for it, and this query's snapshot
+                // shows whether the booking was committed. A committed booking is this request's: nothing more is
+                // inserted, and rolling back releases the lock.
+                if (state.FailedTransiently && state.Saved is BookingResponse earlier)
+                {
+                    if (await db.Bookings.AsNoTracking().AnyAsync(b => b.Id == earlier.Id, token))
+                    {
+                        await transaction.RollbackAsync(token);
+                        return new CreateBookingResult.Created(earlier);
+                    }
+
+                    // Its transaction ended without a commit, so its booking can never appear.
+                    state.Saved = null;
+                }
+
+                Room? room = await availability.FindFreeRoomAsync(roomTypeId, period, token);
+                if (room is null)
+                {
+                    await transaction.RollbackAsync(token);
+                    WriteBookingConflict(roomTypeId, period);
+                    return new CreateBookingResult.NoRoomAvailable(roomType.Name, period.CheckIn, period.CheckOut);
+                }
+
+                DateTime createdAt = UtcNowToMicroseconds();
+                Booking booking = new()
+                {
+                    GuestId = guestId,
+                    RoomId = room.Id,
+                    CheckIn = period.CheckIn,
+                    CheckOut = period.CheckOut,
+                    GuestCount = guests,
+                    TotalPrice = PriceCalculator.Total(roomType.NightlyPrice, period.Nights),
+                    Status = BookingStatus.Confirmed,
+                    CreatedAt = createdAt,
+                };
+
+                db.Bookings.Add(booking);
+                state.Booking = booking;
+                try
+                {
+                    await db.SaveChangesAsync(token);
+
+                    // The insert is saved and its id assigned. Should the commit's acknowledgement be lost, the check
+                    // below, or a retry under the lock, finds this booking's row if the commit took effect, and returns
+                    // this response.
+                    BookingResponse saved = new(
+                        booking.Id,
+                        hotelId,
+                        hotelName,
+                        roomTypeId,
+                        roomType.Name,
+                        room.RoomNumber,
+                        period.CheckIn,
+                        period.CheckOut,
+                        period.Nights,
+                        guests,
+                        booking.TotalPrice,
+                        BookingStatus.Confirmed,
+                        createdAt);
+                    state.Saved = saved;
+                    await transaction.CommitAsync(token);
+                    return new CreateBookingResult.Created(saved);
+                }
+                catch (DbUpdateException ex) when (ex.InnerException is PostgresException
+                {
+                    SqlState: PostgresErrorCodes.ExclusionViolation,
+                    ConstraintName: ExclusionConstraintName,
+                })
+                {
+                    // The rejected insert stays tracked as Added; detaching it keeps a later save in this scope from
+                    // retrying it. The transaction now holds nothing worth keeping, and rolling it back releases the
+                    // lock. The violation is not transient, so the strategy never retries it.
+                    db.Entry(booking).State = EntityState.Detached;
+                    state.Booking = null;
+                    await transaction.RollbackAsync(token);
+                    WriteBookingConflict(roomTypeId, period);
+                    return new CreateBookingResult.NoRoomAvailable(roomType.Name, period.CheckIn, period.CheckOut);
+                }
+            },
+            async (state, token) =>
+            {
+                // Runs after a transient failure, before any retry. Only an attempt whose insert was saved can have
+                // committed, and its booking's row exists once that commit has taken effect, whether or not its
+                // acknowledgement arrived. A commit the server is still completing is not visible yet; the retry looks
+                // for its booking again under the lock.
+                state.FailedTransiently = true;
+                BookingResponse? saved = state.Saved;
+                if (saved is not null
+                    && await db.Bookings.AsNoTracking().AnyAsync(b => b.Id == saved.Id, token))
+                {
+                    return new ExecutionResult<CreateBookingResult>(true, new CreateBookingResult.Created(saved));
+                }
+
+                // EF Core discards the result of an unsuccessful check and retries the unit, or rethrows the failure
+                // once no retry is left.
+                return new ExecutionResult<CreateBookingResult>(false, null!);
+            },
+            cancellationToken);
+
+        // Logged once the strategy has returned, so a booking whose commit the check or a retry confirmed is logged
+        // too, and every created booking is logged exactly once, after its commit.
+        if (result is CreateBookingResult.Created created)
         {
-            await transaction.RollbackAsync(cancellationToken);
-            WriteBookingConflict(roomTypeId, period);
-            return new CreateBookingResult.NoRoomAvailable(roomType.Name, period.CheckIn, period.CheckOut);
+            WriteBookingCreated(created.Booking.Id, roomTypeId, period);
         }
 
-        DateTime createdAt = UtcNowToMicroseconds();
-        Booking booking = new()
-        {
-            GuestId = guestId,
-            RoomId = room.Id,
-            CheckIn = period.CheckIn,
-            CheckOut = period.CheckOut,
-            GuestCount = guests,
-            TotalPrice = PriceCalculator.Total(roomType.NightlyPrice, period.Nights),
-            Status = BookingStatus.Confirmed,
-            CreatedAt = createdAt,
-        };
-
-        db.Bookings.Add(booking);
-        try
-        {
-            await db.SaveChangesAsync(cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
-        }
-        catch (DbUpdateException ex) when (ex.InnerException is PostgresException
-        {
-            SqlState: PostgresErrorCodes.ExclusionViolation,
-            ConstraintName: ExclusionConstraintName,
-        })
-        {
-            // The rejected insert stays tracked as Added; detaching it keeps a later save in this scope from
-            // retrying it. The transaction now holds nothing worth keeping, and rolling it back releases the lock.
-            db.Entry(booking).State = EntityState.Detached;
-            await transaction.RollbackAsync(cancellationToken);
-            WriteBookingConflict(roomTypeId, period);
-            return new CreateBookingResult.NoRoomAvailable(roomType.Name, period.CheckIn, period.CheckOut);
-        }
-
-        WriteBookingCreated(booking.Id, roomTypeId, period);
-        return new CreateBookingResult.Created(new BookingResponse(
-            booking.Id,
-            hotelId,
-            hotelName,
-            roomTypeId,
-            roomType.Name,
-            room.RoomNumber,
-            period.CheckIn,
-            period.CheckOut,
-            period.Nights,
-            guests,
-            booking.TotalPrice,
-            BookingStatus.Confirmed,
-            createdAt));
+        return result;
     }
 
     /// <summary>
@@ -265,6 +348,15 @@ public sealed partial class BookingService(
     /// The status changes in one conditional update that only matches a confirmed booking. When it matches nothing, a
     /// concurrent cancellation won, and the result is <see cref="CancelResult.AlreadyCancelled"/>.
     /// </para>
+    /// <para>
+    /// The update runs as one retriable unit of the context's execution strategy, so a transient failure, such as a
+    /// session the database ended, runs it again. An update whose commit took effect although its acknowledgement was
+    /// lost is recognized by the booking's status: once an attempt has failed transiently, a booking found cancelled,
+    /// by the check that follows the failure or by a retry whose update matches nothing, gives
+    /// <see cref="CancelResult.Cancelled"/>. The only other way to that status, a concurrent cancellation of the same
+    /// booking that races the failure, leaves the booking in the same state. A transient failure that outlasts the
+    /// strategy's retries propagates like any other database error.
+    /// </para>
     /// </remarks>
     /// <param name="guestId">The caller's guest id, from the bearer token's <c>sub</c> claim.</param>
     /// <param name="bookingId">The booking's id, from the route.</param>
@@ -302,10 +394,41 @@ public sealed partial class BookingService(
             return new CancelResult.CheckInPassed();
         }
 
-        int affected = await db.Bookings
-            .Where(b => b.Id == bookingId && b.Status == BookingStatus.Confirmed)
-            .ExecuteUpdateAsync(s => s.SetProperty(b => b.Status, BookingStatus.Cancelled), cancellationToken);
-        if (affected == 0)
+        // Left to itself, the context's retrying execution strategy replays the update after a transient failure, and
+        // the replay of an update whose commit took effect matches no row, which would report a concurrent
+        // cancellation. Run as one retriable unit with a check of its own, the committed update is recognized.
+        IExecutionStrategy strategy = db.Database.CreateExecutionStrategy();
+        CancellationAttempt attempt = new();
+        bool cancelled = await strategy.ExecuteAsync(
+            attempt,
+            async (state, token) =>
+            {
+                int affected = await db.Bookings
+                    .Where(b => b.Id == bookingId && b.Status == BookingStatus.Confirmed)
+                    .ExecuteUpdateAsync(s => s.SetProperty(b => b.Status, BookingStatus.Cancelled), token);
+
+                // Outside a transient failure, matching no row means that a concurrent cancellation won. After one,
+                // the booking, which exists and was confirmed, can only have been cancelled since: by an earlier
+                // attempt whose commit took effect after the check that followed the failure, or by a concurrent
+                // cancellation, which leaves the same final state.
+                return affected > 0 || state.FailedTransiently;
+            },
+            async (state, token) =>
+            {
+                // Runs after a transient failure, before any retry. A booking's status only ever moves from Confirmed
+                // to Cancelled, so the update took effect exactly when the booking is now cancelled, whether or not its
+                // acknowledgement arrived. The only other explanation, a concurrent cancellation of the same booking
+                // racing the failure, leaves the same final state. EF Core discards the result of an unsuccessful
+                // check and retries the unit, or rethrows the failure once no retry is left.
+                state.FailedTransiently = true;
+                bool isCancelled = await db.Bookings
+                    .AsNoTracking()
+                    .AnyAsync(b => b.Id == bookingId && b.Status == BookingStatus.Cancelled, token);
+                return new ExecutionResult<bool>(isCancelled, isCancelled);
+            },
+            cancellationToken);
+
+        if (!cancelled)
         {
             return new CancelResult.AlreadyCancelled();
         }
@@ -404,4 +527,30 @@ public sealed partial class BookingService(
         Level = LogLevel.Information,
         Message = "Booking cancelled. BookingId={BookingId}")]
     private static partial void LogBookingCancelled(ILogger logger, int bookingId);
+
+    // What the attempts of the retriable creation unit share, with each other and with the commit check that runs after
+    // a transient failure: the booking the latest one added, the saved booking whose commit can still take effect, and
+    // whether one has failed transiently.
+    private sealed class CreationAttempt
+    {
+        // The booking the latest attempt added, while the context still tracks it.
+        public Booking? Booking { get; set; }
+
+        // The confirmed booking as the response describes it, set once an attempt's insert is saved and before its
+        // commit. Its row exists only if that commit took effect, possibly after the check that followed the failure,
+        // so it is kept until a later attempt, holding the room type's lock, finds that its row does not exist.
+        public BookingResponse? Saved { get; set; }
+
+        // Set by the check that follows a transient failure. From then on an earlier attempt's commit can take effect
+        // although no attempt has seen it acknowledged.
+        public bool FailedTransiently { get; set; }
+    }
+
+    // What the attempts of the retriable cancellation unit share: whether one has failed transiently.
+    private sealed class CancellationAttempt
+    {
+        // Set by the check that follows a transient failure. From then on the update can have taken effect although no
+        // attempt has seen it match the booking.
+        public bool FailedTransiently { get; set; }
+    }
 }

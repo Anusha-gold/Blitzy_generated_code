@@ -60,7 +60,10 @@ public static class ProblemDetailsSetup
     /// The diagnostics wiring adds the HTTP context accessor and
     /// <see cref="ApiExceptionHandler.ServerErrorLogBridge"/> as a log provider, with a filter rule of its own
     /// that lets it receive the Error records of Kestrel's general category, which <c>appsettings.json</c>
-    /// keeps away from every other provider.
+    /// and <see cref="ApiExceptionHandler.FrameworkLogRedaction"/> keep away from every other provider. The
+    /// redaction is registered as a post-configuration of the logger filter options, so it withholds the framework
+    /// records that carry request values or exception text from every provider, whatever log levels the
+    /// configuration sets.
     /// </para>
     /// <para>
     /// <see cref="ApiExceptionHandler.DeveloperPageProblemFilter"/> answers every exception that reaches the
@@ -100,6 +103,13 @@ public static class ProblemDetailsSetup
             options.AddFilter<ApiExceptionHandler.ServerErrorLogBridge>(
                 ApiExceptionHandler.ServerErrorLogBridge.KestrelCategory,
                 LogLevel.Error));
+
+        // A log level is configuration that any source can lower, so it is not a redaction boundary. The redaction
+        // runs after every configured filter rule is in place and keeps the framework records that carry request
+        // values or exception text away from every provider, the bridge alone excepted.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<
+            IPostConfigureOptions<LoggerFilterOptions>,
+            ApiExceptionHandler.FrameworkLogRedaction>());
 
         // In Development the framework's exception page answers what the exception handler could not, and it
         // would publish the exception's message, stack trace and the request headers. The filter writes the

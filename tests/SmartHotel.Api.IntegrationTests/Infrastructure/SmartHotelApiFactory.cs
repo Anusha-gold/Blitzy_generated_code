@@ -1,4 +1,7 @@
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -10,6 +13,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 using Npgsql;
@@ -472,6 +476,57 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     }
 
     /// <summary>
+    /// Creates a factory for a host of its own, with a new database on the same server and a new signing key, whose
+    /// log records also reach <paramref name="capture"/>. Nothing is created or started until
+    /// <see cref="InitializeAsync"/> runs, and the caller disposes the new factory.
+    /// </summary>
+    /// <remarks>
+    /// Each of <paramref name="captureRules"/> becomes a filter rule that names the capture provider, so for the
+    /// categories it covers it outranks every rule that names no provider, <c>appsettings.json</c>'s included. Every
+    /// other category reaches the capture at the host's configured level, as it reaches the console.
+    /// </remarks>
+    /// <param name="capture">The provider that keeps the new host's records.</param>
+    /// <param name="captureRules">
+    /// Category names or prefixes, each with the lowest level the capture receives for it.
+    /// </param>
+    /// <param name="additionalOverrides">
+    /// Further service replacements, applied after the capture and its rules are registered, or
+    /// <see langword="null"/>.
+    /// </param>
+    /// <returns>The new factory, not yet started.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="capture"/> or <paramref name="captureRules"/> is <see langword="null"/>.
+    /// </exception>
+    public SmartHotelApiFactory CreateLogCaptureVariant(
+        LogCapture capture,
+        IReadOnlyList<(string Category, LogLevel Level)> captureRules,
+        Action<IServiceCollection>? additionalOverrides)
+    {
+        ArgumentNullException.ThrowIfNull(capture);
+        ArgumentNullException.ThrowIfNull(captureRules);
+
+        // Copied now, so a later change to the caller's list cannot alter the host it builds.
+        (string Category, LogLevel Level)[] rules = [.. captureRules];
+
+        return new SmartHotelApiFactory(_postgres)
+        {
+            ServiceOverrides = services =>
+            {
+                services.AddSingleton<ILoggerProvider>(capture);
+                services.Configure<LoggerFilterOptions>(options =>
+                {
+                    foreach ((string category, LogLevel level) in rules)
+                    {
+                        options.AddFilter<LogCapture>(category, level);
+                    }
+                });
+
+                additionalOverrides?.Invoke(services);
+            },
+        };
+    }
+
+    /// <summary>
     /// Records the host builder, from which <see cref="StartLoopbackListenerAsync"/> builds the listener, then builds
     /// and starts the in-process host as the base class does.
     /// </summary>
@@ -598,6 +653,208 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// <param name="Id">The room's id, the <c>RoomId</c> of its bookings.</param>
     /// <param name="RoomNumber">The room's number, unique within its hotel, such as <c>101</c>.</param>
     public sealed record SeededRoom(int Id, string RoomNumber);
+
+    /// <summary>
+    /// One record as <see cref="LogCapture"/> received it, rendered when it was written.
+    /// </summary>
+    /// <param name="Category">The logger's category.</param>
+    /// <param name="Level">The record's level.</param>
+    /// <param name="EventId">The record's numeric event id.</param>
+    /// <param name="Message">The formatted message.</param>
+    /// <param name="Text">The formatted message followed by every state value, the exception and the scopes.</param>
+    /// <param name="Scopes">The scopes the provider saw around the record.</param>
+    /// <param name="HasException">Whether the record carried an exception.</param>
+    public sealed record CapturedLog(
+        string Category,
+        LogLevel Level,
+        int EventId,
+        string Message,
+        string Text,
+        string Scopes,
+        bool HasException)
+    {
+        /// <summary>
+        /// Names the record by its level, category and event id only, so an assertion that prints it never repeats a
+        /// logged value.
+        /// </summary>
+        /// <returns>
+        /// The level, category and event id, such as <c>Warning SmartHotel.Api.Modules.Auth.AuthService[1002]</c>.
+        /// </returns>
+        public override string ToString()
+        {
+            return string.Create(CultureInfo.InvariantCulture, $"{Level} {Category}[{EventId}]");
+        }
+    }
+
+    /// <summary>
+    /// A log provider that keeps every record it receives, in arrival order, as a console provider configured to show
+    /// everything would print it: the message, every state value, the exception and the scopes.
+    /// </summary>
+    /// <remarks>
+    /// Records are only ever added, so a <see cref="Count"/> read before an action marks where that action's records
+    /// begin. The provider keeps recording after the host disposes it, so the records a stopping host writes are kept
+    /// too. Configuration names it by <see cref="Alias"/>, as <c>Logging:Console</c> names the console provider. Every
+    /// member is safe to call concurrently.
+    /// </remarks>
+    [ProviderAlias(Alias)]
+    public sealed class LogCapture : ILoggerProvider, ISupportExternalScope
+    {
+        /// <summary>
+        /// The name configuration addresses this provider by, as in <c>LogCapture:LogLevel:Default</c>.
+        /// </summary>
+        public const string Alias = "LogCapture";
+
+        private readonly ConcurrentQueue<CapturedLog> _records = new();
+        private IExternalScopeProvider? _scopeProvider;
+
+        /// <summary>
+        /// Capture rules that admit EF Core's categories at every level and the application's from Information,
+        /// whatever <c>appsettings.json</c> sets for them, so the data layer and the API's own records are held to
+        /// their outcomes at any verbosity.
+        /// </summary>
+        public static IReadOnlyList<(string Category, LogLevel Level)> DataLayerRules { get; } =
+        [
+            ("Microsoft.EntityFrameworkCore", LogLevel.Trace),
+            ("SmartHotel", LogLevel.Information),
+        ];
+
+        /// <summary>
+        /// The number of records received so far.
+        /// </summary>
+        public int Count => _records.Count;
+
+        /// <summary>
+        /// Every record received so far, in arrival order.
+        /// </summary>
+        public IReadOnlyList<CapturedLog> Records => [.. _records];
+
+        /// <summary>
+        /// Fails the test when any of <paramref name="records"/> matches <paramref name="forbidden"/>, naming each
+        /// distinct match by its level, category and event id only, never by its text.
+        /// </summary>
+        /// <param name="records">The records to check.</param>
+        /// <param name="forbidden">Selects the records that must not exist.</param>
+        /// <param name="description">What the forbidden records are, completing "Expected no ...".</param>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name="records"/> or <paramref name="forbidden"/> is <see langword="null"/>.
+        /// </exception>
+        public static void AssertNone(
+            IEnumerable<CapturedLog> records,
+            Func<CapturedLog, bool> forbidden,
+            string description)
+        {
+            ArgumentNullException.ThrowIfNull(records);
+            ArgumentNullException.ThrowIfNull(forbidden);
+
+            string[] offending =
+            [
+                .. records
+                    .Where(forbidden)
+                    .Select(static record => record.ToString())
+                    .Distinct(StringComparer.Ordinal),
+            ];
+            if (offending.Length > 0)
+            {
+                Assert.Fail($"Expected no {description}, but found: {string.Join("; ", offending)}.");
+            }
+        }
+
+        /// <summary>
+        /// Returns the records received after the first <paramref name="mark"/> ones, in arrival order.
+        /// </summary>
+        /// <param name="mark">A <see cref="Count"/> read earlier.</param>
+        /// <returns>The records written since that count was read.</returns>
+        public IReadOnlyList<CapturedLog> Since(int mark)
+        {
+            // The queue enumerates a snapshot in arrival order, so the records from mark on are those written after it.
+            return [.. _records.Skip(mark)];
+        }
+
+        /// <summary>
+        /// Creates the logger that keeps the records of one category.
+        /// </summary>
+        /// <param name="categoryName">The category the logger factory asks for.</param>
+        /// <returns>The capturing logger for <paramref name="categoryName"/>.</returns>
+        public ILogger CreateLogger(string categoryName)
+        {
+            return new CapturingLogger(this, categoryName);
+        }
+
+        /// <summary>
+        /// Receives the logger factory's scope provider, from which the scopes around each record are read.
+        /// </summary>
+        /// <param name="scopeProvider">The factory's scope provider.</param>
+        public void SetScopeProvider(IExternalScopeProvider scopeProvider)
+        {
+            Volatile.Write(ref _scopeProvider, scopeProvider);
+        }
+
+        /// <summary>
+        /// Does nothing: the records stay readable, and later records are still kept, after the host disposes its
+        /// providers.
+        /// </summary>
+        public void Dispose()
+        {
+        }
+
+        private sealed class CapturingLogger(LogCapture provider, string categoryName) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull
+            {
+                return Volatile.Read(ref provider._scopeProvider)?.Push(state);
+            }
+
+            // The logger factory has already applied the filter rules, so every level that reaches here is kept.
+            public bool IsEnabled(LogLevel logLevel)
+            {
+                return logLevel != LogLevel.None;
+            }
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                ArgumentNullException.ThrowIfNull(formatter);
+
+                string message = formatter(state, exception);
+                StringBuilder text = new(message);
+                if (state is IEnumerable<KeyValuePair<string, object?>> values)
+                {
+                    foreach (KeyValuePair<string, object?> value in values)
+                    {
+                        text.Append(" | ").Append(value.Key).Append('=')
+                            .Append(Convert.ToString(value.Value, CultureInfo.InvariantCulture));
+                    }
+                }
+
+                if (exception is not null)
+                {
+                    text.Append(" | ").Append(exception);
+                }
+
+                StringBuilder scopes = new();
+                Volatile.Read(ref provider._scopeProvider)?.ForEachScope(
+                    static (scope, builder) => builder
+                        .Append(Convert.ToString(scope, CultureInfo.InvariantCulture))
+                        .Append(" => "),
+                    scopes);
+                text.Append(" | ").Append(scopes);
+
+                provider._records.Enqueue(new CapturedLog(
+                    categoryName,
+                    logLevel,
+                    eventId.Id,
+                    message,
+                    text.ToString(),
+                    scopes.ToString(),
+                    exception is not null));
+            }
+        }
+    }
 
     // A class rather than a record: a record's synthesized ToString would print the credentials.
     private sealed class TestSecretSource(string databaseConnectionString, string jwtSigningKey) : ISecretSource

@@ -6,7 +6,9 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Hosting;
@@ -16,13 +18,20 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.Server.Kestrel;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+
+using Npgsql;
 
 using SmartHotel.Api.Infrastructure;
 using SmartHotel.Api.IntegrationTests.Infrastructure;
+using SmartHotel.Api.Modules.Auth;
 
 namespace SmartHotel.Api.IntegrationTests.Http;
 
@@ -31,13 +40,25 @@ namespace SmartHotel.Api.IntegrationTests.Http;
 /// whose <c>Accept</c> header admits no JSON, an unhandled exception, the 400 for input that fails model binding,
 /// and a plaintext request refused outside Development. Each must still be an <c>application/problem+json</c>
 /// document that keeps its protocol headers and carries no exception data. A binding 400 also keys its errors only
-/// by contract names and JSON paths, and echoes no request text.
+/// by contract names and JSON paths, and echoes no request text. The log records behind those responses are held to the
+/// same rule: whatever log levels configuration sets, no record that reaches a log provider carries a request value, a
+/// header value, a credential, an exception's text, or the name of the database or its server, while every other record
+/// still follows the configured levels.
 /// </summary>
 /// <remarks>
+/// <para>
+/// The logging tests each host their own API with a <see cref="SmartHotelApiFactory.LogCapture"/> that keeps every
+/// record it receives. The raised-verbosity hosts are configured the way any configuration source can raise them:
+/// provider-less and provider-specific <c>Default</c> rules at <c>Trace</c>, longer category and wildcard rules at
+/// <c>Trace</c>, scope capture on, and a code rule and minimum level at <c>Trace</c>. Failure messages name records by
+/// level, category and event id only, never by their text.
+/// </para>
+/// <para>
 /// The server's own rejections, of a malformed request before any middleware runs and of a body over its size limit,
 /// are sent over TCP to the fixture's loopback listener, because the in-process server parses no request bytes.
+/// </para>
 /// </remarks>
-public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFactory>
+public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFactory>
 {
     private const string ProblemMediaType = "application/problem+json";
     private const string JsonMediaType = "application/json";
@@ -71,6 +92,95 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
     private const string RegisterFullNameNumberScenario = "register-full-name-number";
     private const string LoginEmptyBodyScenario = "login-empty-body";
     private const string BookingHotelIdStringScenario = "booking-hotel-id-string";
+
+    private const string AuthFaultHeader = "X-Redaction-Test-Auth-Fault";
+    private const string KestrelCategory = "Microsoft.AspNetCore.Server.Kestrel";
+    private const string EndpointMiddlewareCategory = "Microsoft.AspNetCore.Routing.EndpointMiddleware";
+    private const string JwtBearerCategory = "Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerHandler";
+    private const string ActionInvokerCategory = "Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker";
+    private const string HostCategory = "Microsoft.Extensions.Hosting.Internal.Host";
+
+    // The configuration lets this category through only from Warning, so its unredacted Trace level shows that
+    // configuration still quiets a category the redaction covers. The in-process test server never writes to it.
+    private const string QuietedCategory = "Microsoft.AspNetCore.Server.Kestrel.Http2";
+    private const LogLevel QuietedFloor = LogLevel.Warning;
+
+    // ApiExceptionHandler's sanitized UnhandledException, and Kestrel's ApplicationError, which the bridge translates.
+    private const int UnhandledExceptionEventId = 5000;
+    private const int KestrelApplicationErrorEventId = 13;
+    private const string KestrelApplicationErrorEventName = "ApplicationError";
+
+    // AuthService's GuestRegistered and DatabaseInitializer's SeedInserted.
+    private const int GuestRegisteredEventId = 1001;
+    private const int SeedInsertedEventId = 5103;
+
+    // Fixed, non-secret values for throwaway guests in a variant host's own test database.
+    private const string ValidPassword = "Passw0rd!x";
+    private const string ValidFullName = "Test Guest";
+
+    // NpgsqlConnection.DataSource, the server EF Core's connection records would name, has the form tcp://host:port.
+    private const string ServerAddressScheme = "tcp://";
+
+    // EF Core's command records show each parameter as this placeholder while sensitive-data logging is off.
+    private const string ParameterPlaceholder = "='?'";
+
+    private const string AbsentDatabaseSuffix = "_absent";
+
+    private static readonly EventId ProbeEvent = new(9_901, "RedactionProbe");
+    private static readonly string ExceptionHandlerCategory = typeof(ApiExceptionHandler).FullName!;
+    private static readonly string AuthServiceCategory = typeof(AuthService).FullName!;
+    private static readonly string DatabaseInitializerCategory = typeof(DatabaseInitializer).FullName!;
+
+    private static readonly LogLevel[] RecordLevels =
+    [
+        LogLevel.Trace,
+        LogLevel.Debug,
+        LogLevel.Information,
+        LogLevel.Warning,
+        LogLevel.Error,
+        LogLevel.Critical,
+    ];
+
+    // The levels of each category that carry request values or exception text in ASP.NET Core 8.0.34 and its generic
+    // host; every other level of these categories carries only fixed text, type and endpoint names, or
+    // server-generated identifiers.
+    private static readonly (string Category, LogLevel[] Levels)[] RedactedLevels =
+    [
+        (HostCategory, [LogLevel.Debug, LogLevel.Error, LogLevel.Critical]),
+        ("Microsoft.Extensions.Hosting.Internal.ApplicationLifetime", [LogLevel.Critical]),
+        ("Microsoft.AspNetCore.Hosting.Diagnostics", [LogLevel.Information]),
+        ("Microsoft.AspNetCore.HostFiltering.HostFilteringMiddleware", [LogLevel.Trace, LogLevel.Information]),
+        ("Microsoft.AspNetCore.HttpsPolicy.HttpsRedirectionMiddleware", [LogLevel.Debug]),
+        (KestrelCategory, [LogLevel.Trace, LogLevel.Information, LogLevel.Warning, LogLevel.Error, LogLevel.Critical]),
+        ("Microsoft.AspNetCore.Server.Kestrel.BadRequests", [LogLevel.Debug]),
+        (QuietedCategory, [LogLevel.Debug, LogLevel.Information, LogLevel.Critical]),
+        ("Microsoft.AspNetCore.Server.Kestrel.Http3", [LogLevel.Debug, LogLevel.Information]),
+        ("Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets", [LogLevel.Debug]),
+        ("Microsoft.AspNetCore.Server.Kestrel.Https.Internal.HttpsConnectionMiddleware", [LogLevel.Debug]),
+        ("Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware", [LogLevel.Error]),
+        ("Microsoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddleware", [LogLevel.Error]),
+        ("Microsoft.AspNetCore.Cors.Infrastructure.CorsService", [LogLevel.Debug, LogLevel.Information]),
+        ("Microsoft.AspNetCore.Cors.Infrastructure.CorsMiddleware", [LogLevel.Warning]),
+        ("Microsoft.AspNetCore.Routing.Matching.DfaMatcher", [LogLevel.Debug]),
+        ("Microsoft.AspNetCore.Routing.DefaultLinkParser", [LogLevel.Debug]),
+        (JwtBearerCategory, [LogLevel.Information, LogLevel.Error]),
+        ("Microsoft.AspNetCore.Mvc.Formatters.SystemTextJsonInputFormatter", [LogLevel.Debug]),
+        ("Microsoft.AspNetCore.Mvc.ModelBinding.Binders.BodyModelBinder", [LogLevel.Debug]),
+        ("Microsoft.AspNetCore.Mvc.Infrastructure.DefaultOutputFormatterSelector", [LogLevel.Debug]),
+        (ActionInvokerCategory, [LogLevel.Trace]),
+    ];
+
+    // Categories whose records carry no request values; configuration alone decides their levels.
+    private static readonly string[] UnredactedCategories =
+    [
+        "Microsoft.Hosting.Lifetime",
+        "Microsoft.AspNetCore.Server.Kestrel.Connections",
+        "Microsoft.AspNetCore.HttpsPolicy.HstsMiddleware",
+        EndpointMiddlewareCategory,
+        "Microsoft.AspNetCore.Authorization.DefaultAuthorizationService",
+        "Microsoft.EntityFrameworkCore.Database.Command",
+        "SmartHotel.Api.Modules.Auth.AuthService",
+    ];
 
     private const string PlainOptionsScenario = "plain-options";
     private const string AllowedOriginPreflightScenario = "allowed-origin-preflight";
@@ -106,6 +216,9 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
 
     private readonly SmartHotelApiFactory _factory;
     private readonly TestPostgres _postgres;
+
+    // A unique value per test, placed in every request value and exception the logging tests control.
+    private readonly string _marker = "rdx" + Guid.NewGuid().ToString("N");
 
     public ProblemDetailsContractTests(SmartHotelApiFactory factory, TestPostgres postgres)
     {
@@ -315,7 +428,7 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
 
-        ThrowingTimeProvider clock = new();
+        ThrowingTimeProvider clock = new(SecretMarker);
         await using SmartHotelApiFactory variant = new(_postgres)
         {
             ServiceOverrides = services =>
@@ -379,6 +492,392 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
             // Disarmed before the variant is disposed, so the host's shutdown never meets a throwing clock.
             clock.Disarm();
         }
+    }
+
+    // Each request carries the marker where the framework would log it: the query string, the path, a route value, a
+    // JSON property name, the Content-Type, Accept, Origin and CORS request headers, the credentials, bearer tokens,
+    // and the messages of an unexpected authentication failure and an unhandled exception.
+    [Fact]
+    public async Task RaisedVerbosity_RequestsCarryingMarkedValues_LeaveNoValueOrExceptionTextInAnyRecord()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        SmartHotelApiFactory.LogCapture capture = new();
+        ThrowingTimeProvider clock = new(_marker + " clock fault");
+        await using SmartHotelApiFactory variant = CreateRaisedVerbosityVariant(capture, services =>
+        {
+            services.RemoveAll<TimeProvider>();
+            services.AddSingleton<TimeProvider>(clock);
+
+            // An unexpected authentication failure: the bearer handler's first event throws for a request that asks
+            // for it, so the handler logs its processing failure and rethrows.
+            services.PostConfigure<JwtBearerOptions>(
+                JwtBearerDefaults.AuthenticationScheme,
+                options => options.Events = new JwtBearerEvents
+                {
+                    OnMessageReceived = context => context.Request.Headers.ContainsKey(AuthFaultHeader)
+                        ? throw new InvalidOperationException(_marker + " authentication fault")
+                        : Task.CompletedTask,
+                });
+        });
+
+        // A hand-built factory is not a fixture, so it is started here.
+        await variant.InitializeAsync();
+        ApiTestClient client = variant.CreateApiClient();
+        string checkIn = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(30));
+        string checkOut = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(32));
+        string password = _marker + "-password";
+
+        await ExpectStatusAsync(
+            HttpStatusCode.OK,
+            client.SearchAsync(_marker, checkIn, checkOut, "2", ct));
+        await ExpectStatusAsync(
+            HttpStatusCode.NotFound,
+            client.Http.GetAsync($"/api/{_marker}?q={_marker}", ct));
+        await ExpectStatusAsync(
+            HttpStatusCode.NotFound,
+            client.Http.GetAsync($"/api/hotels/{_marker}", ct));
+        await ExpectStatusAsync(
+            HttpStatusCode.BadRequest,
+            client.Http.PostAsync(
+                "/api/auth/login",
+                new StringContent($"{{\"{_marker}\": nul", Encoding.UTF8, "application/json"),
+                ct));
+        await ExpectStatusAsync(
+            HttpStatusCode.UnsupportedMediaType,
+            client.Http.PostAsync(
+                "/api/auth/login",
+                new StringContent("{}", Encoding.UTF8, $"text/x-{_marker}"),
+                ct));
+
+        // A zero-night stay, so the 400 problem is negotiated against an Accept header that admits no JSON, from an
+        // origin the CORS policy rejects.
+        using (HttpRequestMessage request = new(
+            HttpMethod.Get,
+            $"/api/hotels?city=Seattle&checkIn={checkIn}&checkOut={checkIn}&guests=2"))
+        {
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue($"application/x-{_marker}"));
+            request.Headers.TryAddWithoutValidation("Origin", $"http://{_marker}.test");
+            await ExpectStatusAsync(HttpStatusCode.BadRequest, client.Http.SendAsync(request, ct));
+        }
+
+        // A preflight from the allowed origin that asks for a header the policy does not allow.
+        using (HttpRequestMessage preflight = new(HttpMethod.Options, "/api/hotels"))
+        {
+            preflight.Headers.TryAddWithoutValidation("Origin", variant.AllowedOrigin);
+            preflight.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "GET");
+            preflight.Headers.TryAddWithoutValidation("Access-Control-Request-Headers", $"x-{_marker}");
+            await ExpectStatusAsync(HttpStatusCode.NoContent, client.Http.SendAsync(preflight, ct));
+        }
+
+        // A preflight from the allowed origin for a path that carries the marker: before the CORS policy answers it,
+        // the readiness preflight check parses that path against the readiness route.
+        using (HttpRequestMessage preflight = new(HttpMethod.Options, $"/api/{_marker}"))
+        {
+            preflight.Headers.TryAddWithoutValidation("Origin", variant.AllowedOrigin);
+            preflight.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "POST");
+            await ExpectStatusAsync(HttpStatusCode.NoContent, client.Http.SendAsync(preflight, ct));
+        }
+
+        string email = _marker + "@example.test";
+        await ExpectStatusAsync(
+            HttpStatusCode.Created,
+            client.RegisterAsync(new { email, password, fullName = _marker }, ct));
+        await ExpectStatusAsync(
+            HttpStatusCode.Unauthorized,
+            client.LoginAsync(new { email, password = password + "-wrong" }, ct));
+        await ExpectStatusAsync(HttpStatusCode.Unauthorized, client.ListBookingsAsync(_marker, ct));
+        await ExpectStatusAsync(
+            HttpStatusCode.Unauthorized,
+            client.ListBookingsAsync($"{_marker}.{_marker}.{_marker}", ct));
+
+        using (HttpRequestMessage faulted = new(HttpMethod.Get, "/api/bookings"))
+        {
+            faulted.Headers.TryAddWithoutValidation(AuthFaultHeader, "1");
+            using HttpResponseMessage response = await client.Http.SendAsync(faulted, ct);
+            await AssertServerErrorWithW3CTraceIdAsync(response, ct);
+        }
+
+        // The dates are valid, so only the controller's clock read fails, with the marker as its message.
+        clock.Arm();
+        try
+        {
+            using HttpResponseMessage response = await client.SearchAsync("Seattle", checkIn, checkOut, "2", ct);
+            await AssertServerErrorWithW3CTraceIdAsync(response, ct);
+        }
+        finally
+        {
+            // Disarmed before the host stops, so the shutdown never meets a throwing clock.
+            clock.Disarm();
+        }
+
+        // Stopping the host completes every request, so each record a request writes once its response is sent, such
+        // as the request-finished record, has arrived before the records are read.
+        await variant.DisposeAsync();
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Records;
+
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            record => record.Text.Contains(_marker, StringComparison.OrdinalIgnoreCase),
+            "record carrying the marker");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => record.HasException,
+            "record carrying an exception");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => IdentityModelMessage().IsMatch(record.Text),
+            "record carrying a token-validation message");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => record.Scopes.Contains("RequestPath", StringComparison.Ordinal),
+            "record carrying the request path scope");
+
+        // Both failures are recorded once, as the sanitized event.
+        SmartHotelApiFactory.CapturedLog[] sanitized =
+        [
+            .. records.Where(static record =>
+                record.Category == ExceptionHandlerCategory && record.EventId == UnhandledExceptionEventId),
+        ];
+        Assert.Equal(2, sanitized.Length);
+        Assert.All(sanitized, static record => Assert.Equal(LogLevel.Error, record.Level));
+
+        // Configuration still raises what carries no values: the endpoint records, the action invoker's Information
+        // records beside its withheld Trace ones, and the bearer handler's Debug records beside its withheld
+        // Information and Error ones.
+        Assert.Contains(
+            records,
+            static record => record.Category == EndpointMiddlewareCategory && record.Level == LogLevel.Information);
+        Assert.Contains(
+            records,
+            static record => record.Category == ActionInvokerCategory && record.Level == LogLevel.Information);
+        Assert.Contains(
+            records,
+            static record => record.Category == JwtBearerCategory && record.Level == LogLevel.Debug);
+    }
+
+    // Covers every category of the inventory, Kestrel's included, which the in-process test server never uses: each
+    // level is written once with the marker in its message and exception, and only the levels that are neither redacted
+    // nor below the configured level arrive. Kestrel's unhandled-exception report arrives only as the sanitized event,
+    // and no scope is captured.
+    [Fact]
+    public async Task RaisedVerbosity_RedactedLevelsReachNoProvider_WhileConfigurationDecidesTheRest()
+    {
+        SmartHotelApiFactory.LogCapture capture = new();
+        await using SmartHotelApiFactory variant = CreateRaisedVerbosityVariant(capture, additionalOverrides: null);
+        await variant.InitializeAsync();
+        ILoggerFactory loggerFactory = variant.Services.GetRequiredService<ILoggerFactory>();
+
+        List<string> mismatches = [];
+        foreach ((string category, LogLevel[] redacted) in RedactedLevels)
+        {
+            LogLevel floor = category == QuietedCategory ? QuietedFloor : LogLevel.Trace;
+            CheckLevels(category, level => level >= floor && !redacted.Contains(level));
+        }
+
+        foreach (string category in UnredactedCategories)
+        {
+            CheckLevels(category, static _ => true);
+        }
+
+        if (mismatches.Count > 0)
+        {
+            Assert.Fail("Unexpected delivery for: " + string.Join("; ", mismatches) + ".");
+        }
+
+        // Kestrel reports an unhandled exception as its ApplicationError record. Only the bridge receives it, and it
+        // writes the sanitized event instead.
+        int mark = capture.Count;
+        ILogger kestrel = loggerFactory.CreateLogger(KestrelCategory);
+        kestrel.Log(
+            LogLevel.Error,
+            new EventId(KestrelApplicationErrorEventId, KestrelApplicationErrorEventName),
+            _marker,
+            new InvalidOperationException(_marker),
+            static (state, _) => state);
+
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> reported = capture.Since(mark);
+        Assert.DoesNotContain(reported, static record => record.Category == KestrelCategory);
+        SmartHotelApiFactory.CapturedLog sanitized = Assert.Single(
+            reported,
+            static record => record.Category == ExceptionHandlerCategory);
+        Assert.Equal(UnhandledExceptionEventId, sanitized.EventId);
+        Assert.Equal(LogLevel.Error, sanitized.Level);
+        Assert.False(sanitized.HasException, "The sanitized event must not carry the exception.");
+        Assert.DoesNotContain(_marker, sanitized.Text, StringComparison.OrdinalIgnoreCase);
+
+        // A scope opened around a record never reaches the provider.
+        mark = capture.Count;
+        ILogger endpoint = loggerFactory.CreateLogger(EndpointMiddlewareCategory);
+        using (endpoint.BeginScope(_marker))
+        {
+            endpoint.Log(LogLevel.Information, ProbeEvent, "scoped", exception: null, static (state, _) => state);
+        }
+
+        SmartHotelApiFactory.CapturedLog scoped = Assert.Single(
+            capture.Since(mark),
+            static record => record.Category == EndpointMiddlewareCategory && record.EventId == ProbeEvent.Id);
+        Assert.DoesNotContain(_marker, scoped.Scopes, StringComparison.OrdinalIgnoreCase);
+
+        void CheckLevels(string category, Func<LogLevel, bool> delivered)
+        {
+            ILogger logger = loggerFactory.CreateLogger(category);
+            foreach (LogLevel level in RecordLevels)
+            {
+                int before = capture.Count;
+                logger.Log(
+                    level,
+                    ProbeEvent,
+                    _marker,
+                    new InvalidOperationException(_marker),
+                    static (state, _) => state);
+                bool arrived = capture.Since(before).Any(record =>
+                    record.Category == category && record.Level == level && record.EventId == ProbeEvent.Id);
+                if (arrived != delivered(level))
+                {
+                    mismatches.Add(string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"{category} at {level} {(arrived ? "arrived" : "was withheld")}"));
+                }
+            }
+        }
+    }
+
+    // A hosted service that fails to start stands for a server that cannot bind its configured address: the generic
+    // host reports the failure, with its exception, at Error, which the default configuration admits. No record that
+    // reaches a provider carries the exception or its text, and the failure still stops the host from starting.
+    [Fact]
+    public async Task HostedServiceFailsToStart_StartupFailsWithoutExceptionTextInAnyRecord()
+    {
+        SmartHotelApiFactory.LogCapture capture = new();
+        FailingStartup startup = new(_marker + " startup fault");
+        await using SmartHotelApiFactory variant = _factory.CreateLogCaptureVariant(
+            capture,
+            [],
+            services => services.AddHostedService(_ => startup));
+
+        // The host's start fails on the hosted service's exception, so the factory never serves a request. The
+        // factory reports the failure by its exception types alone, so its message carries no marker either.
+        InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await variant.InitializeAsync());
+        Assert.True(startup.Started, "The failing hosted service was never started.");
+        Assert.StartsWith("Starting the API host failed.", failure.Message, StringComparison.Ordinal);
+        Assert.False(
+            failure.Message.Contains(_marker, StringComparison.Ordinal),
+            "Expected the factory's failure message not to carry the hosted service's exception text.");
+
+        // The seed record shows that the capture received the host's records at the configured levels.
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Records;
+        Assert.Contains(
+            records,
+            static record => record.Category == DatabaseInitializerCategory && record.EventId == SeedInsertedEventId);
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => record.Category == HostCategory && record.Level >= LogLevel.Error,
+            "host failure record");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            record => record.Text.Contains(_marker, StringComparison.OrdinalIgnoreCase),
+            "record carrying the marker");
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            static record => record.HasException,
+            "record carrying an exception");
+    }
+
+    // Once the variant host has started, its secret source names a database that does not exist on the same server,
+    // so the search's connection is refused while it is being opened (3D000). That refusal is not transient, so no
+    // retry delays it, and it reaches the exception handler as an outage does once its retries are spent.
+    [Fact]
+    public async Task Search_DatabaseConnectionFails_Returns500WithOnlyTheSanitizedErrorRecord()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        SmartHotelApiFactory.LogCapture capture = new();
+        DatabaseRedirect redirect = new();
+        await using SmartHotelApiFactory variant = _factory.CreateLogCaptureVariant(
+            capture,
+            SmartHotelApiFactory.LogCapture.DataLayerRules,
+            redirect.Install);
+        await variant.InitializeAsync();
+        ApiTestClient client = variant.CreateApiClient();
+        string absentDatabase = variant.DatabaseName + AbsentDatabaseSuffix;
+
+        // The dates come from the real clock, so the query passes validation and the request reaches the database.
+        string checkIn = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(30));
+        string checkOut = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(32));
+
+        redirect.Arm();
+        int mark = capture.Count;
+        using HttpResponseMessage response = await client.SearchAsync("Seattle", checkIn, checkOut, "2", ct);
+
+        await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.InternalServerError,
+            cancellationToken: ct);
+
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Since(mark);
+        SmartHotelApiFactory.CapturedLog error = Assert.Single(
+            records,
+            static record => record.Level >= LogLevel.Warning);
+        Assert.Equal(LogLevel.Error, error.Level);
+        Assert.Equal(ExceptionHandlerCategory, error.Category);
+        Assert.Equal(UnhandledExceptionEventId, error.EventId);
+        Assert.Contains("SqlState=" + PostgresErrorCodes.InvalidCatalogName, error.Message, StringComparison.Ordinal);
+
+        // No record, at any level, names the database or the server it was reached on.
+        AssertNoRecordNamesTheDatabaseOrServer(records, absentDatabase);
+    }
+
+    // EF Core's categories reach the provider at every level, so the startup migration and seed, a search and a
+    // registration, which together open, read, close and dispose connections, would leave any record that names the
+    // database or the server whatever level the host's configuration admits. The connection category's own Debug
+    // records and the command records with their placeholders arrive, so the capture reaches the levels such records
+    // are written at.
+    [Fact]
+    public async Task StartupSearchAndRegister_AtEveryLevel_LeaveNoRecordNamingTheDatabaseOrServer()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        SmartHotelApiFactory.LogCapture capture = new();
+        await using SmartHotelApiFactory variant = _factory.CreateLogCaptureVariant(
+            capture,
+            SmartHotelApiFactory.LogCapture.DataLayerRules,
+            additionalOverrides: null);
+        await variant.InitializeAsync();
+        ApiTestClient client = variant.CreateApiClient();
+        string checkIn = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(30));
+        string checkOut = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(32));
+        string email = $"trace+{Guid.NewGuid():N}@example.test";
+
+        using HttpResponseMessage search = await client.SearchAsync("Seattle", checkIn, checkOut, "2", ct);
+        Assert.Equal(HttpStatusCode.OK, search.StatusCode);
+
+        using HttpResponseMessage register = await client.RegisterAsync(
+            new { email, password = ValidPassword, fullName = ValidFullName },
+            ct);
+        Assert.Equal(HttpStatusCode.Created, register.StatusCode);
+
+        // Every record from the host's start on, its migration and seed included.
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> records = capture.Since(0);
+        Assert.Contains(
+            records,
+            static record => record.Category == DbLoggerCategory.Migrations.Name
+                && record.EventId == RelationalEventId.MigrationApplying.Id);
+        Assert.Contains(
+            records,
+            static record => record.Category == DatabaseInitializerCategory && record.EventId == SeedInsertedEventId);
+        Assert.Contains(
+            records,
+            static record => record.Category == DbLoggerCategory.Database.Connection.Name
+                && record.Level == LogLevel.Debug);
+        Assert.Contains(
+            records,
+            static record => record.Category == DbLoggerCategory.Database.Command.Name
+                && record.EventId == RelationalEventId.CommandExecuted.Id
+                && record.Message.Contains(ParameterPlaceholder, StringComparison.Ordinal));
+        Assert.Single(
+            records,
+            static record => record.Category == AuthServiceCategory && record.EventId == GuestRegisteredEventId);
+
+        AssertNoRecordNamesTheDatabaseOrServer(records, variant.DatabaseName);
     }
 
     // Kestrel rejects these requests while it parses them, before any middleware runs, and writes a bodyless status of
@@ -896,6 +1395,85 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         return methods;
     }
 
+    // The raised configuration, applied the way the host applies its own: through the logging configuration binder,
+    // after appsettings.json, so its rules join the host's. The code rule and minimum level stand for a registration
+    // that raises verbosity.
+    private SmartHotelApiFactory CreateRaisedVerbosityVariant(
+        SmartHotelApiFactory.LogCapture capture,
+        Action<IServiceCollection>? additionalOverrides)
+    {
+        IConfiguration raised = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["LogLevel:Default"] = "Trace",
+                ["LogLevel:Microsoft"] = "Trace",
+                ["LogLevel:Microsoft.AspNetCore"] = "Trace",
+                ["LogLevel:Microsoft.AspNetCore.*"] = "Trace",
+                ["LogLevel:Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware"] = "Trace",
+                ["LogLevel:Microsoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddleware"] = "Trace",
+                ["LogLevel:" + KestrelCategory] = "Trace",
+                [SmartHotelApiFactory.LogCapture.Alias + ":LogLevel:Default"] = "Trace",
+                [SmartHotelApiFactory.LogCapture.Alias + ":LogLevel:Microsoft.AspNetCore.Hosting.Diagnostics*"] =
+                    "Trace",
+                [SmartHotelApiFactory.LogCapture.Alias + ":LogLevel:" + JwtBearerCategory] = "Trace",
+                [SmartHotelApiFactory.LogCapture.Alias + ":LogLevel:" + QuietedCategory] = QuietedFloor.ToString(),
+                ["CaptureScopes"] = "true",
+            })
+            .Build();
+
+        return _factory.CreateLogCaptureVariant(
+            capture,
+            [("Microsoft.AspNetCore", LogLevel.Trace)],
+            services =>
+            {
+                services.AddLogging(logging => logging.AddConfiguration(raised));
+                services.Configure<LoggerFilterOptions>(static options => options.MinLevel = LogLevel.Trace);
+
+                additionalOverrides?.Invoke(services);
+            });
+    }
+
+    private static async Task ExpectStatusAsync(HttpStatusCode expected, Task<HttpResponseMessage> sending)
+    {
+        using HttpResponseMessage response = await sending;
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    // The problem's traceId is the W3C id of the request activity, which hosting starts only while its diagnostics
+    // category is enabled at Critical.
+    private static async Task AssertServerErrorWithW3CTraceIdAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        JsonElement problem = await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.InternalServerError,
+            cancellationToken: cancellationToken);
+        string? traceId = problem.GetProperty("traceId").GetString();
+        Assert.True(
+            traceId is not null && W3CTraceId().IsMatch(traceId),
+            "Expected the problem's traceId to be a W3C trace id.");
+    }
+
+    // A record names the database by its name and the server by the address form NpgsqlConnection.DataSource takes.
+    private static void AssertNoRecordNamesTheDatabaseOrServer(
+        IReadOnlyList<SmartHotelApiFactory.CapturedLog> records,
+        string databaseName)
+    {
+        SmartHotelApiFactory.LogCapture.AssertNone(
+            records,
+            record => record.Message.Contains(databaseName, StringComparison.Ordinal)
+                || record.Message.Contains(ServerAddressScheme, StringComparison.Ordinal),
+            "record naming the database or the server");
+    }
+
+    // Every IdentityModel error message starts with its IDX code.
+    [GeneratedRegex(@"IDX\d{5}", RegexOptions.CultureInvariant)]
+    private static partial Regex IdentityModelMessage();
+
+    [GeneratedRegex("^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$", RegexOptions.CultureInvariant)]
+    private static partial Regex W3CTraceId();
+
     // Reads a comma-separated response header as its trimmed items; the list is empty when the header is absent.
     private static List<string> ReadHeaderItems(HttpResponseMessage response, string name)
     {
@@ -951,9 +1529,10 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         }
     }
 
-    // Delegates to the system clock until armed, then throws on every read. Arm and Disarm may run on another thread
-    // than the request that reads the clock, so the flag is read and written with volatile semantics.
-    private sealed class ThrowingTimeProvider : TimeProvider
+    // Delegates to the system clock until armed, then throws an exception with the given message on every read. Arm and
+    // Disarm may run on another thread than the request that reads the clock, so the flag is read and written with
+    // volatile semantics.
+    private sealed class ThrowingTimeProvider(string message) : TimeProvider
     {
         private int _armed;
 
@@ -973,10 +1552,73 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         {
             if (Volatile.Read(ref _armed) == 1)
             {
-                throw new InvalidOperationException(SecretMarker);
+                throw new InvalidOperationException(message);
             }
 
             return TimeProvider.System.GetUtcNow();
+        }
+    }
+
+    // A hosted service whose start fails with the given message, as the server's start does when it cannot bind.
+    private sealed class FailingStartup(string message) : IHostedService
+    {
+        private int _started;
+
+        public bool Started => Volatile.Read(ref _started) == 1;
+
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            Volatile.Write(ref _started, 1);
+            throw new InvalidOperationException(message);
+        }
+
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+    }
+
+    // Hands out the factory's own credentials until armed and afterwards a connection string that names a database
+    // absent from the same server. The API resolves the string once per scope, so every request after Arm connects
+    // to the absent database.
+    private sealed class DatabaseRedirect
+    {
+        private int _armed;
+
+        private bool IsArmed => Volatile.Read(ref _armed) == 1;
+
+        public void Arm()
+        {
+            Volatile.Write(ref _armed, 1);
+        }
+
+        // Runs as a service override, after the factory has registered its own secret source as an instance.
+        public void Install(IServiceCollection services)
+        {
+            ServiceDescriptor registered = services.Last(
+                static descriptor => descriptor.ServiceType == typeof(ISecretSource));
+            ISecretSource inner = registered.ImplementationInstance as ISecretSource
+                ?? throw new InvalidOperationException("The factory's secret source is not a registered instance.");
+            string connectionString = inner.DatabaseConnectionString
+                ?? throw new InvalidOperationException("The factory's secret source has no connection string.");
+
+            NpgsqlConnectionStringBuilder absent = new(connectionString);
+            absent.Database += AbsentDatabaseSuffix;
+
+            services.RemoveAll<ISecretSource>();
+            services.AddSingleton<ISecretSource>(new RedirectingSecretSource(inner, absent.ConnectionString, this));
+        }
+
+        // A class rather than a record: a record's synthesized ToString would print the credentials.
+        private sealed class RedirectingSecretSource(
+            ISecretSource inner,
+            string absentDatabaseConnectionString,
+            DatabaseRedirect redirect) : ISecretSource
+        {
+            public string? DatabaseConnectionString =>
+                redirect.IsArmed ? absentDatabaseConnectionString : inner.DatabaseConnectionString;
+
+            public string? JwtSigningKey => inner.JwtSigningKey;
         }
     }
 

@@ -1,7 +1,9 @@
+using System.Collections.Frozen;
 using System.Diagnostics;
 
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 
 using Npgsql;
 
@@ -47,9 +49,10 @@ namespace SmartHotel.Api.Infrastructure;
 /// Each exception is logged once per request: a report of an exception already logged for the request, or
 /// reachable from one through inner exceptions, writes nothing. The framework's own records of these
 /// exceptions, from the exception handler middleware, the Development exception page and Kestrel's general
-/// category, carry the raw exception and are filtered out by <c>appsettings.json</c>. A rule of the bridge's
-/// own lets it alone receive Kestrel's records, and it forwards neither their exception nor their message, so
-/// this event is the only one written.
+/// category, carry the raw exception. <c>appsettings.json</c> filters them out, and
+/// <see cref="FrameworkLogRedaction"/> withholds them from every provider whatever log levels the configuration
+/// sets. A rule of the bridge's own, which the redaction exempts, lets it alone receive Kestrel's records, and it
+/// forwards neither their exception nor their message, so this event is the only one written.
 /// </para>
 /// </remarks>
 /// <param name="logger">The logger that receives the sanitized event.</param>
@@ -641,6 +644,216 @@ public sealed partial class ApiExceptionHandler(
 
                 bridge.Translate(state, exception);
             }
+        }
+    }
+
+    /// <summary>
+    /// Withholds, from every log provider, the framework log records that carry request values or exception text,
+    /// whatever log levels the configuration sets.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Log levels are configuration, and any configuration source, an environment variable such as
+    /// <c>Logging__LogLevel__Default=Trace</c> included, can lower them. At the levels such a change admits, several
+    /// framework categories write the request line with its query string, the request path and route values, the
+    /// <c>Host</c>, <c>Origin</c>, <c>Accept</c> and <c>Content-Type</c> header values, action arguments, or the
+    /// messages of JSON, token-validation, server and host exceptions. Some of them pass even the default levels,
+    /// such as the generic host's Error record of a hosted service that failed to start, which carries the exception
+    /// of a server that could not bind its configured address. A level threshold therefore cannot keep them out of
+    /// the logs; this boundary does, in code, at the logger factory, before any provider receives a record.
+    /// </para>
+    /// <para>
+    /// <see cref="ProblemDetailsSetup.AddApiProblemDetails"/> registers the redaction, once however often it is
+    /// called, as a post-configuration of the host's <see cref="LoggerFilterOptions"/>. Nothing is read from
+    /// configuration or resolved at registration. The redaction runs as the last step of building those options,
+    /// after every configuration source and every registration has added its rules, and again whenever the
+    /// configuration reloads. Each rule keeps its provider, category, level and filter, and additionally refuses every
+    /// redacted level of every redacted category. A first rule that names neither a provider nor a category, at the
+    /// configured minimum level, applies the same refusal to the loggers no other rule selects. Configuration
+    /// therefore still decides every other category and level, and can still quiet a redacted category further, but
+    /// can never admit a redacted level.
+    /// </para>
+    /// <para>
+    /// Scopes are not captured. Hosting opens a scope holding the request path for every request, and a provider
+    /// configured to include scopes would add that path to every record the request writes, the sanitized exception
+    /// record included.
+    /// </para>
+    /// <para>
+    /// <see cref="ServerErrorLogBridge"/> is exempt. It receives Kestrel's general records only to replace each report
+    /// of an unhandled exception with the sanitized event, and it forwards neither their exception nor their message.
+    /// </para>
+    /// </remarks>
+    internal sealed class FrameworkLogRedaction : IPostConfigureOptions<LoggerFilterOptions>
+    {
+        // The provider that translates Kestrel's unhandled-exception reports into the sanitized event.
+        private static readonly string BridgeProviderName = typeof(ServerErrorLogBridge).FullName!;
+
+        // Every level of each category that carries a record with request values or exception text in ASP.NET Core
+        // 8.0.34 and its generic host. The categories are the exact names the framework creates its loggers under.
+        // Levels not listed carry only fixed text, type, endpoint and route-template names, or identifiers the server
+        // generates, and stay under the configuration's control.
+        private static readonly FrozenDictionary<string, int> RedactedLevels = new Dictionary<string, int>
+        {
+            // Request starting, request finished and request unhandled: method, host, path and query string.
+            // Critical stays open, although its records, the web host's startup failures, carry their exception:
+            // hosting starts the request activity, whose W3C id is every problem's traceId, only while this category
+            // is enabled at Critical, so keeping exception text out of the logs yields here to that correlation. The
+            // records are written before any request is served.
+            ["Microsoft.AspNetCore.Hosting.Diagnostics"] = Levels(LogLevel.Information),
+
+            // A request host that matches no allowed host, or that matches one: the Host header value.
+            ["Microsoft.AspNetCore.HostFiltering.HostFilteringMiddleware"] = Levels(
+                LogLevel.Trace,
+                LogLevel.Information),
+
+            // The HTTPS redirect target: host, path and query string.
+            ["Microsoft.AspNetCore.HttpsPolicy.HttpsRedirectionMiddleware"] = Levels(LogLevel.Debug),
+
+            // Kestrel's general category: unhandled application and connection exceptions at Warning, Error and
+            // Critical, and binding failures with their exception at Trace and Information. The heartbeat and
+            // request-body notices at those levels are withheld with them. Its Debug records name only connection and
+            // request identifiers.
+            ["Microsoft.AspNetCore.Server.Kestrel"] = Levels(
+                LogLevel.Trace,
+                LogLevel.Information,
+                LogLevel.Warning,
+                LogLevel.Error,
+                LogLevel.Critical),
+
+            // Malformed requests: the bad-request message, which quotes request-line and header fragments, and the
+            // exception that ended request processing.
+            ["Microsoft.AspNetCore.Server.Kestrel.BadRequests"] = Levels(LogLevel.Debug),
+
+            // HTTP/2 and HTTP/3 connection, stream, HPACK and QPACK failures, each with its exception.
+            ["Microsoft.AspNetCore.Server.Kestrel.Http2"] = Levels(
+                LogLevel.Debug,
+                LogLevel.Information,
+                LogLevel.Critical),
+            ["Microsoft.AspNetCore.Server.Kestrel.Http3"] = Levels(LogLevel.Debug, LogLevel.Information),
+
+            // Socket communication errors with their exception, and the abort reasons sent with FIN and RST.
+            ["Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets"] = Levels(LogLevel.Debug),
+
+            // TLS handshake and certificate-store failures, each with its exception.
+            ["Microsoft.AspNetCore.Server.Kestrel.Https.Internal.HttpsConnectionMiddleware"] = Levels(LogLevel.Debug),
+
+            // The raw unhandled exception, and an exception thrown while handling it or rendering the page.
+            ["Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware"] = Levels(LogLevel.Error),
+            ["Microsoft.AspNetCore.Diagnostics.DeveloperExceptionPageMiddleware"] = Levels(LogLevel.Error),
+
+            // The request's Origin header, and a rejected origin, method or request header.
+            ["Microsoft.AspNetCore.Cors.Infrastructure.CorsService"] = Levels(LogLevel.Debug, LogLevel.Information),
+
+            // A failure to apply the CORS response headers, with its exception.
+            ["Microsoft.AspNetCore.Cors.Infrastructure.CorsMiddleware"] = Levels(LogLevel.Warning),
+
+            // Candidate matching: the request path and a route value a constraint rejected.
+            ["Microsoft.AspNetCore.Routing.Matching.DfaMatcher"] = Levels(LogLevel.Debug),
+
+            // Parsing a request path against a named route, which the readiness preflight check does for every
+            // preflight: the request path. The parser writes at no other level.
+            ["Microsoft.AspNetCore.Routing.DefaultLinkParser"] = Levels(LogLevel.Debug),
+
+            // A rejected token's validation exception, the failure message copied from it, and an unexpected
+            // failure's exception. The handler rethrows an unexpected failure, so the sanitized event still records
+            // it.
+            ["Microsoft.AspNetCore.Authentication.JwtBearer.JwtBearerHandler"] = Levels(
+                LogLevel.Information,
+                LogLevel.Error),
+
+            // The JSON reader's exception message, which quotes the property path as the request body spelled it.
+            ["Microsoft.AspNetCore.Mvc.Formatters.SystemTextJsonInputFormatter"] = Levels(LogLevel.Debug),
+
+            // The request's Content-Type header value.
+            ["Microsoft.AspNetCore.Mvc.ModelBinding.Binders.BodyModelBinder"] = Levels(LogLevel.Debug),
+
+            // The request's Accept header values.
+            ["Microsoft.AspNetCore.Mvc.Infrastructure.DefaultOutputFormatterSelector"] = Levels(LogLevel.Debug),
+
+            // The bound action arguments: query values and request bodies.
+            ["Microsoft.AspNetCore.Mvc.Infrastructure.ControllerActionInvoker"] = Levels(LogLevel.Trace),
+
+            // The generic host's own records, each failure with its exception: a hosted service that failed to start,
+            // such as the server failing to bind its configured address, at Error; a faulted background service at
+            // Error and the host it stops at Critical; and an exception while stopping at Debug, beside the fixed
+            // starting, started, stopping and stopped notices. The host writes nothing at Trace, Information or
+            // Warning, which stay under the configuration's control.
+            ["Microsoft.Extensions.Hosting.Internal.Host"] = Levels(
+                LogLevel.Debug,
+                LogLevel.Error,
+                LogLevel.Critical),
+
+            // An exception thrown by a started, stopping or stopped callback of the application lifetime, with the
+            // loader messages of a type-load failure copied into the record's text.
+            ["Microsoft.Extensions.Hosting.Internal.ApplicationLifetime"] = Levels(LogLevel.Critical),
+        }.ToFrozenDictionary(StringComparer.Ordinal);
+
+        private static readonly Func<string?, string?, LogLevel, bool> RedactionOnly =
+            static (provider, category, level) => !IsRedacted(provider, category, level);
+
+        /// <summary>
+        /// Stops scope capture, adds the redaction to every rule's filter, and puts a rule in front that selects only
+        /// the loggers no other rule matches, at the configured minimum level and with the redaction.
+        /// </summary>
+        /// <param name="name">The options name; the logger factory reads the default, unnamed options.</param>
+        /// <param name="options">The options after every configuration step.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="options"/> is <see langword="null"/>.</exception>
+        public void PostConfigure(string? name, LoggerFilterOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+
+            options.CaptureScopes = false;
+
+            IList<LoggerFilterRule> rules = options.Rules;
+            for (int index = 0; index < rules.Count; index++)
+            {
+                LoggerFilterRule rule = rules[index];
+                rules[index] = new LoggerFilterRule(
+                    rule.ProviderName,
+                    rule.CategoryName,
+                    rule.LogLevel,
+                    Redact(rule.Filter));
+            }
+
+            // A rule with neither a provider nor a category ranks below every other rule that applies to a logger,
+            // and the first of equally ranked rules loses to the later ones, so this one is selected only where the
+            // logger factory would otherwise fall back to the minimum level, which carries no filter.
+            rules.Insert(0, new LoggerFilterRule(null, null, options.MinLevel, RedactionOnly));
+        }
+
+        private static int Levels(params LogLevel[] levels)
+        {
+            int mask = 0;
+            foreach (LogLevel level in levels)
+            {
+                mask |= 1 << (int)level;
+            }
+
+            return mask;
+        }
+
+        private static bool IsRedacted(string? provider, string? category, LogLevel level)
+        {
+            if (category is null
+                || level is < LogLevel.Trace or > LogLevel.Critical
+                || string.Equals(provider, BridgeProviderName, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            return RedactedLevels.TryGetValue(category, out int mask) && (mask & (1 << (int)level)) != 0;
+        }
+
+        // Keeps the rule's own filter, so configuration still decides what the redaction does not withhold.
+        private static Func<string?, string?, LogLevel, bool> Redact(Func<string?, string?, LogLevel, bool>? filter)
+        {
+            if (filter is null)
+            {
+                return RedactionOnly;
+            }
+
+            return (provider, category, level) =>
+                !IsRedacted(provider, category, level) && filter(provider, category, level);
         }
     }
 }

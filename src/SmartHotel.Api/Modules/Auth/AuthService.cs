@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 
 using Npgsql;
 
@@ -69,11 +70,22 @@ public sealed partial class AuthService(
     /// Creates a guest from a registration request that has passed model validation.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The email is stored normalized, the full name trimmed, and the password hashed exactly as entered. A taken
     /// email is found by a pre-check, or, when a concurrent registration of the same address wins the race, by the
     /// unique-violation PostgreSQL reports on <c>UX_Guests_Email</c>; both give
     /// <see cref="RegisterResult.EmailTaken"/>. Every other database error, any other unique violation included,
     /// propagates.
+    /// </para>
+    /// <para>
+    /// The insert runs as one retriable unit of the context's execution strategy. A transient failure, such as a
+    /// session the database ended, abandons the attempt, and the next attempt inserts the same values as a fresh
+    /// guest. An insert whose commit took effect although its acknowledgement was lost is recognized by its row, the
+    /// only one that carries this request's password hash, whose salt is random: the check that follows the failure
+    /// finds it, and so does a retry whose insert meets it on <c>UX_Guests_Email</c>. The result is then
+    /// <see cref="RegisterResult.Created"/> with that row's id, and no second guest is stored. A transient failure
+    /// that outlasts the strategy's retries propagates like any other database error.
+    /// </para>
     /// </remarks>
     /// <param name="request">The validated request; none of its members is <see langword="null"/>.</param>
     /// <param name="cancellationToken">Cancels the database work.</param>
@@ -96,33 +108,87 @@ public sealed partial class AuthService(
             return RegisterResult.EmailTaken.Instance;
         }
 
-        Guest guest = new()
+        // Hashed once per request. The salt is random, so among the rows stored for this email the hash identifies
+        // the one this request inserted.
+        Guest registration = new()
         {
             Email = email,
             FullName = request.FullName.Trim(),
             CreatedAt = timeProvider.GetUtcNow().UtcDateTime,
         };
-        guest.PasswordHash = passwordHasher.HashPassword(guest, request.Password);
+        registration.PasswordHash = passwordHasher.HashPassword(registration, request.Password);
 
-        db.Guests.Add(guest);
-        try
+        // Left to itself, the context's retrying execution strategy replays the insert after a transient failure, and
+        // the replay of an insert whose commit took effect meets its own row on UX_Guests_Email, which would report
+        // the email as taken. Run as one retriable unit with a check of its own, the committed insert is recognized.
+        IExecutionStrategy strategy = db.Database.CreateExecutionStrategy();
+        RegistrationAttempt attempt = new(registration);
+        RegisterResult result = await strategy.ExecuteAsync(
+            attempt,
+            async (state, token) =>
+            {
+                // A failed attempt leaves its guest tracked as Added. Detaching it limits this attempt's save to a
+                // fresh insert, whose id the database assigns.
+                DetachAttemptGuest(state);
+
+                Guest guest = new()
+                {
+                    Email = state.Registration.Email,
+                    PasswordHash = state.Registration.PasswordHash,
+                    FullName = state.Registration.FullName,
+                    CreatedAt = state.Registration.CreatedAt,
+                };
+                db.Guests.Add(guest);
+                state.Guest = guest;
+                try
+                {
+                    await db.SaveChangesAsync(token);
+                    return new RegisterResult.Created(guest.Id);
+                }
+                catch (DbUpdateException ex) when (ex.InnerException is PostgresException
+                {
+                    SqlState: PostgresErrorCodes.UniqueViolation,
+                    ConstraintName: Guest.EmailUniqueIndexName,
+                })
+                {
+                    // The rejected insert stays tracked as Added; detaching it keeps a later save in this scope from
+                    // retrying it.
+                    DetachAttemptGuest(state);
+
+                    // After a transient failure the row holding the email can be this request's own, inserted by an
+                    // earlier attempt whose commit took effect only after the check that followed the failure. Only
+                    // that row carries this request's hash; any other row belongs to a registration that won the race.
+                    if (state.FailedTransiently
+                        && await FindRegisteredGuestIdAsync(state.Registration, token) is int ownGuestId)
+                    {
+                        return new RegisterResult.Created(ownGuestId);
+                    }
+
+                    return RegisterResult.EmailTaken.Instance;
+                }
+            },
+            async (state, token) =>
+            {
+                // Runs after a transient failure, before any retry. The insert took effect exactly when a row carries
+                // this request's email and hash, whether or not its acknowledgement arrived. EF Core discards the
+                // result of an unsuccessful check and retries the unit, or rethrows the failure once no retry is left.
+                state.FailedTransiently = true;
+                DetachAttemptGuest(state);
+                int? guestId = await FindRegisteredGuestIdAsync(state.Registration, token);
+                return guestId is int id
+                    ? new ExecutionResult<RegisterResult>(true, new RegisterResult.Created(id))
+                    : new ExecutionResult<RegisterResult>(false, null!);
+            },
+            cancellationToken);
+
+        // Logged once the strategy has returned, so a guest whose commit the check confirmed is logged too, and every
+        // registered guest is logged exactly once, after its commit.
+        if (result is RegisterResult.Created created)
         {
-            await db.SaveChangesAsync(cancellationToken);
-        }
-        catch (DbUpdateException ex) when (ex.InnerException is PostgresException
-        {
-            SqlState: PostgresErrorCodes.UniqueViolation,
-            ConstraintName: Guest.EmailUniqueIndexName,
-        })
-        {
-            // The rejected insert stays tracked as Added; detaching it keeps a later save in this scope from
-            // retrying it.
-            db.Entry(guest).State = EntityState.Detached;
-            return RegisterResult.EmailTaken.Instance;
+            LogGuestRegistered(logger, created.GuestId);
         }
 
-        LogGuestRegistered(logger, guest.Id);
-        return new RegisterResult.Created(guest.Id);
+        return result;
     }
 
     /// <summary>
@@ -210,6 +276,29 @@ public sealed partial class AuthService(
             () => passwordHasher.HashPassword(new Guest(), Guid.NewGuid().ToString("N")));
     }
 
+    // Stops tracking the guest the latest registration attempt added, if the context still tracks one.
+    private void DetachAttemptGuest(RegistrationAttempt attempt)
+    {
+        if (attempt.Guest is not null)
+        {
+            db.Entry(attempt.Guest).State = EntityState.Detached;
+            attempt.Guest = null;
+        }
+    }
+
+    // The id of the row a registration attempt committed, or null when none did. The hash's salt is drawn at random for
+    // each request, so no other registration of the email stores the same hash.
+    private async Task<int?> FindRegisteredGuestIdAsync(Guest registration, CancellationToken cancellationToken)
+    {
+        string email = registration.Email;
+        string passwordHash = registration.PasswordHash;
+        return await db.Guests
+            .AsNoTracking()
+            .Where(g => g.Email == email && g.PasswordHash == passwordHash)
+            .Select(g => (int?)g.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+    }
+
     [LoggerMessage(
         EventId = 1001,
         EventName = "GuestRegistered",
@@ -224,4 +313,19 @@ public sealed partial class AuthService(
         Level = LogLevel.Warning,
         Message = "Failed login.")]
     private static partial void LogLoginFailed(ILogger logger);
+
+    // What the attempts of the retriable registration unit share: the values each one inserts, the guest the latest
+    // one added, and whether one has failed transiently.
+    private sealed class RegistrationAttempt(Guest registration)
+    {
+        // The values every attempt inserts, the hash included. The context never tracks this instance.
+        public Guest Registration { get; } = registration;
+
+        // The guest the latest attempt added, while the context still tracks it.
+        public Guest? Guest { get; set; }
+
+        // Set by the check that follows a transient failure. From then on a row this request committed can exist
+        // although no attempt has seen its insert succeed.
+        public bool FailedTransiently { get; set; }
+    }
 }

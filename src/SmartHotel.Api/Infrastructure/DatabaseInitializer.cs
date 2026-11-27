@@ -41,7 +41,8 @@ public static partial class DatabaseInitializer
     /// <returns>A task that completes once the database is migrated and seeded.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="services"/> is <see langword="null"/>.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The database connection string is missing or refused when the context is resolved.
+    /// The database connection string is missing or refused, or the runtime configuration does not enable the
+    /// <c>Npgsql.DisableDateTimeInfinityConversions</c> switch, when the context is resolved.
     /// </exception>
     /// <exception cref="OperationCanceledException">
     /// <paramref name="cancellationToken"/> was canceled; the uncommitted migration or seed rolls back.
