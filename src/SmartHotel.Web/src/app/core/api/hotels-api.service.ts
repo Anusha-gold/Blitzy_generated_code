@@ -1,11 +1,11 @@
 import { Injectable, inject } from '@angular/core';
-import { HttpClient, HttpErrorResponse, HttpParams } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse, HttpHeaders, HttpParams } from '@angular/common/http';
 import { throwError } from 'rxjs';
 import type { Observable } from 'rxjs';
 
 import { API_CONFIG } from '../config/runtime-config';
 import { withRequestDeadline, withResponseBody } from '../http/problem-details';
-import type { HotelDetail, HotelSearchQuery, HotelSummary, RoomTypeAvailability, StayQuery } from './models';
+import type { HotelDetail, HotelSearchQuery, HotelSummary, ProblemDetails, RoomTypeAvailability, StayQuery } from './models';
 
 /**
  * Appends the stay criteria to `params` as `checkIn`, `checkOut` and `guests`,
@@ -48,6 +48,42 @@ function hotelIdSegment(text: string): string | null {
   return Number.isSafeInteger(value) && value >= MIN_ROUTE_ID && value <= MAX_ROUTE_ID
     ? String(value)
     : null;
+}
+
+/** The media type of every API error response. */
+const PROBLEM_MEDIA_TYPE = 'application/problem+json';
+
+/** The `type` the API gives a 404: the RFC 9110 section that defines the status. */
+const NOT_FOUND_TYPE = 'https://tools.ietf.org/html/rfc9110#section-15.5.5';
+
+/** The `title` of the API's 404 for an unknown hotel id. */
+const UNKNOWN_HOTEL_TITLE = 'Hotel not found';
+
+/** The `detail` of the API's 404 for an unknown hotel id. */
+const UNKNOWN_HOTEL_DETAIL = 'No hotel matches the requested id.';
+
+/**
+ * Returns the failure {@link HotelsApiService.getHotel} gives a hotel id that
+ * is not an integer literal, without sending a request: a 404 that mirrors the
+ * API's answer for an unknown hotel id, with the same status, the
+ * `application/problem+json` media type and a body with the same `type`,
+ * `title`, `status` and `detail`, so `toUiError` shows both alike. The body has
+ * no `traceId`, because no server handled the request, and the error has no
+ * `url`, because none was requested. Each call returns a new error and body.
+ */
+function unknownHotelError(): HttpErrorResponse {
+  const problem: ProblemDetails = {
+    type: NOT_FOUND_TYPE,
+    title: UNKNOWN_HOTEL_TITLE,
+    status: 404,
+    detail: UNKNOWN_HOTEL_DETAIL,
+  };
+  return new HttpErrorResponse({
+    error: problem,
+    headers: new HttpHeaders({ 'Content-Type': PROBLEM_MEDIA_TYPE }),
+    status: 404,
+    statusText: 'Not Found',
+  });
 }
 
 /** An exact `yyyy-MM-dd` date, the form the API writes and the detail page compares as text. */
@@ -179,9 +215,10 @@ function isHotelDetail(body: unknown): body is HotelDetail {
  * search list `[]` is valid.
  * Apart from that deadline and that check the returned observables are the
  * `HttpClient` requests unchanged, except for a hotel id that is not an
- * integer literal, which fails with a local 404 and sends nothing
- * ({@link HotelsApiService.getHotel}): pages map their errors through
- * `toUiError`, and nothing here retries, caches, transforms or logs them.
+ * integer literal, which sends nothing and fails with a local 404 carrying
+ * the API's unknown-hotel problem ({@link HotelsApiService.getHotel}): pages
+ * map their errors through `toUiError`, and nothing here retries, caches,
+ * transforms or logs them.
  * Availability changes with every booking and cancellation, so each call sends
  * a new request.
  */
@@ -239,14 +276,18 @@ export class HotelsApiService {
    * the 32-bit signed range, is sent as its canonical decimal, so the server
    * keeps its own order for it: a 400 for the stay or `guests` before a 404
    * for an unknown hotel. Any other id, such as `1.0` or `abc`, is a
-   * non-integer id, which the API's `{id:int}` route answers with 404. That
-   * 404 is given here instead, with nothing sent, because some non-integer
-   * text cannot travel as one path segment: an empty id would address the
-   * search, URL parsing collapses the dot segments `.` and `..`,
-   * percent-encoded or not, and the API's HTTP server rejects a NUL before
-   * routing with a bare 400 that carries no CORS headers, which the page could
-   * only show as an unreachable service. The local 404 is an
-   * `HttpErrorResponse` with no body.
+   * non-integer id, which matches no hotel and no API route. It gets a local
+   * 404 instead, with nothing sent, because some non-integer text cannot
+   * travel as one path segment: an empty id would address the search, URL
+   * parsing collapses the dot segments `.` and `..`, percent-encoded or not,
+   * and the API's HTTP server rejects a NUL while parsing the request, before
+   * any middleware runs, so its 400 problem carries no CORS headers, the
+   * browser withholds it, and the page could only show an unreachable service.
+   * The local 404 has the status of the API's answer for an unknown hotel id
+   * and carries its problem, as `application/problem+json` with the same
+   * `type`, `title` ("Hotel not found"), `status` and `detail` ("No hotel
+   * matches the requested id."), but no `traceId`, so the page shows a
+   * non-integer id exactly like an unknown one.
    *
    * A request with no response within `REQUEST_DEADLINE_MS` is aborted and
    * fails with status 0.
@@ -260,7 +301,7 @@ export class HotelsApiService {
   getHotel(id: string, q: StayQuery): Observable<HotelDetail> {
     const segment = hotelIdSegment(id);
     if (segment === null) {
-      return throwError(() => new HttpErrorResponse({ status: 404, statusText: 'Not Found' }));
+      return throwError(() => unknownHotelError());
     }
     const params = withStayParams(new HttpParams(), q);
     const url = `${this.config.apiBaseUrl}/hotels/${segment}`;

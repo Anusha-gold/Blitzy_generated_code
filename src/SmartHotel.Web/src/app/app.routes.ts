@@ -1,6 +1,9 @@
 import { Routes } from '@angular/router';
+import type { RouterStateSnapshot } from '@angular/router';
 
 import { authGuard } from './core/auth/auth.guard';
+// Type-only, so the hotel detail page stays out of the eager bundle.
+import type { HotelDetailPageComponent } from './features/hotel-detail/hotel-detail-page.component';
 import { SearchPageComponent } from './features/search/search-page.component';
 
 /**
@@ -10,7 +13,13 @@ import { SearchPageComponent } from './features/search/search-page.component';
  * - `search`: hotel search; reads `city`, `checkIn`, `checkOut` and `guests`
  *   from the query.
  * - `hotels/:id`: hotel detail and booking; reads `checkIn`, `checkOut` and
- *   `guests` from the query.
+ *   `guests` from the query. It has no access guard. Its `canDeactivate`
+ *   calls `HotelDetailPageComponent.canLeave`, which holds every navigation
+ *   to another route, whatever the session state, while the page's booking
+ *   request is in flight, until the page has settled the answer, and then
+ *   refuses it; a 201 for the stay on screen goes to My bookings instead
+ *   while the guest has a live session, and is shown on the page otherwise.
+ *   The hold keeps a booking's outcome in view; it is not access protection.
  * - `login`: reads `returnUrl`, `registered` and `reason` from the query.
  * - `register`: guest registration.
  * - `bookings`: the guest's own bookings, guarded by `authGuard`, which
@@ -21,9 +30,12 @@ import { SearchPageComponent } from './features/search/search-page.component';
  * `ActivatedRoute`.
  *
  * Only the search page, the entry screen, is bundled eagerly. The other four
- * pages are loaded through `loadComponent` on their first navigation, each as
- * its own chunk. The router runs `authGuard` before it fetches the bookings
- * chunk, so a guest without a live session never downloads that page.
+ * pages are loaded through `loadComponent` on their first navigation. The
+ * router runs `authGuard` before it activates the bookings route, so a guest
+ * without a live session never sees that page. The guard does not keep the
+ * bookings page's code from loading: the hotel detail page imports its
+ * confirmation handoff helper, `bookingConfirmationState`, from the bookings
+ * page module, so that module also loads with the hotel detail page.
  */
 export const routes: Routes = [
   { path: '', redirectTo: 'search', pathMatch: 'full' },
@@ -34,6 +46,10 @@ export const routes: Routes = [
       import('./features/hotel-detail/hotel-detail-page.component').then(
         (m) => m.HotelDetailPageComponent,
       ),
+    canDeactivate: [
+      (page: HotelDetailPageComponent, _route: unknown, _state: unknown, next: RouterStateSnapshot) =>
+        page.canLeave(next),
+    ],
     title: 'Hotel · SmartHotel',
   },
   {

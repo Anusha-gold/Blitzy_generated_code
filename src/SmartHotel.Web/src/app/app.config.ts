@@ -1,7 +1,7 @@
 import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
 import { DATE_PIPE_DEFAULT_OPTIONS, type DatePipeConfig } from '@angular/common';
 import { provideHttpClient, withInterceptors } from '@angular/common/http';
-import { provideRouter } from '@angular/router';
+import { provideRouter, withRouterConfig } from '@angular/router';
 
 import { routes } from './app.routes';
 import { authInterceptor } from './core/auth/auth.interceptor';
@@ -77,7 +77,11 @@ function browserDateFormat(): string {
  * - Zone.js change detection, with event coalescing. `zone.js` is the
  *   polyfill configured in `angular.json`.
  * - The router with {@link routes}, using path-based URLs, which the hosting
- *   nginx serves through its `index.html` fallback.
+ *   nginx serves through its `index.html` fallback. A Back or Forward step
+ *   that a guard refuses, as the hotel detail page refuses one while it
+ *   settles a booking in flight, moves the browser back to the history entry
+ *   it left (`canceledNavigationResolution: 'computed'`), so the entry the
+ *   guest stepped to stays in history rather than being overwritten.
  * - `HttpClient` on its default XHR backend, with two functional
  *   interceptors in this order:
  *   1. {@link loadingInterceptor} is outermost, so the loading counter spans
@@ -109,7 +113,7 @@ function browserDateFormat(): string {
 export const appConfig: ApplicationConfig = {
   providers: [
     provideZoneChangeDetection({ eventCoalescing: true }),
-    provideRouter(routes),
+    provideRouter(routes, withRouterConfig({ canceledNavigationResolution: 'computed' })),
     provideHttpClient(withInterceptors([loadingInterceptor, authInterceptor])),
     { provide: DATE_PIPE_DEFAULT_OPTIONS, useFactory: (): DatePipeConfig => ({ dateFormat: browserDateFormat() }) },
   ],

@@ -43,9 +43,11 @@
  * search, `guests=2.0`, `guests=2e0` or an empty `guests`, and its 400 shows
  * inline. A hotel id that is not an integer literal, such as `1.0`, `abc` or a
  * NUL reached through the login page's return URL, matches no API route, so
- * the detail page shows the API's 404 inline without sending a request. A
- * detail page reused by one history traversal that changes both its hotel and
- * its stay loads once, for the hotel and stay it lands on.
+ * the detail page sends no request and shows the client's local 404 inline,
+ * which carries the API's unknown-hotel problem. These cases prove that local
+ * answer, not the API's routing of such an id. A detail page reused by one
+ * history traversal that changes both its hotel and its stay loads once, for
+ * the hotel and stay it lands on.
  *
  * Search form state: the guest count is text, so a typed `2.0`, `2e0`, `1e`
  * or white space reaches the server as typed, on submit and on an unchanged
@@ -382,14 +384,18 @@ function recordDetailRequests(page: Page): URL[] {
 }
 
 /**
- * Asserts the hotel detail page's answer to a non-integer id: the 404 the API
- * gives such an id is shown inline in place of the content, the page does not
- * report the service as unreachable, and `detailRequests` stayed empty.
+ * Asserts the hotel detail page's answer to a non-integer id: the client's
+ * local 404, given without a request and equivalent to the API's answer for an
+ * unknown hotel id, is shown inline in place of the content with that answer's
+ * title and detail, the page does not report the service as unreachable, and
+ * `detailRequests` stayed empty. It checks the client's answer only; the API's
+ * own routing of such an id is never exercised.
  */
 async function expectLocal404(page: Page, detailRequests: readonly URL[]): Promise<void> {
   const error = page.getByTestId('inline-error');
   await expect(error).toBeVisible();
-  await expect(error).toContainText('404');
+  await expect(error).toContainText('Hotel not found');
+  await expect(error).toContainText('No hotel matches the requested id.');
   await expect(error).not.toContainText('The service is unreachable.');
   await expect(page.getByTestId('hotel-name')).toHaveCount(0);
   expect(detailRequests.map((u) => u.href)).toEqual([]);

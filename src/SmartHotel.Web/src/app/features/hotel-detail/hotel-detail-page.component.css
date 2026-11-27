@@ -3,7 +3,8 @@
    buttons' 2.75rem minimum height, the disabled button, the in-content link
    sizing ("Log in again" and the late-booking notice's links) and the
    :focus-visible outline are the global defaults in src/styles.css, so they
-   are not repeated here. */
+   are not repeated here; only the narrow layout at the end of this file
+   changes the borders and padding. */
 :host {
   display: block;
 }
@@ -33,10 +34,11 @@
 
 /* A table wider than the screen scrolls here instead of widening the page.
    relative makes this box clip the absolutely positioned visually hidden
-   "Actions" header text as well. */
+   "Actions" header text as well. Its width selects the narrow layout. */
 .rooms-scroll {
   position: relative;
   overflow-x: auto;
+  container-type: inline-size;
 }
 
 .num {
@@ -46,6 +48,16 @@
 
 .actions {
   text-align: end;
+}
+
+/* Why "Book" is disabled, under the button; it wraps to the button's width
+   when the table is at its narrowest. Muted text on white is 6.4:1. */
+.book-reason {
+  display: block;
+  margin-block-start: 0.25rem;
+  font-size: 0.875rem;
+  line-height: 1.25;
+  color: var(--sh-color-text-muted);
 }
 
 /* The notice for a booking answered after the page moved to another view. */
@@ -58,4 +70,88 @@
 
 .late-booking p {
   margin-block: 0;
+}
+
+/* Narrow layout. The six columns need 526-549px with the seeded rooms (a
+   30-night total is the widest figure), so below 36rem the table can overflow
+   its scroller. The room type and Book columns then stay pinned at the edges
+   on an opaque background, so every Book shows without scrolling and keeps
+   its row's name while the figures between them scroll beneath. Separate
+   borders let each pinned cell paint its own row rule, and the caption text
+   stays at the start. The padding still clears the Book focus ring. */
+@container (width < 36rem) {
+  .rooms {
+    border-collapse: separate;
+    border-spacing: 0;
+  }
+
+  caption {
+    position: sticky;
+    inset-inline-start: 0;
+    inline-size: fit-content;
+  }
+
+  th,
+  td {
+    padding-inline: 0.5rem;
+  }
+
+  tr > :first-child,
+  tr > :last-child {
+    position: sticky;
+    z-index: 1;
+    background-color: var(--sh-color-bg);
+  }
+
+  tr > :first-child {
+    inset-inline-start: 0;
+  }
+
+  tr > :last-child {
+    inset-inline-end: 0;
+  }
+
+  /* The overflow cue: a shade on each pinned column's inner edge, over the
+     columns passing beneath it. */
+  tr > :first-child::after,
+  tr > :last-child::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inline-size: 0.75rem;
+    pointer-events: none;
+    background: linear-gradient(to right, var(--sh-color-rule), transparent);
+  }
+
+  tr > :first-child::after {
+    inset-inline-start: 100%;
+  }
+
+  tr > :last-child::after {
+    inset-inline-end: 100%;
+    transform: scaleX(-1);
+  }
+
+  /* Where the scroller drives animations, each shade shows only while
+     columns are hidden on its side, and neither shows when the table fits.
+     Elsewhere both stay on. */
+  @supports (animation-timeline: scroll()) {
+    tr > :first-child::after,
+    tr > :last-child::after {
+      opacity: 0;
+      animation: rooms-cue linear both;
+      animation-timeline: scroll(inline);
+    }
+
+    tr > :last-child::after {
+      animation-direction: reverse;
+    }
+  }
+}
+
+@keyframes rooms-cue {
+  5%,
+  to {
+    opacity: 1;
+  }
 }

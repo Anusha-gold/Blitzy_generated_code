@@ -1,10 +1,16 @@
 <!-- The answer to a booking made for another hotel or stay than the one on
-     screen. It sits outside the hotel content, so it shows in every state of
-     the current view, and it never navigates or puts an error above the
-     current room table; when it is a 201 or a 409 for rooms that table counts
-     (same hotel, overlapping dates), the page revalidates them. The link hands
-     over the created booking in memory, so My bookings shows the same
-     confirmation as after a booking on the current view. -->
+     screen, or a 201 for the stay on screen once "Log out" or the session's
+     expiry has left no live session, when the guard of My bookings would send
+     the guest to the login page and lose the confirmation. The page holds
+     every navigation away while its booking is in flight, so this shows to
+     the guest who sent it. It sits outside the hotel content, so it shows in
+     every state of the current view, and it never navigates or puts an error
+     above the current room table; when it is a 201 or a 409 for rooms that
+     table counts (same hotel, overlapping dates), the page revalidates them.
+     The link hands over the created booking in memory, so My bookings shows
+     the same confirmation as after a booking on the current view; without a
+     live session the guard asks for a login first and the link's
+     confirmation is not carried there. -->
 <div *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
   <p role="status" data-testid="late-booking-message">
     Your booking of {{ late.attempt.roomType.name }} at {{ late.attempt.hotel.name }}
@@ -35,9 +41,11 @@
      the revalidation after a 409: the conflict stays visible beside the
      reason the fresh counts are missing. Only one of this block and the hotel
      content below renders at a time, so both can carry the booking error's
-     "Log in again" link under one test hook. -->
+     "Log in again" link under one test hook. The heading takes focus from
+     script only, after a booking answer whose revalidation failed has removed
+     the room table and the pressed "Book" with it. -->
 <ng-container *ngIf="loadError() as e">
-  <h1>Hotel</h1>
+  <h1 #loadErrorHeading tabindex="-1" data-testid="load-error-heading">Hotel</h1>
   <app-error-message [error]="e"></app-error-message>
   <app-error-message [error]="bookError()">
     <a
@@ -84,10 +92,14 @@
   <!-- Six columns are wider than a phone screen. The component CSS gives this
        wrapper overflow-x: auto, so the table scrolls inside it instead of
        widening the page, and position: relative, so it also clips the
-       absolutely positioned visually hidden "Actions" text. Every Book button
+       absolutely positioned visually hidden "Actions" text. When the wrapper
+       is narrow, the CSS pins the room type and Book columns to its edges, so
+       every Book shows without scrolling and keeps its row's name, and shades
+       their inner edges while columns are hidden beneath. Every Book button
        can be disabled, so the wrapper itself is a focusable region named by the
        caption: Tab reaches it and the arrow keys scroll it. -->
   <div
+    #roomsScroll
     *ngIf="hotel.roomTypes.length > 0"
     class="rooms-scroll"
     role="region"
@@ -109,7 +121,11 @@
       </thead>
       <tbody>
         <!-- Server order (by nightly price). "Available" counts free rooms whatever
-             the party size; capacity applies only through the disabled "Book". -->
+             the party size; capacity applies only through the disabled "Book".
+             A "Book" disabled by its room type says why below it, "Sold out"
+             before "Max N guests", and its description names that reason, as
+             a disabled button is skipped by Tab. A pending booking disables
+             every "Book" briefly and shows no reason. -->
         <tr *ngFor="let rt of hotel.roomTypes; trackBy: trackById" [attr.data-testid]="'room-type-row-' + rt.id">
           <td [attr.id]="'room-type-name-' + rt.id">{{ rt.name }}</td>
           <td class="num">{{ rt.maxGuests }}</td>
@@ -120,10 +136,16 @@
             <button
               type="button"
               [attr.data-testid]="'book-' + rt.id"
-              [attr.aria-describedby]="'room-type-name-' + rt.id"
+              [attr.aria-describedby]="'room-type-name-' + rt.id + (rt.availableRooms === 0 || hotel.guests > rt.maxGuests ? ' book-reason-' + rt.id : '')"
               [disabled]="rt.availableRooms === 0 || hotel.guests > rt.maxGuests || bookingPending()"
               (click)="book(rt)"
             >Book</button>
+            <span
+              *ngIf="rt.availableRooms === 0 || hotel.guests > rt.maxGuests"
+              class="book-reason"
+              [attr.id]="'book-reason-' + rt.id"
+              [attr.data-testid]="'book-reason-' + rt.id"
+            >{{ rt.availableRooms === 0 ? 'Sold out' : 'Max ' + rt.maxGuests + (rt.maxGuests === 1 ? ' guest' : ' guests') }}</span>
           </td>
         </tr>
       </tbody>

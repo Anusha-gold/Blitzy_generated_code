@@ -14,6 +14,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, DOCUMENT, DatePipe, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
+import type { ActivatedRouteSnapshot, RouterStateSnapshot } from '@angular/router';
 import { Subject, catchError, distinctUntilChanged, finalize, map, merge, of, switchMap, take, tap } from 'rxjs';
 import type { Observable } from 'rxjs';
 
@@ -34,7 +35,11 @@ interface BookingAttempt {
   roomType: RoomTypeAvailability;
 }
 
-/** The answer to a booking submitted for another hotel or stay than the one on screen. */
+/**
+ * A booking's answer shown in the late-booking notice rather than above the
+ * room table: one for another hotel or stay than the one on screen, or a 201
+ * for the stay on screen once no live session remains.
+ */
 interface LateBookingOutcome {
   /** What was submitted. */
   attempt: BookingAttempt;
@@ -86,8 +91,9 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  * are passed on exactly as the URL holds them, and `guests` is sent as 1 when
  * the query omits it, as on the server, because the server is the only
  * authority on the stay rules; `HotelsApiService.getHotel` answers an id that
- * is not an integer literal with the API's own 404, sending nothing. A newer
- * load cancels the one still in flight. While a load runs, the previous hotel
+ * is not an integer literal with a local 404 carrying the API's unknown-hotel
+ * problem, sending nothing. A newer load cancels the one still in flight.
+ * While a load runs, the previous hotel
  * stays rendered but hidden, so none of its content or "Book" buttons can be
  * seen, focused or clicked, and the app-wide indicator shows progress; the new
  * detail then reuses the room rows whose room-type ids recur. A failed load,
@@ -105,20 +111,32 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  * creation, with no payment step. The booking request is never retried.
  *
  * One booking is in flight at a time, and its answer belongs to the hotel and
- * stay it was submitted for: the loaded detail's id, dates and party size. A
- * route change while it is in flight neither cancels nor retries it, because
- * cancelling cannot undo a booking the server has already committed, and every
- * "Book" stays disabled until it is settled. An answer that arrives while a
+ * stay it was submitted for: the loaded detail's id, dates and party size. It
+ * is never retried, and neither a route change nor leaving the page cancels
+ * it, because cancelling cannot undo a booking the server may already have
+ * committed; every "Book" stays disabled until it is settled. Only the
+ * request's deadline ends the client's wait: `BookingsApiService.create`
+ * aborts a request still unanswered after `REQUEST_DEADLINE_MS` (30 seconds)
+ * and fails it with status 0, settled like any other failure and shown as
+ * "The service is unreachable.". That abort cannot undo a booking the server
+ * may already have committed either. While the request is in flight the page
+ * is destroyed only by the app's own teardown, because leaving is held as
+ * described below; an answer that arrives after that is dropped, with no
+ * navigation and nothing shown. An answer that arrives while a
  * load runs waits for that load, so it is matched against what the guest is
  * about to see; it is then compared with the hotel and stay on screen, both as
  * the server echoed them:
- * - The same hotel and stay: a 201 navigates to `/bookings` with the new
- *   booking in the router state ({@link bookingConfirmationState}), held only
- *   in memory and never written to the browser's history, and
- *   `BookingsPageComponent` confirms it from its own list of the caller's
- *   bookings; any failure, status 0 included, is shown above the room table. A
- *   409 means the room type has no room free for the stay any more, so the
- *   page also revalidates the stay in place.
+ * - The same hotel and stay: while the guest has a live session, a 201
+ *   navigates to `/bookings` with the new booking in the router state
+ *   ({@link bookingConfirmationState}), held only in memory and never written
+ *   to the browser's history, and `BookingsPageComponent` confirms it from its
+ *   own list of the caller's bookings. Once "Log out" or the session's expiry
+ *   has left no live session, the guard of `/bookings` would send the guest
+ *   to the login page and lose the confirmation, so the 201 is shown on this
+ *   page in the notice described next, and the stay is revalidated. Any
+ *   failure, status 0 included, is shown above the room table. A 409 means
+ *   the room type has no room free for the stay any more, so the page also
+ *   revalidates the stay in place.
  * - Another hotel or stay, or none after a failed load: the answer leaves the
  *   current view alone, with no navigation and no error above its table. A
  *   notice at the top of the page names the room type, hotel and dates it was
@@ -138,8 +156,25 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  * is the server's answer, never assumed here. A failed revalidation is shown
  * like a failed load, in place of the content, because the counts on screen
  * are known to be stale; a booking error such as the 409 stays shown beside
- * it. Leaving the page drops an answer still to come; a booking the server
- * created still appears in My bookings.
+ * it.
+ *
+ * Leaving while a booking is in flight: the `hotels/:id` route's
+ * `canDeactivate` asks {@link HotelDetailPageComponent.canLeave}. Every
+ * navigation to another route, whatever the session state, such as browser
+ * Back to the search, nav "Search", "My bookings" or "Log in", or the
+ * navigation to `/search` that "Log out" starts, waits with the loading
+ * indicator on until the answer has been settled as above, and is then
+ * refused, so the error above the table or the notice stays in view; a 201
+ * for the stay on screen with a live session instead goes to `/bookings` with
+ * its confirmation, superseding the navigation the guest started. The
+ * request's deadline bounds the wait. "Log out" itself is not held:
+ * `AuthService.logout` discards the session at once and the nav bar switches
+ * to "Log in"; only its route change waits and is refused. While the hold
+ * lasts, no navigation, the one to `/login` included, leaves this page, so no
+ * other guest can sign in on this tab before the outcome is shown here to the
+ * guest who sent the request; the session lives only in this tab's memory,
+ * so other tabs are unaffected. A navigation to another hotel or stay keeps
+ * this page and is never held.
  *
  * A 401 from "Book" (a token the server rejects before its expiry) follows the
  * inline branch of the app's 401 rule: `authInterceptor` has already cleared
@@ -172,6 +207,21 @@ export class HotelDetailPageComponent {
 
   /** The "Log in again" link, rendered only while a 401 from "Book" is shown above the table. */
   @ViewChild('loginAgain') private loginAgain?: ElementRef<HTMLAnchorElement>;
+
+  /**
+   * The focusable rooms region around the room table, rendered while the
+   * loaded hotel has room types; where focus lands after a booking answer when
+   * the "Book" it should return to is gone or disabled.
+   */
+  @ViewChild('roomsScroll') private roomsScroll?: ElementRef<HTMLDivElement>;
+
+  /**
+   * The heading of the load error shown in place of the content, focusable
+   * from script only; where focus lands after a booking answer when a failed
+   * revalidation has removed the room table, and the "Book" and rooms region
+   * with it.
+   */
+  @ViewChild('loadErrorHeading') private loadErrorHeading?: ElementRef<HTMLHeadingElement>;
 
   /** Read by the template, whose "Log in again" links return to `router.url`. */
   protected readonly router = inject(Router);
@@ -213,7 +263,8 @@ export class HotelDetailPageComponent {
 
   /**
    * The answer to a booking submitted for another hotel or stay than the one
-   * on screen, shown as a notice at the top of the page; `null` otherwise.
+   * on screen, or a 201 for the stay on screen once no live session remains,
+   * shown as a notice at the top of the page; `null` otherwise.
    */
   protected readonly lateOutcome = signal<LateBookingOutcome | null>(null);
 
@@ -226,7 +277,20 @@ export class HotelDetailPageComponent {
   /** Emits when a route-driven load settles, with a hotel or with an error. */
   private readonly loadSettled$ = new Subject<void>();
 
+  /**
+   * Emits once a booking's answer has been settled on this page, after
+   * {@link HotelDetailPageComponent.booked} or
+   * {@link HotelDetailPageComponent.bookingFailed} has run; ends a navigation
+   * that {@link HotelDetailPageComponent.canLeave} holds.
+   */
+  private readonly bookingSettled$ = new Subject<void>();
+
+  /** `true` once this page is destroyed; a booking answer arriving later is not settled. */
+  private readonly destroyed = signal(false);
+
   constructor() {
+    this.destroyRef.onDestroy(() => this.destroyed.set(true));
+
     const loads$ = merge(this.route.paramMap, this.route.queryParamMap).pipe(
       // Either stream only signals a committed navigation. The router assigns
       // the route's new snapshot before it emits the query and then the path
@@ -278,12 +342,23 @@ export class HotelDetailPageComponent {
    *
    * The answer is matched by the hotel and stay the request carried against
    * the ones on screen once no load is running, so it is never applied to
-   * another hotel or stay. The request lives as long as the page: it is never
-   * cancelled on a route change, because cancelling cannot undo a booking the
-   * server has already committed. The element focused when the request is
-   * sent, normally this "Book" button, is recorded so that an answer that
-   * keeps the guest on this page can move focus to "Log in again" after a
-   * 401 shown above the table, or back to it otherwise.
+   * another hotel or stay. Neither a route change nor leaving the page cancels
+   * the request, because cancelling cannot undo a booking the server may
+   * already have committed. Only its deadline ends the client's wait:
+   * `BookingsApiService.create` aborts it after `REQUEST_DEADLINE_MS` and
+   * fails it with status 0, shown inline as "The service is unreachable.",
+   * which cannot undo a booking the server may already have committed either.
+   * While it is in flight, {@link HotelDetailPageComponent.canLeave} holds
+   * every navigation away from this route, whatever the session state, until
+   * the answer has been settled here, so it reaches the guest who sent it
+   * even after "Log out" or the session's expiry; only the app's own teardown
+   * destroys the page first, and an answer arriving after that is dropped,
+   * with no navigation and nothing shown. The element focused when the
+   * request is sent, normally this "Book" button, is recorded so that an
+   * answer that keeps the guest on this page can move focus to "Log in again"
+   * after a 401 shown above the table, back to it otherwise, or, when the
+   * button is gone or disabled by then, to the rooms region, or to the load
+   * error's heading when a failed revalidation has removed the table.
    *
    * @param rt - The room type whose "Book" button was clicked.
    */
@@ -312,16 +387,62 @@ export class HotelDetailPageComponent {
       guests: hotel.guests,
     };
 
-    this.bookings
-      .create(request)
-      .pipe(takeUntilDestroyed(this.destroyRef))
-      .subscribe({
-        next: (booking: Booking) => this.afterLoad(() => this.booked(attempt, booking, trigger)),
-        error: (err: HttpErrorResponse) => {
-          const error = toUiError(err);
-          this.afterLoad(() => this.bookingFailed(attempt, error, trigger));
-        },
-      });
+    // Deliberately not tied to this page's lifetime: leaving must never abort
+    // a POST the server may already have committed, and canLeave holds every
+    // navigation away until its answer is settled. Only the request deadline
+    // in BookingsApiService.create ends the wait. afterLoad drops an answer
+    // that arrives once the app's teardown has destroyed the page.
+    this.bookings.create(request).subscribe({
+      next: (booking: Booking) => this.afterLoad(() => this.booked(attempt, booking, trigger)),
+      error: (err: HttpErrorResponse) => {
+        const error = toUiError(err);
+        this.afterLoad(() => this.bookingFailed(attempt, error, trigger));
+      },
+    });
+  }
+
+  /**
+   * Decides whether the router may leave this page for `next`; the
+   * `hotels/:id` route's `canDeactivate` calls it. It answers `true` at once
+   * unless both hold: a booking request from this page is in flight, and
+   * `next` leaves the `hotels/:id` route. A navigation to another hotel or
+   * stay keeps this page, so it is never held, and its answer is settled
+   * against the new view.
+   *
+   * Otherwise the navigation waits until the answer has been settled here,
+   * with the loading indicator still on because the request is pending, and
+   * is then refused, so the error above the table or the late-booking notice
+   * stays in view. The session state plays no part: once "Log out" or the
+   * session's expiry has left no live session, the answer is still settled
+   * here, a 201 for the stay on screen in the late-booking notice. "Log out"
+   * itself is not held: it discards the session at once, and only the
+   * navigation to `/search` it starts waits and is refused. While the hold
+   * lasts no navigation leaves this page, the one to `/login` included, so no
+   * other guest can sign in on this tab before the outcome is shown. A 201
+   * for the stay on screen with a live session starts its own navigation to
+   * My bookings while it is settled; that navigation supersedes the held one
+   * and passes this check, because no booking request is in flight any more.
+   *
+   * Leaving never cancels the request, because cancelling cannot undo a
+   * booking the server may already have committed. Only the request's
+   * deadline, `REQUEST_DEADLINE_MS` in `BookingsApiService.create`, ends the
+   * client's wait, and so bounds the hold: the request is then aborted and
+   * settled as a status-0 error like any other failure, which cannot undo a
+   * booking the server may already have committed either. This hold keeps a
+   * booking's outcome in view; it does not protect access to any page.
+   *
+   * @param next - The router state the navigation would activate.
+   * @returns `true` to let the navigation proceed, or an observable that emits
+   *   `false` once the booking's answer has been settled here.
+   */
+  canLeave(next: RouterStateSnapshot): boolean | Observable<boolean> {
+    if (!this.postPending() || this.keepsThisRoute(next)) {
+      return true;
+    }
+    return this.bookingSettled$.pipe(
+      take(1),
+      map(() => false),
+    );
   }
 
   /** Identifies a room type row by its id for `NgFor`. */
@@ -330,29 +451,63 @@ export class HotelDetailPageComponent {
   }
 
   /**
-   * Runs `settle` once no route-driven load is in flight: at once, or when the
-   * load now running settles. A load that a newer one supersedes never
-   * settles, so the newest load decides what is on screen.
+   * Whether `next` still activates this page's route, `hotels/:id`, as a
+   * navigation to another hotel or stay does: the router then keeps this
+   * component and only changes its parameters.
    */
-  private afterLoad(settle: () => void): void {
-    if (!this.loadPending()) {
-      settle();
-      return;
-    }
-    this.loadSettled$.pipe(take(1), takeUntilDestroyed(this.destroyRef)).subscribe(settle);
+  private keepsThisRoute(next: RouterStateSnapshot): boolean {
+    const config = this.route.routeConfig;
+    const activates = (snapshot: ActivatedRouteSnapshot): boolean =>
+      snapshot.routeConfig === config || snapshot.children.some(activates);
+    return activates(next.root);
   }
 
   /**
-   * Settles a 201. For the hotel and stay on screen it navigates to My
-   * bookings with the booking in the router state. Otherwise it reports the
-   * booking in the late-outcome notice and stays on the current view, which
-   * it revalidates when the booked room may be one its table counts, and then
-   * returns focus to `trigger` as after a failed booking.
+   * Settles a booking's answer through `settle` once no route-driven load is
+   * in flight: at once, or when the load now running settles. A load that a
+   * newer one supersedes never settles, so the newest load decides what is on
+   * screen. {@link HotelDetailPageComponent.bookingSettled$} emits right after
+   * `settle` has run, so a navigation held for the answer resumes only once
+   * the answer is shown or its own navigation has started. Once the page is
+   * destroyed, which while a booking is in flight only the app's own teardown
+   * does, because {@link HotelDetailPageComponent.canLeave} holds every
+   * navigation away, nothing runs, at once or from the wait: a late answer
+   * neither navigates nor touches the destroyed page.
+   */
+  private afterLoad(settle: () => void): void {
+    if (this.destroyed()) {
+      return;
+    }
+    const run = (): void => {
+      if (this.destroyed()) {
+        return;
+      }
+      settle();
+      this.bookingSettled$.next();
+    };
+    if (!this.loadPending()) {
+      run();
+      return;
+    }
+    this.loadSettled$.pipe(take(1), takeUntilDestroyed(this.destroyRef)).subscribe(run);
+  }
+
+  /**
+   * Settles a 201. For the hotel and stay on screen, while the guest still has
+   * a live session, it navigates to My bookings with the booking in the router
+   * state. Otherwise it reports the booking in the late-outcome notice, as
+   * confirmed with no payment taken online and with the "View it in My
+   * bookings" link, and stays on the current view, which it revalidates when
+   * the booked room may be one its table counts, and then returns focus to
+   * `trigger` as after a failed booking. That includes the stay on screen once
+   * "Log out" or the session's expiry has left no live session: the guard of
+   * `/bookings` would then send the guest to the login page and lose the
+   * confirmation, so it is shown here.
    */
   private booked(attempt: BookingAttempt, booking: Booking, trigger: HTMLElement | null): void {
     this.postPending.set(false);
     const shown = this.hotel();
-    if (shown !== null && isSameStay(shown, attempt.hotel)) {
+    if (shown !== null && isSameStay(shown, attempt.hotel) && this.auth.isAuthenticated()) {
       void this.router.navigate(['/bookings'], { state: bookingConfirmationState(booking) });
       return;
     }
@@ -373,8 +528,10 @@ export class HotelDetailPageComponent {
    * notice and the current table is left alone, except that a 409 for rooms
    * the table counts revalidates it too. Focus then moves as
    * {@link HotelDetailPageComponent.restoreFocusAfterBooking} describes, once
-   * any revalidation has settled, so it lands on a "Book" that the fresh
-   * counts left enabled.
+   * any revalidation has settled, so it returns to the pressed "Book" only
+   * when the fresh counts left it enabled, otherwise lands on the rooms
+   * region, and lands on the load error's heading when the revalidation
+   * failed and removed the table.
    */
   private bookingFailed(attempt: BookingAttempt, error: UiError, trigger: HTMLElement | null): void {
     this.postPending.set(false);
@@ -499,12 +656,21 @@ export class HotelDetailPageComponent {
    * Moves focus once a booking answer that keeps the guest on this page has
    * rendered and re-enabled the "Book" buttons: to the "Log in again" link
    * after a 401 shown above the table, otherwise, or when that link is
-   * missing, back to `trigger`. Disabling the focused "Book" button while the
-   * request is pending can drop focus to the document body, so focus moves
-   * only when it is still on the body, on nothing, or on `trigger`, and only
-   * to an element that is still in the document and enabled; anything else the
-   * guest focused meanwhile keeps focus. A cancelled request never calls this,
-   * and a 201 for the stay on screen navigates away instead.
+   * missing, back to `trigger`. When that target is missing, no longer in the
+   * document or disabled, as the pressed "Book" is once the revalidation after
+   * a 409 finds its room type full, focus moves to the rooms region around the
+   * table instead. When the rooms region is gone too, as after a revalidation
+   * that failed and removed the hotel content, focus moves to the heading of
+   * the load error shown in its place, beside which the booking error stays.
+   * It never moves to another room type's "Book", where one more Enter would
+   * book a room the guest did not choose. Disabling the focused "Book" button
+   * while the request is pending can drop focus to the document body, so
+   * focus moves only when it is still on the body, on nothing, or on
+   * `trigger`; anything else the guest focused meanwhile keeps focus. With
+   * none of these targets rendered, focus stays where it is. An answer that
+   * arrives once the page is destroyed never calls this, and a 201 for the
+   * stay on screen while the guest still has a live session navigates to My
+   * bookings instead.
    *
    * @param trigger - The element focused when the request was sent, or `null`.
    * @param unauthorized - Whether the booking failed with 401.
@@ -518,10 +684,13 @@ export class HotelDetailPageComponent {
         }
 
         const loginAgain = unauthorized ? this.loginAgain?.nativeElement : undefined;
-        const target = loginAgain?.isConnected ? loginAgain : trigger;
-        if (target !== null && target.isConnected && !target.matches(':disabled')) {
-          target.focus();
-        }
+        const preferred = loginAgain?.isConnected ? loginAgain : trigger;
+        const fallbacks = [this.roomsScroll?.nativeElement, this.loadErrorHeading?.nativeElement];
+        const target =
+          preferred !== null && preferred.isConnected && !preferred.matches(':disabled')
+            ? preferred
+            : fallbacks.find((element) => element?.isConnected);
+        target?.focus();
       },
       { injector: this.injector },
     );
