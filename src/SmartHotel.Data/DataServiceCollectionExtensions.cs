@@ -1,8 +1,10 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
+using Npgsql.EntityFrameworkCore.PostgreSQL;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Infrastructure;
 
 namespace SmartHotel.Data;
@@ -41,9 +43,13 @@ public static class DataServiceCollectionExtensions
     /// transient, such as a pooled connection that a database restart ended (SqlState <c>57P01</c>) or a refused or
     /// dropped connection, runs again up to three times, at once and then after delays capped at two seconds, so a
     /// request that meets a restarted database succeeds and one that meets a database that stays down fails within a
-    /// few seconds. Constraint violations are not transient, so they reach their callers on the first failure. The
-    /// strategy rejects a transaction begun outside it, so booking creation and seeding each run their transaction
-    /// through <see cref="Microsoft.EntityFrameworkCore.Infrastructure.DatabaseFacade.CreateExecutionStrategy"/> as one
+    /// few seconds. A session failure that Npgsql reports through its disposed-transaction exception is judged by that
+    /// exception's inner failure and checked and retried the same way. That happens when a session ends while EF Core
+    /// releases the savepoint around a save inside a transaction: EF Core does not report the failure, and the commit
+    /// that follows throws <see cref="ObjectDisposedException"/> with the session's failure as its inner exception.
+    /// Constraint violations are not transient, so they reach their callers on the first failure. The strategy rejects
+    /// a transaction begun outside it, so booking creation and seeding each run their transaction through
+    /// <see cref="Microsoft.EntityFrameworkCore.Infrastructure.DatabaseFacade.CreateExecutionStrategy"/> as one
     /// retriable unit. A write the strategy would otherwise replay on its own after a commit whose acknowledgement was
     /// lost, a guest's registration or a booking's cancellation, runs through it the same way, with a check that
     /// recognizes the committed write, so the replay never reports its own row as a conflict. Sensitive-data logging
@@ -165,13 +171,11 @@ public static class DataServiceCollectionExtensions
         return services;
     }
 
-    // Shared by the run-time and the design-time options, so both use one execution strategy.
+    // Shared by the run-time and the design-time options, so both use one execution strategy: Npgsql's retrying
+    // strategy, which also judges a failure reported through the disposed-transaction exception by its inner one.
     private static void EnableRetryOnTransientFailure(NpgsqlDbContextOptionsBuilder npgsql)
     {
-        npgsql.EnableRetryOnFailure(
-            TransientFailureMaxRetryCount,
-            TransientFailureMaxRetryDelay,
-            errorCodesToAdd: null);
+        npgsql.ExecutionStrategy(static dependencies => new TransientFailureExecutionStrategy(dependencies));
     }
 
     // EF Core writes each of these failure events before the caller sees the exception. Some hand the logger the
@@ -263,6 +267,27 @@ public static class DataServiceCollectionExtensions
             throw new InvalidOperationException(
                 "The SmartHotel database connection string must not enable Log Parameters, because parameter values "
                 + "would then be logged.");
+        }
+    }
+
+    // Npgsql's retrying strategy, which also recognizes a transient failure that Npgsql reports through its
+    // disposed-transaction exception. A session can end while EF Core releases, or rolls back to, the savepoint it
+    // wraps a save in. EF Core does not report that failure, while Npgsql breaks the connection and disposes the
+    // transaction, so the commit or rollback that follows throws ObjectDisposedException with the session's failure as
+    // its inner exception. That failure is judged as if it had surfaced directly, so a unit that meets it is checked
+    // and run again like any other transient failure: EF Core decides whether to run a unit's check of a committed
+    // write through the same judgement.
+    private sealed class TransientFailureExecutionStrategy(ExecutionStrategyDependencies dependencies)
+        : NpgsqlRetryingExecutionStrategy(
+            dependencies,
+            TransientFailureMaxRetryCount,
+            TransientFailureMaxRetryDelay,
+            errorCodesToAdd: null)
+    {
+        protected override bool ShouldRetryOn(Exception? exception)
+        {
+            return base.ShouldRetryOn(exception)
+                || (exception is ObjectDisposedException { InnerException: { } inner } && base.ShouldRetryOn(inner));
         }
     }
 }

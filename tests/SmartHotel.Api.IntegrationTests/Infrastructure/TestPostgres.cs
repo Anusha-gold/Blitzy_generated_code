@@ -26,7 +26,9 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// the fixture starts the repository's <c>db-test</c> Compose service, a passwordless server published on host
 /// loopback port 55432, in its own Compose project <c>smarthotel-test</c>, and leaves it running: its data lives on
 /// tmpfs and the next run reuses it. The server user must be a superuser, or have <c>CREATEDB</c> and
-/// <c>CREATEROLE</c>.
+/// <c>CREATEROLE</c> and, for each server log setting that could record the statement that sets a test role's
+/// password, either the <c>SET</c> privilege on it or a server value that keeps statement text out of the log; the
+/// remarks on <see cref="CreateDatabaseAsync"/> list those settings and values.
 /// </para>
 /// <para>
 /// The fixture never sets an environment variable. Neither the server connection string nor the variable's value is
@@ -42,7 +44,11 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// The only connection strings the fixture hands out are those of test databases. Each one authenticates as its
 /// database's own login role, with a random password, so no two test databases share a credential, and each keeps
 /// <c>Include Error Detail</c> off, so PostgreSQL's <c>DETAIL</c> text, which can contain key values, stays redacted
-/// in exceptions and logs.
+/// in exceptions and logs. Each one is pooled without multiplexing, at Npgsql's default pool limits, whatever pool
+/// settings the server connection string carries, so a test can always derive an unpooled string from it. None names
+/// a client certificate. Those on <c>db-test</c>, which offers no TLS, have <c>SSL Mode=Disable</c>, and the fixture
+/// refuses to start whenever Npgsql could present an ambient certificate on the others, as
+/// <see cref="InitializeAsync"/> describes.
 /// </para>
 /// <para>
 /// The members are safe to call concurrently from test classes that run in parallel.
@@ -96,6 +102,28 @@ public sealed partial class TestPostgres : IAsyncLifetime
     private const string InvalidDatabaseConnectionString =
         "The value is not a connection string that CreateDatabaseConnectionString returned.";
 
+    // Npgsql 8's own defaults for the pool settings, which every test database's connection string carries whatever
+    // the server string sets: no idle session kept open, at most 100 sessions, an idle one closed after 300 seconds and
+    // looked for every 10 seconds, and no limit on a session's age. The lifetimes are in seconds.
+    private const int DefaultMinPoolSize = 0;
+    private const int DefaultMaxPoolSize = 100;
+    private const int DefaultConnectionIdleLifetime = 300;
+    private const int DefaultConnectionPruningInterval = 10;
+    private const int DefaultConnectionLifetime = 0;
+
+    // Where Npgsql 8 looks for a client certificate that a connection string does not name, in this order: the file
+    // the PGSSLCERT environment variable names, and postgresql.crt in the PostgreSQL directory under the user's home,
+    // which is .postgresql under HOME, or postgresql under APPDATA on Windows.
+    private const string ClientCertificateVariable = "PGSSLCERT";
+    private const string ClientCertificateFile = "postgresql.crt";
+
+    // Where the ambient certificate that a test database's connection would present comes from, in fixed words that
+    // name neither the variable's value nor the file's path.
+    private const string ClientCertificateFromVariable = "the PGSSLCERT environment variable is set";
+    private const string ClientCertificateFromFile =
+        "a postgresql.crt file exists in the PostgreSQL directory under the user's home (.postgresql under HOME, or "
+        + "postgresql under APPDATA on Windows)";
+
     // A first run may have to pull the postgres image before db-test can become healthy.
     private static readonly TimeSpan ComposeTimeout = TimeSpan.FromMinutes(5);
 
@@ -133,13 +161,28 @@ public sealed partial class TestPostgres : IAsyncLifetime
     private static readonly string[] ComposeSelectionVariables =
         ["COMPOSE_PROJECT_NAME", "COMPOSE_FILE", "COMPOSE_PROFILES", "COMPOSE_ENV_FILES"];
 
-    // Keep the text of every statement, of a failing one and of a slow one out of the server log until the transaction
-    // they run in ends. Only a superuser may change these settings.
-    private static readonly string[] StatementLoggingOff =
+    // PostgreSQL decides whether to log every statement of a transaction when the transaction starts, so this setting
+    // is changed for the session before the transaction that sets a password begins, and reset once it has ended.
+    private const string TransactionSampleRate = "log_transaction_sample_rate";
+
+    // Every way the server log can record the text of the statement that sets a login role's password. Each way is
+    // the settings that open it, each with the value, as pg_settings shows it, that keeps the text out; the way is
+    // closed when the server user may change one of its settings, or one of them already has that value. In order:
+    // log_statement records every DDL statement unless it is none; log_min_error_statement attaches the statement to
+    // any server log message below panic, such as a failure, a cancellation or a lock wait; log_min_duration_statement
+    // records a slow statement; log_min_duration_sample and log_statement_sample_rate record a sampled one, unless
+    // either is off; log_transaction_sample_rate records every statement of a sampled transaction; and the three
+    // debug_print settings write the statement's parse, rewritten or plan tree, which holds the verifier.
+    private static readonly (string Name, string Off)[][] StatementTextLogging =
     [
-        "SET LOCAL log_statement = 'none'",
-        "SET LOCAL log_min_error_statement = 'panic'",
-        "SET LOCAL log_min_duration_statement = -1",
+        [("log_statement", "none")],
+        [("log_min_error_statement", "panic")],
+        [("log_min_duration_statement", "-1")],
+        [("log_min_duration_sample", "-1"), ("log_statement_sample_rate", "0")],
+        [(TransactionSampleRate, "0")],
+        [("debug_print_parse", "off")],
+        [("debug_print_rewritten", "off")],
+        [("debug_print_plan", "off")],
     ];
 
     // Both set once by InitializeAsync, before xUnit creates any test class, and only read afterwards.
@@ -150,12 +193,31 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// Selects the server and waits until it accepts connections. xUnit v3 calls this once, before the first test of
     /// the assembly runs.
     /// </summary>
-    /// <returns>A task that completes once the server answers <c>SELECT 1</c> on its maintenance database.</returns>
+    /// <remarks>
+    /// A test database's connection string names no client certificate, and Npgsql 8 then presents an ambient one on
+    /// every connection that negotiates TLS: the file the <c>PGSSLCERT</c> environment variable names, even when it is
+    /// empty, or else <c>postgresql.crt</c> in the PostgreSQL directory under the user's home. No connection string
+    /// setting turns that fallback off except <c>SSL Mode=Disable</c>, and it would give every test database's login
+    /// role the same TLS identity. Whether a test database's connection negotiates TLS is settled only when it opens,
+    /// under that database's own login and on whichever host of the string answers it, so no connection the fixture
+    /// makes beforehand can rule it out. Once the server string is selected, and before the fixture first connects to
+    /// the server, the fixture therefore fails whenever the string's <c>SSL Mode</c> is not <c>Disable</c> and Npgsql
+    /// would find such a certificate. The <c>db-test</c> Compose service offers no TLS, so the fixture connects to it
+    /// with <c>SSL Mode=Disable</c>: its connections skip the TLS request, no ambient certificate can reach them, and
+    /// the default run is never refused for one. A string that <c>SMARTHOTEL_TEST_POSTGRES</c> supplies keeps its own
+    /// <c>SSL Mode</c> and <c>Root Certificate</c>. The environment and the certificate are only read, never changed.
+    /// </remarks>
+    /// <returns>
+    /// A task that completes once no ambient client certificate could reach a test database's connection and the
+    /// server answers <c>SELECT 1</c> on its maintenance database.
+    /// </returns>
     /// <exception cref="InvalidOperationException">
     /// <c>SMARTHOTEL_TEST_POSTGRES</c> is not a valid connection string or sets no <c>Host</c>; the repository root
-    /// cannot be found; the <c>docker</c> CLI cannot be started, or <c>docker compose up</c> fails or times out; the
-    /// server rejects the login (SQLSTATE class 28), which ends the wait at once; a connection attempt fails in a way
-    /// no retry changes; or the server does not accept connections within 15 seconds.
+    /// cannot be found; the <c>docker</c> CLI cannot be started, or <c>docker compose up</c> fails or times out; Npgsql
+    /// would present an ambient client certificate on the test databases' connections, which ends the run before any
+    /// connection to the server; the server rejects the login (SQLSTATE class 28), which ends the wait at once; a
+    /// connection attempt fails in a way no retry changes; or the server does not accept connections within 15
+    /// seconds.
     /// </exception>
     /// <exception cref="OperationCanceledException">The test run was cancelled.</exception>
     public async ValueTask InitializeAsync()
@@ -170,7 +232,14 @@ public sealed partial class TestPostgres : IAsyncLifetime
         if (string.IsNullOrWhiteSpace(configured))
         {
             await StartComposeServiceAsync(cancellationToken);
-            server = new NpgsqlConnectionStringBuilder(DefaultServer);
+
+            // db-test offers no TLS, so its connections skip the TLS request and no ambient client certificate can
+            // reach them; the default run is therefore never refused for one. The test databases' strings carry this
+            // SSL Mode over.
+            server = new NpgsqlConnectionStringBuilder(DefaultServer)
+            {
+                SslMode = SslMode.Disable,
+            };
             selectedByVariable = false;
         }
         else
@@ -181,6 +250,11 @@ public sealed partial class TestPostgres : IAsyncLifetime
 
         // Applied to a supplied string as well: whatever it says, PostgreSQL's DETAIL text stays redacted.
         server.IncludeErrorDetail = false;
+
+        // The test databases' strings take their SSL Mode from the server string. A refused string is never kept, the
+        // server is never reached with it, and no test database exists yet.
+        RejectAmbientClientCertificate(server.SslMode);
+
         _server = server.ConnectionString;
         _selectedByVariable = selectedByVariable;
 
@@ -208,9 +282,19 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <returns>
     /// The server connection string's host, port and transport settings, with <paramref name="name"/> as both its
     /// database and its user, a password of 64 random lowercase hex characters, no password file and no client
-    /// certificate, and <c>Include Error Detail</c> off. It carries the password, so callers must never write it to
-    /// output.
+    /// certificate, and <c>Include Error Detail</c> off. It is pooled without multiplexing, with Npgsql's default pool
+    /// settings: <c>Minimum Pool Size</c> 0, <c>Maximum Pool Size</c> 100, <c>Connection Idle Lifetime</c> 300,
+    /// <c>Connection Pruning Interval</c> 10 and <c>Connection Lifetime</c> 0. It carries the password, so callers
+    /// must never write it to output.
     /// </returns>
+    /// <remarks>
+    /// The pool and multiplexing settings of the server connection string never reach the string returned here, so
+    /// every test database's pool behaves the same whichever server is selected. The API pools its sessions under
+    /// this string. A caller that needs sessions outside that pool derives an unpooled string from it by setting
+    /// <c>Pooling</c> to <see langword="false"/>, which Npgsql accepts because multiplexing is off. Every other
+    /// setting of the server connection string, such as <c>SSL Mode</c>, <c>Root Certificate</c>, the timeouts and
+    /// the keepalive, carries over unchanged.
+    /// </remarks>
     /// <exception cref="ArgumentException"><paramref name="name"/> does not have the test database form.</exception>
     /// <exception cref="InvalidOperationException">The fixture has not been initialized.</exception>
     public string CreateDatabaseConnectionString(string name)
@@ -218,7 +302,9 @@ public sealed partial class TestPostgres : IAsyncLifetime
         EnsureTestDatabaseName(name);
 
         // Every credential the server string may hold is replaced or removed: its user and password, its password file,
-        // and a client certificate with its key, so no test database inherits the server user's identity.
+        // and a client certificate with its key, so no test database inherits the server user's identity. The pool
+        // settings are replaced as well: pooled, so the tests can observe the API's pooled sessions, and without
+        // multiplexing, which Npgsql rejects on the unpooled strings the tests derive, at Npgsql's default limits.
         NpgsqlConnectionStringBuilder database = new(ServerConnectionString())
         {
             Database = name,
@@ -229,6 +315,13 @@ public sealed partial class TestPostgres : IAsyncLifetime
             SslKey = null,
             SslPassword = null,
             IncludeErrorDetail = false,
+            Pooling = true,
+            Multiplexing = false,
+            MinPoolSize = DefaultMinPoolSize,
+            MaxPoolSize = DefaultMaxPoolSize,
+            ConnectionIdleLifetime = DefaultConnectionIdleLifetime,
+            ConnectionPruningInterval = DefaultConnectionPruningInterval,
+            ConnectionLifetime = DefaultConnectionLifetime,
         };
 
         return database.ConnectionString;
@@ -237,7 +330,10 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <summary>
     /// Creates the login role and the empty test database that a connection string from
     /// <see cref="CreateDatabaseConnectionString"/> names. The role may log in with that string's password and has no
-    /// other attribute. The database is owned by the role, and only the role and superusers may connect to it.
+    /// other attribute. The database is owned by the role, and <c>PUBLIC</c>'s <c>CONNECT</c> and <c>TEMPORARY</c>
+    /// privileges on it are revoked, so no other test database's role may connect to it. The role, superusers and the
+    /// server user that provisions it may connect: the server user is granted the role with <c>INHERIT TRUE</c>, so it
+    /// inherits the owner's privileges.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -248,18 +344,27 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <para>
     /// The role is created without a password, so the statements that fail when the server user lacks
     /// <c>CREATEROLE</c> or <c>CREATEDB</c> carry no secret into the server's error log. The verifier is set
-    /// afterwards, by an <c>ALTER ROLE</c> in a transaction of its own. When the server user is a superuser, that
-    /// transaction first turns off, for itself alone, each setting that writes a statement's text to the server log,
-    /// so no server log records the verifier. Any other server user cannot change those settings, so for it only the
-    /// server's own statement logging can still record the verifier, never the plain text: <c>log_statement</c> set
-    /// to <c>ddl</c> or <c>all</c> by the server's operator, and, under the default <c>log_min_error_statement</c>, a
-    /// failure of that <c>ALTER ROLE</c> itself. The exceptions raised here never quote a statement, so neither the
-    /// password nor the verifier appears in their messages.
+    /// afterwards, by an <c>ALTER ROLE</c> in a transaction of its own, and only once no server log setting can record
+    /// that statement's text: <c>log_statement</c>, <c>log_min_error_statement</c>,
+    /// <c>log_min_duration_statement</c>, <c>log_min_duration_sample</c> with <c>log_statement_sample_rate</c>,
+    /// <c>log_transaction_sample_rate</c>, and <c>debug_print_parse</c>, <c>debug_print_rewritten</c> and
+    /// <c>debug_print_plan</c>. Each of them that the server user may change is turned off for that transaction
+    /// alone, so every other statement is logged as the server is configured: a superuser may change all of them, and
+    /// any other server user the <c>debug_print</c> settings and each setting it holds the <c>SET</c> privilege on.
+    /// Each one it may not change must already keep the text out: <c>log_statement</c> <c>none</c>,
+    /// <c>log_min_error_statement</c> <c>panic</c>, <c>log_min_duration_statement</c> <c>-1</c>,
+    /// <c>log_min_duration_sample</c> <c>-1</c> or <c>log_statement_sample_rate</c> <c>0</c>, and
+    /// <c>log_transaction_sample_rate</c> <c>0</c>. Otherwise the <c>ALTER ROLE</c> is never sent, and the call fails
+    /// with a message that names those settings and the remedies: a superuser as the server user,
+    /// <c>GRANT SET ON PARAMETER</c> on them to the server user, or server values that keep statement text out of the
+    /// log. The server's own settings are never changed. The exceptions raised here never quote a statement, so
+    /// neither the password nor the verifier appears in their messages.
     /// </para>
     /// <para>
     /// When a step fails, the database and the role are dropped again before the failure is reported, so a failed call
     /// leaves nothing behind. The failure is reported as <see cref="DescribeServerFailure"/> describes it, with no
-    /// inner exception, because PostgreSQL's and Npgsql's messages can quote the username or the database.
+    /// inner exception, because PostgreSQL's and Npgsql's messages can quote the username or the database; a refusal
+    /// to set the password adds its own fixed message, which names server settings only.
     /// </para>
     /// </remarks>
     /// <param name="connectionString">
@@ -272,9 +377,10 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <see cref="CreateDatabaseConnectionString"/> returned.
     /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// The fixture has not been initialized, or a step failed; the message is then the one
-    /// <see cref="DescribeServerFailure"/> builds, which also says when dropping the database and the role again
-    /// failed, and carries no inner exception.
+    /// The fixture has not been initialized, or a step failed, including the refusal to set the password while the
+    /// server log could record it; the message is then the one <see cref="DescribeServerFailure"/> builds, which also
+    /// says when dropping the database and the role again failed and, for that refusal, names the settings, and it
+    /// carries no inner exception.
     /// </exception>
     /// <exception cref="OperationCanceledException">
     /// <paramref name="cancellationToken"/> was cancelled, and the database and the role were dropped again.
@@ -304,9 +410,18 @@ public sealed partial class TestPostgres : IAsyncLifetime
             $"REVOKE CONNECT, TEMPORARY ON DATABASE \"{name}\" FROM PUBLIC",
         ];
 
+        // Every statement runs in one session that ends with this call: unpooled, so the setting SetLoginPasswordAsync
+        // changes for the session never passes to a later user of the connection, even when a step fails before it is
+        // reset. The maintenance string is never multiplexed, which Npgsql allows only on a pooled connection and which
+        // could spread the statements over several sessions.
+        string provisioning = new NpgsqlConnectionStringBuilder(maintenance)
+        {
+            Pooling = false,
+        }.ConnectionString;
+
         try
         {
-            await using NpgsqlConnection connection = new(maintenance);
+            await using NpgsqlConnection connection = new(provisioning);
             await connection.OpenAsync(cancellationToken);
             await ExecuteStatementsAsync(connection, roleStatements, transaction: null, cancellationToken);
             await SetLoginPasswordAsync(connection, name, verifier, cancellationToken);
@@ -326,11 +441,16 @@ public sealed partial class TestPostgres : IAsyncLifetime
                 cleanupFailure = exception;
             }
 
+            // A refusal to set the password is fixed text that names server settings only, so its message is reported.
+            string refusal = creationFailure is StatementLoggingUnsafeException unsafeLogging
+                ? " " + unsafeLogging.Message
+                : string.Empty;
+
             if (cleanupFailure is not null)
             {
                 // Reported even when the run is being cancelled: the database or the role may be left behind.
                 throw new InvalidOperationException(DescribeServerFailure(
-                    "Creating a test database and its login role failed, and so did dropping them again.",
+                    "Creating a test database and its login role failed, and so did dropping them again." + refusal,
                     new AggregateException(creationFailure, cleanupFailure)));
             }
 
@@ -341,7 +461,7 @@ public sealed partial class TestPostgres : IAsyncLifetime
             }
 
             throw new InvalidOperationException(DescribeServerFailure(
-                "Creating a test database and its login role failed.",
+                "Creating a test database and its login role failed." + refusal,
                 creationFailure));
         }
     }
@@ -729,16 +849,13 @@ public sealed partial class TestPostgres : IAsyncLifetime
             ? $"The PostgreSQL server {ServerVariable} selects rejected the login."
             : $"The {ComposeService} PostgreSQL server rejected the login.";
 
-        // Unpooled, so the per-attempt limits set below never leave a pool behind for each value they take. Npgsql
-        // accepts multiplexing only on a pooled connection, so the probe also turns off a multiplexing the server
-        // string asks for; the strings CreateDatabaseConnectionString hands out keep
-        // it. A cancellation timeout of -1 abandons a
+        // Unpooled, so the per-attempt limits set below never leave a pool behind for each value they take, which
+        // Npgsql accepts because the maintenance string is never multiplexed. A cancellation timeout of -1 abandons a
         // timed-out or cancelled attempt at once, instead of first waiting up to two seconds for an answer to a
         // cancellation request, which a stalled server never sends.
         NpgsqlConnectionStringBuilder probe = new(MaintenanceConnectionString())
         {
             Pooling = false,
-            Multiplexing = false,
             CancellationTimeout = -1,
         };
         int connectLimit = probe.Timeout;
@@ -838,16 +955,69 @@ public sealed partial class TestPostgres : IAsyncLifetime
         return new InvalidOperationException(description + " " + hint);
     }
 
+    // Fails when a test database's connection could present an ambient client certificate, as InitializeAsync
+    // describes. Npgsql 8 sends a TLS request on every connection whose SSL Mode is not Disable, under Allow once a
+    // login without TLS has failed, and offers the certificate in the TLS handshake whenever the other end accepts that
+    // request. Each test database's connection settles that for itself, under its own login and on whichever host
+    // answers it, so only SSL Mode=Disable keeps an ambient certificate away from it. The message names where the
+    // certificate comes from, never its value or path.
+    private static void RejectAmbientClientCertificate(SslMode sslMode)
+    {
+        if (sslMode == SslMode.Disable)
+        {
+            return;
+        }
+
+        string? source = FindAmbientClientCertificate();
+        if (source is null)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Npgsql would present one ambient TLS client certificate on the connections of every test database, "
+            + $"because {source}, so the test databases' login roles would share one TLS identity. For the test run, "
+            + $"unset {ClientCertificateVariable} and remove {ClientCertificateFile} from the PostgreSQL directory under "
+            + $"the user's home, or select the server through {ServerVariable} with SSL Mode=Disable in its "
+            + $"connection string.");
+    }
+
+    // Mirrors where Npgsql 8 finds a client certificate for a connection string that names none, and returns which
+    // source it would use, or null when it would find none. PGSSLCERT counts once it is set, even to an empty value,
+    // as it does for Npgsql, which then never looks for the file. Npgsql looks for the key only once it has found a
+    // certificate, so the key's sources decide nothing here.
+    private static string? FindAmbientClientCertificate()
+    {
+        if (Environment.GetEnvironmentVariable(ClientCertificateVariable) is not null)
+        {
+            return ClientCertificateFromVariable;
+        }
+
+        bool windows = OperatingSystem.IsWindows();
+        string? home = Environment.GetEnvironmentVariable(windows ? "APPDATA" : "HOME");
+        return home is not null
+            && File.Exists(Path.Combine(home, windows ? "postgresql" : ".postgresql", ClientCertificateFile))
+            ? ClientCertificateFromFile
+            : null;
+    }
+
     // The selected server's own connection string, with the server user's credentials. It stays inside this class.
     private string ServerConnectionString()
     {
         return _server ?? throw new InvalidOperationException(NotInitialized);
     }
 
+    // The server connection string on the maintenance database, where the fixture's statements run one after another.
+    // It is never multiplexed, whatever the server string asks: Npgsql accepts multiplexing only on a pooled
+    // connection, and the server string may turn pooling off, or a caller may. Its pooling and every other setting
+    // stay as the server string has them.
     private string MaintenanceConnectionString()
     {
-        return new NpgsqlConnectionStringBuilder(ServerConnectionString()) { Database = MaintenanceDatabase }
-            .ConnectionString;
+        return new NpgsqlConnectionStringBuilder(ServerConnectionString())
+        {
+            Database = MaintenanceDatabase,
+            Multiplexing = false,
+        }.ConnectionString;
     }
 
     // Runs the statements in order on one connection, each as its own autocommit command, and stops at the first that
@@ -877,42 +1047,135 @@ public sealed partial class TestPostgres : IAsyncLifetime
         }
     }
 
-    // Gives the role its password with the one statement whose text carries the verifier, in a transaction of its own.
-    // For a superuser server user, the transaction first turns off the settings that would copy that text into the
-    // server log, whether the ALTER ROLE succeeds, fails or runs slowly. SET LOCAL lasts only until the transaction
-    // ends, so every other statement is logged as the server is configured. Any other server user cannot change those
-    // settings, so for it only the server's own statement logging can still record the verifier, never the plain text:
-    // log_statement ddl or all, which the server's operator has to enable, and, under the default
-    // log_min_error_statement, a failure of the ALTER ROLE itself. Disposing the transaction uncommitted rolls it back,
-    // so a failure leaves the role without a password.
+    // Gives the role its password with the one statement whose text carries the verifier, in a transaction of its own,
+    // and sends that statement only once no way in StatementTextLogging can copy its text into the server log, whether
+    // it succeeds, fails, is cancelled or runs slowly. Every setting of those ways that the server user may change is
+    // turned off for that transaction alone: log_transaction_sample_rate for the session, before the transaction
+    // begins, and reset once it has committed, and every other one with SET LOCAL, which lasts only until the
+    // transaction ends. Every other statement is therefore logged as the server is configured. When the server user
+    // may change none of a way's settings and the server's values keep it open, the statement is never sent and the
+    // StatementLoggingUnsafeException raised names those settings. Disposing the transaction uncommitted rolls it
+    // back, so a failure leaves the role without a password. The connection must be unpooled and not multiplexed, so
+    // that the session's setting ends with its one session when a step fails before the reset. The setting names and
+    // values reach the SQL text only from StatementTextLogging.
     private static async Task SetLoginPasswordAsync(
         NpgsqlConnection connection,
         string name,
         string verifier,
         CancellationToken cancellationToken)
     {
-        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
+        List<(string Name, string Off)> changes = await PlanStatementLoggingChangesAsync(connection, cancellationToken);
+        List<string> sessionChanges = changes
+            .Where(static change => change.Name == TransactionSampleRate)
+            .Select(static change => $"SET {change.Name} = '{change.Off}'")
+            .ToList();
+        List<string> transactionChanges = changes
+            .Where(static change => change.Name != TransactionSampleRate)
+            .Select(static change => $"SET LOCAL {change.Name} = '{change.Off}'")
+            .ToList();
 
-        bool superuser;
-        await using (NpgsqlCommand check = new(
-            "SELECT current_setting('is_superuser') = 'on'",
-            connection,
-            transaction))
+        // Npgsql sends BEGIN only with the transaction's first command, so this runs before the transaction starts.
+        await ExecuteStatementsAsync(connection, sessionChanges, transaction: null, cancellationToken);
+
+        await using (NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken))
         {
-            superuser = await check.ExecuteScalarAsync(cancellationToken) is true;
+            await ExecuteStatementsAsync(connection, transactionChanges, transaction, cancellationToken);
+            await ExecuteStatementsAsync(
+                connection,
+                [$"ALTER ROLE \"{name}\" PASSWORD '{verifier}'"],
+                transaction,
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
         }
 
-        if (superuser)
+        if (sessionChanges.Count > 0)
         {
-            await ExecuteStatementsAsync(connection, StatementLoggingOff, transaction, cancellationToken);
+            await ExecuteStatementsAsync(
+                connection,
+                [$"RESET {TransactionSampleRate}"],
+                transaction: null,
+                cancellationToken);
+        }
+    }
+
+    // Reads each setting of StatementTextLogging in this session and returns the ones to turn off: every one the
+    // server user may change. A superuser may change each of them, any user one whose context is user, and any other
+    // user one it holds the SET privilege on. A way that none of its settings closes, because the server user may
+    // change none of them and none already has its Off value, raises StatementLoggingUnsafeException naming all of its
+    // settings; a setting that pg_settings does not show counts as one that keeps its way open.
+    private static async Task<List<(string Name, string Off)>> PlanStatementLoggingChangesAsync(
+        NpgsqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        Dictionary<string, (string? Value, bool Settable)> current = new(StringComparer.Ordinal);
+        await using (NpgsqlCommand read = new(
+            "SELECT name, setting, current_setting('is_superuser') = 'on' OR context = 'user' "
+                + "OR has_parameter_privilege(name, 'SET') FROM pg_settings WHERE name = ANY(@names)",
+            connection))
+        {
+            read.Parameters.AddWithValue(
+                "names",
+                StatementTextLogging.SelectMany(static way => way).Select(static setting => setting.Name).ToArray());
+            await using NpgsqlDataReader reader = await read.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                string? value = reader.IsDBNull(1) ? null : reader.GetString(1);
+                current[reader.GetString(0)] = (value, reader.GetBoolean(2));
+            }
         }
 
-        await ExecuteStatementsAsync(
-            connection,
-            [$"ALTER ROLE \"{name}\" PASSWORD '{verifier}'"],
-            transaction,
-            cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+        List<(string Name, string Off)> changes = [];
+        List<string> open = [];
+        foreach ((string Name, string Off)[] way in StatementTextLogging)
+        {
+            bool closed = false;
+            foreach ((string Name, string Off) setting in way)
+            {
+                if (!current.TryGetValue(setting.Name, out (string? Value, bool Settable) state))
+                {
+                    continue;
+                }
+
+                if (state.Settable)
+                {
+                    changes.Add(setting);
+                    closed = true;
+                }
+                else if (string.Equals(state.Value, setting.Off, StringComparison.Ordinal))
+                {
+                    closed = true;
+                }
+            }
+
+            if (!closed)
+            {
+                open.AddRange(way.Select(static setting => setting.Name));
+            }
+        }
+
+        if (open.Count > 0)
+        {
+            throw new StatementLoggingUnsafeException(open);
+        }
+
+        return changes;
+    }
+
+    // Raised instead of sending the statement that sets a login role's password, while the server log could record its
+    // text. The message is fixed text naming the settings that keep a way open, never a value, a username or a
+    // statement, so CreateDatabaseAsync reports it in full.
+    private sealed class StatementLoggingUnsafeException(IReadOnlyList<string> settings)
+        : Exception(Describe(settings))
+    {
+        private static string Describe(IReadOnlyList<string> settings)
+        {
+            string names = string.Join(", ", settings);
+            return "The login role's password was not set, because the server log could record the statement that "
+                + $"sets it: the server user may not change the server settings {names}, and their values let that "
+                + "statement's text reach the log. Use a superuser as the server user, grant the server user SET on "
+                + $"them (GRANT SET ON PARAMETER {names} TO <server user>), or configure them on the server to "
+                + "values that keep statement text out of the log.";
+        }
     }
 
     // Each drop opens its own connection, so the role is still dropped when the database drop fails, even on a broken
@@ -959,7 +1222,10 @@ public sealed partial class TestPostgres : IAsyncLifetime
     // of: for a server user that is neither a superuser nor a member of pg_signal_backend, an autovacuum worker that
     // happens to be processing the database. The fallback then ends the role's own sessions, which the GRANT in
     // CreateDatabaseAsync lets the server user do, and runs a plain DROP DATABASE: that locks the database against new
-    // sessions, stops autovacuum workers itself and waits up to 5 seconds for the ended sessions to exit.
+    // sessions, stops autovacuum workers itself and waits up to 5 seconds for the ended sessions to exit. Both run on
+    // one connection, in that order. The query that finds the sessions binds the database and role names as
+    // parameters, because there they are values. DROP DATABASE takes the name as an identifier, which cannot be a
+    // parameter, so there it reaches the SQL text quoted, in the form ParseTestDatabase validated.
     private static async Task DropTestDatabaseAsync(
         string maintenance,
         string name,
@@ -974,13 +1240,22 @@ public sealed partial class TestPostgres : IAsyncLifetime
         }
         catch (PostgresException refused) when (refused.SqlState == PostgresErrorCodes.InsufficientPrivilege)
         {
-            await ExecuteOnMaintenanceDatabaseAsync(
-                maintenance,
-                [
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                        + $"WHERE datname = '{name}' AND usename = '{name}'",
-                    $"DROP DATABASE IF EXISTS \"{name}\"",
-                ],
+            await using NpgsqlConnection connection = new(maintenance);
+            await connection.OpenAsync(cancellationToken);
+
+            await using (NpgsqlCommand terminate = new(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = @database AND usename = @role",
+                connection))
+            {
+                terminate.Parameters.AddWithValue("database", name);
+                terminate.Parameters.AddWithValue("role", name);
+                await terminate.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await ExecuteStatementsAsync(
+                connection,
+                [$"DROP DATABASE IF EXISTS \"{name}\""],
+                transaction: null,
                 cancellationToken);
         }
     }

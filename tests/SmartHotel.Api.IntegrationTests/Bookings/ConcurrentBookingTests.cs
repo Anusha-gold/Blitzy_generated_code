@@ -33,6 +33,20 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
         + "WHERE datname = current_database() AND pid <> @holderPid AND pid <> pg_backend_pid() "
         + "AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%'";
 
+    // The holder's session and the observer's, both outside the API's pool.
+    private const int ControlSessions = 2;
+
+    // How many sessions the server lets this class's login role have open at once: the slots left to a role that is
+    // neither a superuser nor a member of pg_use_reserved_connections, capped by the role's and the database's own
+    // connection limits, where -1 means none. reserved_connections arrived in PostgreSQL 16; an older server reserves
+    // no such slots. LEAST ignores the NULL that a limit of -1 becomes.
+    private const string SessionCapacitySql =
+        "SELECT least("
+        + "current_setting('max_connections')::int - current_setting('superuser_reserved_connections')::int "
+        + "- coalesce(current_setting('reserved_connections', true)::int, 0), "
+        + "(SELECT nullif(rolconnlimit, -1) FROM pg_roles WHERE rolname = current_user), "
+        + "(SELECT nullif(datconnlimit, -1) FROM pg_database WHERE datname = current_database()))";
+
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan ObservationLimit = TimeSpan.FromSeconds(15);
     // The whole drain, from the release: the wait for the client tasks, the factory's drain of the server's requests,
@@ -66,6 +80,10 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
 
+        // Before any lock is taken, so a server or pool too small for the test fails it here with that reason, rather
+        // than as waiters not observed in time.
+        await AssertSessionCapacityAsync(_factory, ct);
+
         ApiTestClient.GuestSession session = await _client.RegisterGuestAsync(ct);
         int hotelId = await _factory.GetHotelIdAsync(HotelName, ct);
         SmartHotelApiFactory.SeededRoomType roomType = await _factory.GetRoomTypeAsync(HotelName, RoomTypeName, ct);
@@ -82,10 +100,18 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
 
         Assert.Equal(1, await AvailableRoomsAsync(hotelId, roomTypeId, checkIn, checkOut, ct));
 
+        // Every session the contention needs is open before the lock is taken and before any request starts: the
+        // observer's and the holder's, outside the API's pool, and Concurrency sessions in the API's pool, which the
+        // requests then find idle there. A server whose free slots other sessions hold fails the test here, with that
+        // reason, rather than as a request or the observer left without a session and the waiters not observed in
+        // time. Each connection is disposed on every path, and the holder has no transaction yet.
+        await using NpgsqlConnection observer = await OpenControlSessionAsync(_factory, ct);
+        await using NpgsqlConnection holder = await OpenControlSessionAsync(_factory, ct);
+        await ReserveRequestSessionsAsync(_factory, ct);
+
         // The holder takes the room type's row lock before any request starts, so every request blocks at its own
         // FOR UPDATE. Seeing all of them queued there proves that the requests passed authentication, validation and
         // the lookups and contend inside PostgreSQL at the critical section together, rather than one after another.
-        await using NpgsqlConnection holder = await _factory.OpenDatabaseConnectionAsync(ct);
         await using NpgsqlTransaction holderTx = await holder.BeginTransactionAsync(ct);
         await using NpgsqlCommand lockCommand = new(LockRoomTypeSql, holder, holderTx);
         lockCommand.Parameters.AddWithValue("id", roomTypeId);
@@ -114,7 +140,7 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
                 }
 
                 (bool observed, long lastCount) = await ObserveWaitersAsync(
-                    _factory,
+                    observer,
                     holderPid,
                     ct);
                 if (!observed)
@@ -193,11 +219,117 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
         return Assert.Single(detail.RoomTypes, roomType => roomType.Id == roomTypeId).AvailableRooms;
     }
 
-    // Polls until exactly Concurrency sessions wait behind the holder's lock. One deadline covers opening the
-    // observer, every poll and every pause, and a count read after it is not accepted. Returns whether the waiters
-    // were seen in time, with the last count read in time (-1 for none).
-    private static async Task<(bool Observed, long LastCount)> ObserveWaitersAsync(
+    // Fails the test unless every session it needs can be open at once: the API's pool must allow Concurrency
+    // sessions, and the server must let this class's login role have those and the ControlSessions together. Otherwise
+    // some requests would queue for a pool slot or fail for a server slot instead of waiting at the lock, and the
+    // observation would only time out. These are the configured limits, not the sessions open right now, which
+    // OpenControlSessionAsync and ReserveRequestSessionsAsync settle by opening them. The server's are read on one
+    // short-lived session outside the API's pool. The messages name the limits, never their values.
+    private static async Task AssertSessionCapacityAsync(
         SmartHotelApiFactory factory,
+        CancellationToken cancellationToken)
+    {
+        if (new NpgsqlConnectionStringBuilder(factory.DatabaseConnectionString).MaxPoolSize < Concurrency)
+        {
+            Assert.Fail(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The test database's connection string lets the API's pool open fewer than {Concurrency} sessions "
+                + $"(Maximum Pool Size), so the {Concurrency} concurrent booking requests cannot all reach PostgreSQL."));
+        }
+
+        int capacity;
+        await using (NpgsqlConnection connection = await OpenControlSessionAsync(factory, cancellationToken))
+        await using (NpgsqlCommand command = new(SessionCapacitySql, connection))
+        {
+            capacity = (int)(await command.ExecuteScalarAsync(cancellationToken))!;
+        }
+
+        if (capacity < Concurrency + ControlSessions)
+        {
+            Assert.Fail(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The PostgreSQL server cannot give this test class's login role {Concurrency + ControlSessions} "
+                + $"sessions at once, {Concurrency} for the booking requests and {ControlSessions} for the lock holder "
+                + $"and the observer: max_connections less superuser_reserved_connections and reserved_connections, "
+                + $"the role's connection limit or the database's connection limit is lower. Select a server with more "
+                + $"connection slots through SMARTHOTEL_TEST_POSTGRES."));
+        }
+    }
+
+    // Opens a session of the test's own outside the API's pool, or fails the test when the server has no connection
+    // slot free for it.
+    private static async Task<NpgsqlConnection> OpenControlSessionAsync(
+        SmartHotelApiFactory factory,
+        CancellationToken cancellationToken) =>
+        await factory.TryOpenDatabaseConnectionAsync(pooled: false, cancellationToken) ?? throw SessionRefused();
+
+    // Opens Concurrency sessions of the API's own pool at once, each held open until every open has ended, and then
+    // returns them to the pool, so that many sessions stay open on the server, idle in the pool, for the requests to
+    // take instead of opening sessions of their own. The pool keeps an idle session for its connection idle lifetime,
+    // minutes rather than the seconds the test takes. Fails the test when the server refused one of them for want of a
+    // free slot, and rethrows any other failure; either way only once every connection that opened is disposed.
+    private static async Task ReserveRequestSessionsAsync(
+        SmartHotelApiFactory factory,
+        CancellationToken cancellationToken)
+    {
+        List<Task<NpgsqlConnection?>> opens = new(Concurrency);
+        for (int opened = 0; opened < Concurrency; opened++)
+        {
+            opens.Add(factory.TryOpenDatabaseConnectionAsync(pooled: true, cancellationToken));
+        }
+
+        // Ends only when every open has, however it ended, so each session that opened is held until then.
+        Task allEnded = Task.WhenAll(opens);
+        await allEnded.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+
+        List<Exception> failures = [];
+        bool refused = false;
+        foreach (Task<NpgsqlConnection?> open in opens)
+        {
+            try
+            {
+                // Already ended, so this does not wait.
+                NpgsqlConnection? connection = await open;
+                if (connection is null)
+                {
+                    refused = true;
+                    continue;
+                }
+
+                await connection.DisposeAsync();
+            }
+            catch (Exception exception)
+            {
+                failures.Add(exception);
+            }
+        }
+
+        // The test's cancellation is reported once, rather than as each open it cancelled.
+        cancellationToken.ThrowIfCancellationRequested();
+        if (refused)
+        {
+            failures.Add(SessionRefused());
+        }
+
+        ThrowFailures(failures);
+    }
+
+    // The server refused a session the test needs, before the lock is taken. The message names the limit, never a
+    // value of the connection string.
+    private static FailException SessionRefused() =>
+        FailException.ForFailure(string.Create(
+            CultureInfo.InvariantCulture,
+            $"The PostgreSQL server refused a session this test needs (SQLSTATE 53300, too_many_connections): fewer "
+            + $"than {Concurrency + ControlSessions} connection slots are free for this test class's login role, "
+            + $"{Concurrency} for the booking requests and {ControlSessions} for the lock holder and the observer, "
+            + $"because other sessions hold the rest. Run the test when the server has more free connection slots, or "
+            + $"select another server through SMARTHOTEL_TEST_POSTGRES."));
+
+    // Polls the observer until exactly Concurrency sessions wait behind the holder's lock. One deadline covers every
+    // poll and every pause, and a count read after it is not accepted. Returns whether the waiters were seen in time,
+    // with the last count read in time (-1 for none).
+    private static async Task<(bool Observed, long LastCount)> ObserveWaitersAsync(
+        NpgsqlConnection observer,
         int holderPid,
         CancellationToken cancellationToken)
     {
@@ -209,7 +341,6 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
         {
             // No transaction on the observer: each poll is its own autocommit statement and so reads a fresh
             // pg_stat_activity snapshot, while inside a transaction every poll would return the first one again.
-            await using NpgsqlConnection observer = await factory.OpenDatabaseConnectionAsync(deadline.Token);
             await using NpgsqlCommand countWaiters = new(CountWaitersSql, observer);
             countWaiters.Parameters.AddWithValue("holderPid", holderPid);
 
@@ -234,8 +365,7 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
         catch (OperationCanceledException) when (deadline.IsCancellationRequested
             && !cancellationToken.IsCancellationRequested)
         {
-            // The deadline passed while opening the observer, polling or pausing. The test's own cancellation is
-            // not caught.
+            // The deadline passed while polling or pausing. The test's own cancellation is not caught.
             return (false, lastCount);
         }
     }

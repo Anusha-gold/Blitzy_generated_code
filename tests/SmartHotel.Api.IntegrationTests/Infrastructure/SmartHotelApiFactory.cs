@@ -591,19 +591,73 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
     /// <summary>
     /// Opens a new connection of the test's own to <see cref="DatabaseName"/>, outside the host's services, for a
-    /// session the API does not control, such as one that holds a row lock in a transaction of its own.
+    /// session the API does not control, such as one that holds a row lock in a transaction of its own or one that
+    /// observes the server's activity.
     /// </summary>
+    /// <remarks>
+    /// The connection is unpooled: it is <see cref="DatabaseConnectionString"/> with <c>Pooling</c> off, so it never
+    /// takes one of the sessions the API's pool may open, and disposing it ends its session on the server. A test that
+    /// must tell a server without a free connection slot apart from other failures uses
+    /// <see cref="TryOpenDatabaseConnectionAsync"/> instead.
+    /// </remarks>
     /// <param name="cancellationToken">Cancels the open.</param>
     /// <returns>The open connection, with no transaction begun; the caller disposes it.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The connection could not be opened. The message names only the operation, the exception types, any SQLSTATE
-    /// and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c> without its value, and carries no inner exception,
-    /// because a provider message can quote the username or the database.
+    /// The connection could not be opened, including when the server has no connection slot free for it. The message
+    /// names only the operation, the exception types, any SQLSTATE and the server note naming
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c> without its value, and carries no inner exception, because a provider message
+    /// can quote the username or the database.
     /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<NpgsqlConnection> OpenDatabaseConnectionAsync(CancellationToken cancellationToken)
     {
-        NpgsqlConnection connection = new(DatabaseConnectionString);
+        // Never null: a refusal for want of a free slot is described and thrown like any other failure here.
+        return (await OpenConnectionAsync(pooled: false, refusalReturnsNull: false, cancellationToken))!;
+    }
+
+    /// <summary>
+    /// Opens a new connection of the test's own to <see cref="DatabaseName"/>, outside the host's services, unless the
+    /// server has no connection slot free for it: an unpooled one for a session the API does not control, such as one
+    /// that holds a row lock in a transaction of its own, or one from the API's own pool.
+    /// </summary>
+    /// <remarks>
+    /// An unpooled connection is <see cref="DatabaseConnectionString"/> with <c>Pooling</c> off, so it never takes one
+    /// of the sessions the API's pool may open, and disposing it ends its session on the server. A pooled one uses
+    /// <see cref="DatabaseConnectionString"/> as it is, the string the API's database context opens its connections
+    /// with, so it comes from the pool the API's requests draw from, and disposing it returns its session to that pool,
+    /// open and idle.
+    /// </remarks>
+    /// <param name="pooled">Whether the connection comes from the API's own pool.</param>
+    /// <param name="cancellationToken">Cancels the open.</param>
+    /// <returns>
+    /// The open connection, with no transaction begun, which the caller disposes; or <see langword="null"/> when the
+    /// server refused the session because no connection slot is free for the login role or the database
+    /// (SQLSTATE 53300, too_many_connections).
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// The connection could not be opened for any other reason. The message names only the operation, the exception
+    /// types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c> without its value, and carries no
+    /// inner exception, because a provider message can quote the username or the database.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public Task<NpgsqlConnection?> TryOpenDatabaseConnectionAsync(
+        bool pooled,
+        CancellationToken cancellationToken)
+    {
+        return OpenConnectionAsync(pooled, refusalReturnsNull: true, cancellationToken);
+    }
+
+    // Opens a connection to this factory's database, unpooled or from the API's pool. A refusal for want of a free
+    // connection slot (SQLSTATE 53300) returns null when refusalReturnsNull is set, and is described like any other
+    // failure otherwise.
+    private async Task<NpgsqlConnection?> OpenConnectionAsync(
+        bool pooled,
+        bool refusalReturnsNull,
+        CancellationToken cancellationToken)
+    {
+        NpgsqlConnection connection = new(pooled
+            ? DatabaseConnectionString
+            : new NpgsqlConnectionStringBuilder(DatabaseConnectionString) { Pooling = false }.ConnectionString);
         try
         {
             await connection.OpenAsync(cancellationToken);
@@ -617,6 +671,14 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
             {
                 // Raised afresh, so that no provider exception rides along as its inner exception.
                 throw new OperationCanceledException(cancellationToken);
+            }
+
+            // A refusal for want of a free slot, when the caller handles it, is returned, not described. The server's
+            // message, which names the role or the database, is dropped with the exception.
+            if (refusalReturnsNull
+                && exception is PostgresException { SqlState: PostgresErrorCodes.TooManyConnections })
+            {
+                return null;
             }
 
             throw new InvalidOperationException(
