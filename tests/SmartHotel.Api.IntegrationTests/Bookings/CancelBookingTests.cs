@@ -631,9 +631,12 @@ public sealed class CancelBookingTests : IClassFixture<SmartHotelApiFactory>
     }
 
     // One run of Cancel_CheckInToday_Returns204: books a one-night stay from today (UTC) through the API and cancels it
-    // as its owner. The run reads the date before the booking and again once its last response has arrived. When the
-    // two differ, midnight UTC passed during the run, which then asserts nothing and returns false. Otherwise it
-    // requires the 201 for a stay from that date, the 204 and the stored Cancelled status, and returns true.
+    // as its owner. The date is read before the booking, after the cancel response and, when the create is not 201,
+    // after the create response. A create other than 201 while the date has changed returns false with nothing
+    // asserted, so the caller can run again with the new date; the refusal is taken to be midnight passing, not shown
+    // to be. Otherwise the run requires the 201 and a booking body, cancels, and returns false if the date has changed
+    // by the cancel response, without checking the check-in, the 204 or the stored status. With the date unchanged it
+    // requires a check-in on that date, the 204 and the stored Cancelled status, and returns true.
     private async Task<bool> TryCancelCheckInTodayAsync(
         ApiTestClient.GuestSession owner,
         SmartHotelApiFactory.SeededRoomType roomType,
@@ -646,7 +649,7 @@ public sealed class CancelBookingTests : IClassFixture<SmartHotelApiFactory>
             cancellationToken);
         if (created.StatusCode != HttpStatusCode.Created && ApiTestClient.TodayUtc != today)
         {
-            // The check-in had become yesterday by the time the server checked it, so the booking was refused.
+            // A refusal during a date change is taken to be the stay starting yesterday; its cause is not checked.
             return false;
         }
 

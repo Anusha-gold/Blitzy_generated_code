@@ -154,7 +154,7 @@ To choose the values yourself, set the optional first-start overrides `SMARTHOTE
 
 An override must have this format:
 
-- A single line made only of the letters `A-Z` and `a-z`, the digits `0-9` and the characters `. _ ~ + / = -`. These need no quoting in the shell, in a connection string or in PostgreSQL's initialization.
+- A single line made only of the letters `A-Z` and `a-z`, the digits `0-9` and the characters `. _ ~ + / = -`. These need no quoting in a connection string, in PostgreSQL's initialization or in a `.env` file, which Compose reads without a shell. In a shell, put the value in single quotes, as in `export SMARTHOTEL_DB_PASSWORD='<your password>'`: unquoted, a leading `~` can expand to a home directory, and in zsh a leading `=` to a command's path, before the wrapper checks the value, so the stored secret can silently differ from what you typed.
 - `SMARTHOTEL_DB_PASSWORD`: 16–128 characters.
 - `SMARTHOTEL_JWT_SIGNING_KEY`: 32–256 characters.
 
@@ -172,10 +172,10 @@ The supported reset removes the database and the secrets together:
 docker compose down -v
 ```
 
-- Secret files are written only when absent, so `SMARTHOTEL_DB_PASSWORD` and `SMARTHOTEL_JWT_SIGNING_KEY` are read only on a first start. Later starts ignore them and log a notice.
+- Secret files are written only when absent, so `SMARTHOTEL_DB_PASSWORD` and `SMARTHOTEL_JWT_SIGNING_KEY` are read only while a secret file is missing, normally on a first start. Once both files exist, later starts ignore them and log a notice.
 - PostgreSQL applies its password only when it initializes an empty data directory, so a restart never changes the database role's password.
 - A changed override therefore takes effect only after `docker compose down -v`.
-- Removing only the `db-data` volume is safe: PostgreSQL re-initializes it with the retained password.
+- Removing only the `db-data` volume keeps the secrets consistent, because PostgreSQL re-initializes it with the retained password. It also deletes every guest account and booking: the next start restores only the seeded catalogue of hotels, room types and rooms.
 - Do not remove only the `secrets` volume while `db-data` survives. The next start generates a password that no longer matches the database role, and the API cannot connect. Recover with `docker compose down -v`.
 
 ## API overview

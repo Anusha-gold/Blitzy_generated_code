@@ -31,9 +31,11 @@ const target = resolveStackTarget();
 process.env['E2E_BASE_URL'] = target.baseUrl;
 process.env['E2E_API_URL'] = target.apiUrl;
 
-// Stops Playwright from saving a page snapshot (DOM text, including the
-// signed-in guest's email) with each failure. Workers inherit it, and
-// re-loading this file in a worker sets it again.
+// This switch turns off Playwright's fallback failure page snapshot, which
+// would hold page text such as the signed-in guest's email. Workers inherit
+// it, and re-loading this file in a worker sets it again. A failed matcher may
+// still write its ARIA error context to `error-context.md`, which
+// `preserveOutput: 'never'` deletes when the test completes normally.
 process.env['PLAYWRIGHT_NO_COPY_PROMPT'] = '1';
 
 /**

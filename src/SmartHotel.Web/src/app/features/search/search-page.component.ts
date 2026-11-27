@@ -79,12 +79,13 @@ export class SearchPageComponent {
    * date inputs yield raw `yyyy-MM-dd` strings, and the guest count is a text
    * input with a numeric keyboard hint, so a decimal, exponent, signed,
    * white-space or incomplete entry such as `2.0`, `2e0` or `1e` stays exactly
-   * as typed, for the server to judge, instead of being read as a number. An
-   * empty guest count is left out of the search, so the server uses 1, except
-   * where the field still holds, unedited, the URL's own explicit empty
-   * `guests=`: that is the one place an empty field is sent, and the guest
-   * count's pristine state is what tells the two apart. These initial values
-   * are what `reset()` restores on the idle page, pristine as well.
+   * as typed, for the server to judge, instead of being read as a number. A
+   * guest count the guest cleared is left out of the URL, and `run` then sends
+   * the API 1. The one empty guest count that is sent is the URL's own
+   * explicit empty `guests=` while the field still holds it unedited: it goes
+   * to the API empty, for the server to judge, and the guest count's pristine
+   * state is what tells the two apart. These initial values are what `reset()`
+   * restores on the idle page, pristine as well.
    */
   protected readonly form = this.fb.group({
     city: '',
@@ -145,16 +146,16 @@ export class SearchPageComponent {
    * Writes the form's criteria into the URL, which runs the search. Every
    * criterion goes into the URL as the text its input holds, with one
    * exception: a guest count left exactly empty means the guest left that
-   * optional field blank, so it is left out and the server uses 1. The one
-   * place an empty guest count is sent is an unedited explicit empty from the
-   * URL: while the field still shows the current URL's own `guests=`, not
-   * edited since the page filled it in (the control is pristine), it goes out
-   * as `guests=` again, so the server judges it. Once the guest edits the
-   * field, even back to empty, an empty field is left out. Any other
-   * guest-count text, white space, a decimal, an exponent or an incomplete
-   * entry included, is written verbatim, so the server judges it. When the
-   * criteria, that guest count included, equal the current URL, the router
-   * would not emit, so the current query is replayed instead, and an
+   * optional field blank, so it is left out of the URL, and `run` supplies the
+   * explicit 1 the API receives. The one place an empty guest count is sent is
+   * an unedited explicit empty from the URL: while the field still shows the
+   * current URL's own `guests=`, not edited since the page filled it in (the
+   * control is pristine), it goes out as `guests=` again, so the server judges
+   * it. Once the guest edits the field, even back to empty, an empty field is
+   * left out. Any other guest-count text, white space, a decimal, an exponent
+   * or an incomplete entry included, is written verbatim, so the server judges
+   * it. When the criteria, that guest count included, equal the current URL,
+   * the router would not emit, so the current query is replayed instead, and an
    * unchanged re-submit sends the same text again. The element focused at
    * submit, normally the Search button that the pending state disables, is
    * recorded for the search this submit starts, so focus can return to it
@@ -168,8 +169,6 @@ export class SearchPageComponent {
     const { city, checkIn, checkOut, guests } = this.form.getRawValue();
     const current = this.route.snapshot.queryParamMap;
     const queryParams: Record<string, string> = { city, checkIn, checkOut };
-    // An empty field is sent only as the URL's own explicit empty `guests`,
-    // still unedited; one the guest cleared is left out, so the server uses 1.
     const keepsUrlEmpty = this.form.controls.guests.pristine && current.get('guests') === '';
     const sentGuests = guests === '' && !keepsUrlEmpty ? null : guests;
     if (sentGuests !== null) {

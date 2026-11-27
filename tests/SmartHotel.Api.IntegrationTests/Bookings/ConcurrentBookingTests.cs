@@ -57,9 +57,9 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
     // abort the requests still running and to give them its grace.
     private static readonly TimeSpan ServerDrainReserve = TimeSpan.FromSeconds(4);
 
-    // The end of DrainLimit, kept for the client tasks still pending once the factory's drain has ended. The
-    // in-process server completes a client's task when the request's pipeline returns or the request is aborted, so
-    // they complete at once unless their requests never reached the server.
+    // The end of DrainLimit, kept for the client tasks still pending once the factory's drain has ended, so they can
+    // settle independently of the server's drain: a drained server does not mean every client task, with its response
+    // buffering and continuations, has completed.
     private static readonly TimeSpan ClientSettleLimit = TimeSpan.FromSeconds(1);
 
     // How long before the wait for the client tasks ends the requests still running are cancelled, which leaves them
@@ -442,9 +442,8 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
             failures.Add(exception);
         }
 
-        // The in-process server completes a client task when its request's pipeline returns or the request is aborted,
-        // so after a drain that left nothing running, only a request that never reached the server leaves its task
-        // pending here.
+        // Even a drain that left nothing running on the server does not show that every client task has settled, so
+        // those still pending are given what is left of DrainLimit.
         if (!clientsStopped.IsCompleted)
         {
             await CompletesWithinAsync(clientsStopped, RemainingUntil(DrainLimit));

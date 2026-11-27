@@ -161,8 +161,10 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             expected[0].Key,
             ct);
 
-        // ProblemAssert has checked that errors is an object of message-string arrays with no repeated key. The keys
-        // and messages are compared in memory, and a failure names only the test's own fixed key.
+        // ProblemAssert has checked that errors is an object whose values are all arrays of message strings and that it
+        // holds the first expected key once. Comparing every member name, repeats included, with the expected keys then
+        // shows that errors holds exactly the broken fields' keys, each once. The keys and messages are compared in
+        // memory, and a failure names only the test's own fixed key.
         JsonElement errors = problem.GetProperty("errors");
         string[] keys = [.. errors.EnumerateObject().Select(static entry => entry.Name).Order(StringComparer.Ordinal)];
         string[] expectedKeys = [.. expected.Select(static entry => entry.Key).Order(StringComparer.Ordinal)];

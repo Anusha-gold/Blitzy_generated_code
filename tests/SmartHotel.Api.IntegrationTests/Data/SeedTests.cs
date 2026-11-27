@@ -731,11 +731,12 @@ public sealed class SeedTests : IClassFixture<SmartHotelApiFactory>
     // returns only once it has ended, so nothing the seed uses is disposed and its database is not dropped while it
     // runs. cancelFirst cancels the seed before the wait. A seed still running after DrainLimit is recorded as one that
     // did not end in time, then cancelled and waited for again; one still running DrainLimit after that is recorded as
-    // well, and then waited for until it ends. Its cancellation bounds that wait: the seed passes its token to every
-    // database call and to its execution strategy, which waits between retries under it, and a cancelled command ends
-    // even when the server does not answer, because the driver then breaks the connection. The two limits only detect
-    // and report a slow seed. Returns the seed's result, or null when it failed or ended by a cancellation requested
-    // here. Every failure, other than ending by that cancellation, is recorded for the caller, never thrown.
+    // well. The two limits only detect and report a slow seed, and the cancellation only asks it to stop: the seed
+    // passes its token to every database call that takes one and to its execution strategy, which waits between
+    // retries under it, and a cancelled command ends even when the server does not answer, because the driver then
+    // breaks the connection. The last wait is deliberately unbounded, so teardown never runs ahead of a seed that is
+    // still running. Returns the seed's result, or null when it failed or ended by a cancellation requested here.
+    // Every failure, other than ending by that cancellation, is recorded for the caller, never thrown.
     private static async Task<bool?> DrainSeedAsync(
         Task<bool> seed,
         CancellationTokenSource seedCancellation,

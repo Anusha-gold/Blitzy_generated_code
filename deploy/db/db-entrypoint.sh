@@ -46,23 +46,19 @@
 #   secrets and `db-data` must therefore be reset together, with
 #   "docker compose down -v".
 #
-# Line endings
-#   The file is bind-mounted and run as checked out, so it may have CRLF
-#   line endings, as a default Git for Windows checkout gives it. The guard
-#   below then runs its text again with every carriage return removed, or
-#   exits 1 with a stderr line naming the file when it cannot be read. An LF
-#   copy runs straight through.
-#
 # Never enable shell tracing or print the environment, which would expose
 # the secrets.
 #
-# Carriage-return guard. The quoted newline holds this file's own line
-# ending, so a CRLF copy is recognised without reading the file, and the
-# text it re-runs, which has no carriage return, cannot recurse. exec keeps
-# the process, and so the server it becomes, as PID 1. Every guard line ends
-# in a comment, which absorbs that line's carriage return, and no blank line
-# comes before the guard, because /bin/sh runs a lone carriage return as a
-# command.
+# Carriage-return guard. The file is bind-mounted and run as checked out,
+# so a default Git for Windows checkout can give it CRLF line endings. A
+# CRLF copy then runs again with every carriage return removed, or exits 1
+# naming the file when it cannot be read; an LF copy runs straight through.
+# The quoted newline holds this file's own line ending, so a CRLF copy is
+# recognised without reading the file, and the re-run text cannot recurse.
+# exec keeps the process, and so the server it becomes, as PID 1. Every
+# guard line ends in a comment, which absorbs that line's carriage return,
+# and no blank line comes before the guard, because /bin/sh runs a lone
+# carriage return as a command.
 _line_end='
 ' #
 case $_line_end in #
@@ -253,12 +249,12 @@ if [ "$#" -eq 0 ] || [ -z "$1" ]; then
     exit 2
 fi
 
-# The override values are expanded only where a secret file is missing, to
-# validate them and to write the missing file; "${VARIABLE:+set}" tests
-# whether an override is set without expanding its value. When both files
-# hold valid secrets nothing is validated or written: the overrides apply on
-# the first start only, so a changed one cannot stop a restart and is only
-# reported as ignored.
+# check_secrets validates both persisted files on every start. The override
+# values are expanded only where a secret file is missing, to validate them
+# and to write the missing file; "${VARIABLE:+set}" tests whether an override
+# is set without expanding its value. When both persisted files validate,
+# host override validation and file writes are skipped, so a changed override
+# cannot stop a restart and is only reported as ignored.
 check_secrets
 if [ "$db_password_missing" -eq 1 ] ||
     [ "$jwt_signing_key_missing" -eq 1 ]; then

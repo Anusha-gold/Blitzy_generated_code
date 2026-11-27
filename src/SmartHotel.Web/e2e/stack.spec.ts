@@ -74,25 +74,18 @@ const SEEDED_CITIES: ReadonlyArray<readonly [string, number]> = [
   ['Chicago', 1],
 ];
 
-/** The number of seeded hotels across all cities. */
 const SEEDED_HOTEL_COUNT = 5;
 
-/** The room type names every seeded hotel offers, sorted. */
 const SEEDED_ROOM_TYPE_NAMES = ['Deluxe', 'Family', 'Standard', 'Suite'];
 
-/** The number of rooms seeded for every room type. */
 const ROOMS_PER_TYPE = 10;
 
-/** Virtual users in the latency run, each with its own request context. */
 const USERS = 20;
 
-/** Sequential measured requests each virtual user sends. */
 const REQUESTS_PER_USER = 25;
 
-/** Warm-up requests sent before measuring; their timings are discarded. */
 const WARM_UP = 20;
 
-/** The highest acceptable 95th-percentile latency. */
 const THRESHOLD_MS = 1_000;
 
 /** Request options that return a redirect as-is, so only the direct response is checked and timed. */

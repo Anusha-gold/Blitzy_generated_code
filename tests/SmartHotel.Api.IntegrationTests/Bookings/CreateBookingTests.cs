@@ -713,7 +713,6 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             ServiceOverrides = services => AddContextInterceptors(services, failures),
         };
 
-        // A hand-built factory is not a fixture, so it is started here.
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
@@ -776,7 +775,6 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             ServiceOverrides = services => services.AddSingleton<IStartupFilter>(served),
         };
 
-        // A hand-built factory is not a fixture, so it is started here.
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
@@ -795,8 +793,8 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             await lockBookings.ExecuteNonQueryAsync(ct);
         }
 
-        // A request still running past its drain or its host's stop limit has every session the API holds in the
-        // variant's database ended, so nothing it waits on there outlasts it.
+        // For a request still running past its drain or its host's stop limit, an attempt is made to end every session
+        // the API holds in the variant's database, so that the request is not left waiting there.
         Func<List<Exception>, Task> endApiSessions = cleanupFailures => EndApiSessionsAsync(variant, cleanupFailures);
 
         // The request's own token: the test's cancellation reaches it, and so does the drain's cancellation of a
@@ -839,10 +837,10 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             {
                 // Runs on every path, the test's cancellation included. The holder changed nothing, so the rollback
                 // only releases the lock; the request is then drained, and the host is closed and seen to finish
-                // serving it. Each wait is bounded first, and work still running at its bound has its sessions ended
-                // and is awaited until it stops, so nothing is running into the next test or into the variant's
-                // database drop, and a late response is disposed below. No step throws, so each runs even when the
-                // one before it failed.
+                // serving it. Each wait is bounded first, and for work still running at its bound, an attempt is made
+                // to end its sessions before it is awaited until it stops, so nothing is running into the next test or
+                // into the variant's database drop, and a late response is disposed below. No step throws, so each
+                // runs even when the one before it failed.
                 await ReleaseHolderAsync(holder, holderTx, failures);
                 response = await DrainAsync(request, "booking request", requestCancellation, endApiSessions, failures);
                 await ObserveHostIdleAsync(served, endApiSessions, failures);
@@ -999,11 +997,11 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         {
             // Runs on every path, the test's cancellation included. A commit the server is completing takes effect
             // whatever the client does, so the held transaction commits once the injector is done with the holder
-            // session; the creation is then drained. Each wait is bounded first, and a creation still running at its
-            // bound has its sessions and the holder's ended and is awaited until it stops, so none is running into
-            // the next test and no held transaction is left without an owner. Neither step throws, so the drain runs
-            // even when the commit failed. The creation's context is disposed inside the creation, so a stopped
-            // creation has no command left running.
+            // session; the creation is then drained. Each wait is bounded first, and for a creation still running at
+            // its bound, an attempt is made to end its sessions and the holder's before it is awaited until it stops,
+            // so none is running into the next test and no held transaction is left without an owner. Neither step
+            // throws, so the drain runs even when the commit failed. The creation's context is disposed inside the
+            // creation, so a stopped creation has no command left running.
             lateCommitted = await CommitHeldAsync(
                 holder,
                 interceptor,
@@ -1046,7 +1044,6 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             SmartHotelApiFactory.LogCapture.DataLayerRules,
             additionalOverrides: null);
 
-        // A hand-built factory is not a fixture, so it is started here.
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
@@ -1128,7 +1125,6 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             SmartHotelApiFactory.LogCapture.DataLayerRules,
             additionalOverrides: null);
 
-        // A hand-built factory is not a fixture, so it is started here.
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
@@ -1354,7 +1350,6 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             ServiceOverrides = services => AddContextInterceptors(services, interceptor),
         };
 
-        // A hand-built factory is not a fixture, so it is started here.
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
@@ -1446,9 +1441,9 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         return terminated;
     }
 
-    // Ends the variant API's sessions, as TerminateApiSessionsAsync does, for a request that outlived its drain or its
-    // host's stop limit. Not the test's token: the sessions must end even while the test is being cancelled. Failures
-    // are recorded for the caller, never thrown.
+    // Asks the database to end the variant API's sessions, as TerminateApiSessionsAsync does, for a request that
+    // outlived its drain or its host's stop limit, without checking whether each one exited. Not the test's token: the
+    // sessions must end even while the test is being cancelled. Failures are recorded for the caller, never thrown.
     private static async Task EndApiSessionsAsync(SmartHotelApiFactory api, List<Exception> failures)
     {
         try
@@ -1461,10 +1456,11 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         }
     }
 
-    // Ends the sessions of this class's database that a direct creation which outlived its wait can be using: its own,
-    // which carry its application name, and the holder's, on which its injector runs. A closed holder's process id may
-    // since belong to another session, so it is matched only while the holder is open. Not the test's token: the
-    // sessions must end even while the test is being cancelled. Failures are recorded for the caller, never thrown.
+    // Asks the database to end the sessions of this class's database that a direct creation which outlived its wait
+    // can be using: its own, which carry its application name, and the holder's, on which its injector runs. Whether
+    // each one exited is not checked. A closed holder's process id may since belong to another session, so it is
+    // matched only while the holder is open. Not the test's token: the sessions must end even while the test is being
+    // cancelled. Failures are recorded for the caller, never thrown.
     private static async Task EndCreationSessionsAsync(
         SmartHotelApiFactory api,
         string applicationName,
@@ -1737,8 +1733,8 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
     // The holder session is touched only once the injector has handed the transaction over, or once the creation has
     // ended without reaching the injector, when nothing is held. That wait is bounded like the drain and not by the
     // test's token, so a cancelled test still releases the held lock. When the commit fails, closing the holder's
-    // session still ends the transaction. When neither happens within the bound, the wait is recorded, every session
-    // the creation and the injector can be using is ended through endSessions, and the creation is awaited until it
+    // session still ends the transaction. When neither happens within the bound, the wait is recorded, endSessions
+    // attempts to end every session the creation and the injector can be using, and the creation is awaited until it
     // stops; a transaction handed over by then is rolled back and disposed here, so it is never left without an owner
     // and never commits. Returns whether the held commit took effect. endSessions records its failures and never
     // throws. Failures are recorded for the caller, never thrown.
@@ -1760,9 +1756,10 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
                 + $"creation's and the holder's sessions were then ended.")));
             await endSessions(failures);
 
-            // Not bounded: the creation's token is cancelled and its sessions and the holder's are gone, so it has
-            // nothing left to wait on. The injector runs inside the creation's commit and completes the hand-over on
-            // every path before it returns, so once the creation has stopped the injector is done with the holder.
+            // Deliberately not bounded: the creation's token is cancelled and ending its sessions and the holder's has
+            // been attempted, but neither guarantees that it stops, and the holder session must not be touched or
+            // disposed while it still runs. The injector runs inside the creation's commit and completes the hand-over
+            // on every path before it returns, so once the creation has stopped the injector is done with the holder.
             await creation.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             await DiscardLateHandOverAsync(holder, handOver, failures);
             return false;
@@ -1865,10 +1862,10 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
     }
 
     // Drains one piece of work after its release, waiting as WaitWithinDrainLimitAsync does. Work still running at the
-    // limit is recorded, has every database session it can be using ended through endSessions, and is then awaited
-    // until it stops, so it returns only once the work has stopped and its outcome has been observed. Returns the
-    // work's result, a late one included, which the caller then owns, such as a response to dispose; or null when it
-    // failed or was cancelled, which is recorded. endSessions records its failures and never throws. Failures are
+    // limit is recorded, endSessions attempts to end every database session it can be using, and the work is then
+    // awaited until it stops, so it returns only once the work has stopped and its outcome has been observed. Returns
+    // the work's result, a late one included, which the caller then owns, such as a response to dispose; or null when
+    // it failed or was cancelled, which is recorded. endSessions records its failures and never throws. Failures are
     // recorded for the caller, never thrown.
     private static async Task<T?> DrainAsync<T>(
         Task<T> work,
@@ -1887,8 +1884,9 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
                 + $"after {cancelAfter.TotalSeconds} s; its database sessions were then ended.")));
             await endSessions(failures);
 
-            // Not bounded: the work's token is cancelled and its database sessions are gone, so it has nothing left to
-            // wait on, and no caller tears down what the work uses while it still runs.
+            // Deliberately not bounded: the work's token is cancelled and ending its database sessions has been
+            // attempted, but neither guarantees that it stops, and no caller may tear down what the work uses while it
+            // still runs.
             await ((Task)work).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         }
 
@@ -1912,9 +1910,9 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
     // A drained client task, ended with a response or a cancellation, does not show that the host has finished the
     // request: its handler and its database commands can still be running. Closes the host to new requests, so a
     // request it has not started yet never reaches the handler, then waits, after the drain and whatever the test's
-    // token says, until the host serves none. A host still serving after HostStopLimit is recorded, has every
-    // database session its requests can be using ended through endSessions, and is then awaited until it serves none,
-    // so this returns only once no handler is running or can start. endSessions records its failures and never
+    // token says, until the host serves none. A host still serving after HostStopLimit is recorded, endSessions
+    // attempts to end every database session its requests can be using, and the host is then awaited until it serves
+    // none, so this returns only once no handler is running or can start. endSessions records its failures and never
     // throws. Never throws.
     private static async Task ObserveHostIdleAsync(
         ServedRequests served,
@@ -1934,9 +1932,9 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
                 + $"drain ended; their database sessions were then ended.")));
             await endSessions(failures);
 
-            // Not bounded: the closed host serves only requests it had already started, whose database sessions are
-            // now gone, so none has anything left to wait on, and the host is not torn down while one still runs.
-            // The wait never faults.
+            // Deliberately not bounded: the closed host serves only requests it had already started, and ending their
+            // database sessions has been attempted, but that does not guarantee that they stop, and the host must not
+            // be torn down while one still runs. The wait never faults.
             await idle;
         }
     }
@@ -2066,7 +2064,6 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
             ServiceOverrides = services => services.AddSingleton<ILoggerProvider>(logProvider),
         };
 
-        // A hand-built factory is not a fixture, so it is started here.
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
