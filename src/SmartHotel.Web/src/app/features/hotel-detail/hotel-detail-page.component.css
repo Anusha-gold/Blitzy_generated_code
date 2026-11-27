@@ -1,0 +1,64 @@
+/* Hotel detail page: the hotel facts and the room table. The table's width,
+   collapsed borders, cell padding, row rules and start-aligned headers, the
+   disabled button and the :focus-visible outline are the global defaults in
+   src/styles.css, so they are not repeated here. */
+:host {
+  display: block;
+}
+
+/* The flex gap, not heading or paragraph margins, spaces the facts. */
+.hotel-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-block-end: 1.5rem;
+}
+
+.hotel-header h1 {
+  margin-block-end: 0;
+}
+
+.hotel-header p {
+  margin-block: 0;
+}
+
+/* #52606d on white is 6.4:1. */
+.hotel-meta,
+.rooms-empty {
+  color: #52606d;
+}
+
+.hotel-stay {
+  font-weight: 600;
+}
+
+/* A table wider than the screen scrolls here instead of widening the page.
+   relative makes this box clip the absolutely positioned visually hidden
+   "Actions" header text as well. */
+.rooms-scroll {
+  position: relative;
+  overflow-x: auto;
+}
+
+.num {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  text-align: end;
+}
+
+/* A 44px touch target. */
+.actions button {
+  min-block-size: 2.75rem;
+}
+
+/* "Log in again", projected into the inline error: block padding gives it a
+   44px-tall target. */
+a {
+  display: inline-block;
+  padding-block: 0.625rem;
+  font-weight: 600;
+  text-underline-offset: 0.2em;
+}

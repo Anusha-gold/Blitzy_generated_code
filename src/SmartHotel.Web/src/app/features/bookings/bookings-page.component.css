@@ -1,0 +1,77 @@
+/* My bookings page: the confirmation banner and the bookings table. */
+:host {
+  display: block;
+  /* Ten columns overflow narrow screens, so this region scrolls sideways, not the page.
+     Relative, so the absolute .visually-hidden spans stay inside the scroller. */
+  position: relative;
+  overflow-x: auto;
+  /* On white: success 6.3:1, muted 6.5:1. */
+  --bookings-success: #1b6e37;
+  --bookings-muted: #52606d;
+}
+
+/* The tint is ~10% success over white (success on it is 5.4:1). */
+.confirmation {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-block-end: 1rem;
+  padding-block: 0.75rem;
+  padding-inline: 1rem;
+  border: 1px solid var(--bookings-success);
+  border-inline-start-width: 4px;
+  border-radius: var(--sh-radius);
+  background-color: #e8f0eb;
+}
+
+.confirmation h2 {
+  margin-block: 0;
+  font-size: 1.125rem;
+  color: var(--bookings-success);
+}
+
+.confirmation p {
+  margin-block: 0;
+}
+
+.empty {
+  margin-block: 1rem 0;
+  color: var(--bookings-muted);
+}
+
+/* Width, collapse, start-aligned headers and row rules are the global table base. */
+.bookings th,
+.bookings td {
+  padding-inline: 0.5rem;
+}
+
+/* Only the hotel name wraps; dates would otherwise break at their hyphens. */
+.bookings th:not(:first-child),
+.bookings td:not(:first-child) {
+  white-space: nowrap;
+}
+
+.bookings thead th {
+  border-block-end: 2px solid var(--sh-color-control-border);
+}
+
+.money {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Weight and style, not colour alone, tell the statuses apart. */
+.status-confirmed {
+  font-weight: 600;
+  color: var(--bookings-success);
+}
+
+.status-cancelled {
+  font-style: italic;
+  color: var(--bookings-muted);
+}
+
+/* A 44px target; the focus ring and the disabled state are the global button's. */
+.bookings button {
+  min-block-size: 2.75rem;
+}

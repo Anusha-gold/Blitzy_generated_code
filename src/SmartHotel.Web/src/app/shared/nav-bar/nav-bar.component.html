@@ -1,0 +1,17 @@
+<header class="nav-bar">
+  <nav aria-label="Main">
+    <a class="brand" routerLink="/search" data-testid="nav-brand">SmartHotel</a>
+    <a routerLink="/search" data-testid="nav-search">Search</a>
+    <a routerLink="/bookings" data-testid="nav-bookings">My bookings</a>
+    <div class="account">
+      <ng-container *ngIf="auth.session() as s; else signedOut">
+        <span class="email" data-testid="nav-email">{{ s.email }}</span>
+        <button type="button" data-testid="nav-logout" (click)="auth.logout()">Log out</button>
+      </ng-container>
+      <ng-template #signedOut>
+        <a routerLink="/login" data-testid="nav-login">Log in</a>
+        <a routerLink="/register" data-testid="nav-register">Register</a>
+      </ng-template>
+    </div>
+  </nav>
+</header>
