@@ -48,14 +48,19 @@ export interface RegisterResponse {
 }
 
 /**
- * Body of `POST /api/auth/login`. Any mismatch, including an unknown email,
- * gives the same 401 whether or not the account exists.
+ * Body of `POST /api/auth/login`. The server validates neither member: either
+ * may be omitted or `null`. A missing, `null` or blank value is not a
+ * validation error; it gets the same 401 as an unknown email or a wrong
+ * password, whether or not the account exists.
  */
 export interface LoginRequest {
-  /** The email as entered; the server folds its letter case before the lookup. */
-  email: string;
-  /** The password as entered. */
-  password: string;
+  /**
+   * The email as entered, or omitted or `null`. The server trims it and folds
+   * its letter case before the lookup.
+   */
+  email?: string | null;
+  /** The password as entered, or omitted or `null`. It is never trimmed. */
+  password?: string | null;
 }
 
 /** Body of a successful login (200). */
@@ -69,7 +74,10 @@ export interface LoginResponse {
   expiresAt: string;
 }
 
-/** Query of `GET /api/hotels/{id}`: the stay the room types are priced for. */
+/**
+ * Query of `GET /api/hotels/{id}`: the stay the room types are priced for. It
+ * is also the stay criteria shared with `GET /api/hotels`.
+ */
 export interface StayQuery {
   /** The first night of the stay, `yyyy-MM-dd`, not earlier than today (UTC). */
   checkIn: string;
@@ -78,13 +86,18 @@ export interface StayQuery {
    * exclusive end of the stay and is not occupied.
    */
   checkOut: string;
-  /** The party size, an integer of at least 1. */
-  guests: number;
+  /**
+   * The party size, an integer of at least 1. It is optional on both
+   * `GET /api/hotels` and `GET /api/hotels/{id}`: when it is omitted the
+   * request carries no `guests` parameter and the server uses 1.
+   */
+  guests?: number;
 }
 
 /**
  * Query of `GET /api/hotels`: the stay criteria shared with
- * `GET /api/hotels/{id}`, plus the city to search.
+ * `GET /api/hotels/{id}`, `guests` defaulting to 1 on both, plus the city to
+ * search.
  */
 export interface HotelSearchQuery extends StayQuery {
   /** The city to search; required, not blank, at most 100 characters. */
