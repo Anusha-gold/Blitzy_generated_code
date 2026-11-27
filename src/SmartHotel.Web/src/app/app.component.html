@@ -1,0 +1,9 @@
+<!-- The shell's landmarks (the nav bar's header and "Main" navigation, and the
+     single main below) are the bypass for repeated navigation, so there is no
+     skip link: a "#main" href resolves against <base href="/"> and would reload
+     the app at "/", discarding the in-memory session. -->
+<app-nav-bar />
+<app-loading-indicator />
+<main>
+  <router-outlet />
+</main>

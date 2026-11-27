@@ -1,0 +1,41 @@
+<h1>Find a hotel</h1>
+
+<form [formGroup]="form" (ngSubmit)="submit()">
+  <div class="field">
+    <label for="search-city">City</label>
+    <input id="search-city" data-testid="search-city" formControlName="city" type="text" required />
+  </div>
+  <div class="field">
+    <label for="search-check-in">Check-in</label>
+    <input id="search-check-in" data-testid="search-check-in" formControlName="checkIn" type="date" required />
+  </div>
+  <div class="field">
+    <label for="search-check-out">Check-out</label>
+    <input id="search-check-out" data-testid="search-check-out" formControlName="checkOut" type="date" required />
+  </div>
+  <div class="field">
+    <label for="search-guests">Guests</label>
+    <input id="search-guests" data-testid="search-guests" formControlName="guests" type="number" min="1" />
+  </div>
+  <button type="submit" data-testid="search-submit" [disabled]="pending()">Search</button>
+</form>
+
+<app-error-message [error]="error()"></app-error-message>
+
+<ng-container *ngIf="searched() as s">
+  <ng-container *ngIf="results() as list">
+    <ul *ngIf="list.length > 0" class="results" aria-label="Search results">
+      <li *ngFor="let h of list; trackBy: trackById" [attr.data-testid]="'hotel-result-' + h.id">
+        <h2>{{ h.name }}</h2>
+        <p>{{ h.address }}</p>
+        <p class="price">From {{ h.lowestNightlyPrice | currency: 'USD' }} / night</p>
+        <a
+          [routerLink]="['/hotels', h.id]"
+          [queryParams]="{ checkIn: s.checkIn, checkOut: s.checkOut, guests: s.guests }"
+          [attr.data-testid]="'view-rooms-' + h.id"
+        >View rooms</a>
+      </li>
+    </ul>
+    <p *ngIf="list.length === 0" class="empty" data-testid="search-empty">No hotels with available rooms in {{ s.city }} for these dates.</p>
+  </ng-container>
+</ng-container>
