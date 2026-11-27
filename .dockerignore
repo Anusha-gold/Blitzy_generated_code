@@ -1,0 +1,22 @@
+# Build context for the API image (src/SmartHotel.Api/Dockerfile, context: repository root).
+# Exclude everything, then re-include only what the API image build needs. The last matching rule wins.
+# SmartHotel.sln stays out on purpose: it lists the test projects, which are not in this context, so the
+# Dockerfile restores and publishes the API project directly.
+*
+
+# Root build inputs (.editorconfig is read by the analyzers, so the image build matches the host build)
+!global.json
+!Directory.Build.props
+!Directory.Packages.props
+!.editorconfig
+
+# API and data projects
+!src/SmartHotel.Api/
+!src/SmartHotel.Data/
+
+# Never send local build output, even from re-included folders
+**/bin/
+**/obj/
+
+# Local dotenv files can hold credentials, so they stay out at any depth
+**/.env
