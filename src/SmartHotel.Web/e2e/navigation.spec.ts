@@ -77,10 +77,20 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await logIn(page, email, TEST_PASSWORD);
     await expect(page.getByTestId('nav-email')).toHaveText(email);
     await expect(page.getByTestId('nav-logout')).toHaveText('Log out');
+    await expect(page).toHaveURL(/\/search$/);
+    await expect(h1('Find a hotel')).toBeVisible();
+
+    // Login with no returnUrl already lands on bare /search, so the click must
+    // start from a search with criteria in the URL: only a working "Search"
+    // link clears that query and its results back to the idle page.
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+    await expect(page).toHaveURL(/\/search\?.*city=Seattle/);
+    await expect(page.locator('[data-testid^="hotel-result-"]').first()).toBeVisible();
 
     await page.getByTestId('nav-search').click();
     await expect(page).toHaveURL(/\/search$/);
     await expect(h1('Find a hotel')).toBeVisible();
+    await expect(page.locator('[data-testid^="hotel-result-"]')).toHaveCount(0);
   });
 
   await test.step('search, then "View rooms" opens /hotels/:id', async () => {
@@ -108,7 +118,7 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(h1('Find a hotel')).toBeVisible();
   });
 
-  await test.step('after "Log out", nav "My bookings" is redirected to /login', async () => {
+  await test.step('after "Log out", nav "My bookings" is redirected to /login and back after logging in', async () => {
     await page.getByTestId('nav-logout').click();
     await expect(page).toHaveURL(/\/search$/);
     await expect(page.getByTestId('nav-login')).toBeVisible();
@@ -116,5 +126,10 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await page.getByTestId('nav-bookings').click();
     await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
     await expect(h1('Log in')).toBeVisible();
+
+    await logIn(page, email, TEST_PASSWORD);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(h1('My bookings')).toBeVisible();
+    await expect(page.getByTestId('bookings-empty')).toHaveText('You have no bookings yet.');
   });
 });

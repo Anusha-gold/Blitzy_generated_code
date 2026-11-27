@@ -44,6 +44,12 @@ const isHotelSearch = (url: URL): boolean => url.pathname === '/api/hotels';
 const isBookingsApi = (url: URL): boolean =>
   url.pathname === '/api/bookings' || url.pathname.startsWith('/api/bookings/');
 
+/** The registration endpoint, `/api/auth/register`, never the SPA's `/register` page. */
+const isRegisterApi = (url: URL): boolean => url.pathname === '/api/auth/register';
+
+/** The login endpoint, `/api/auth/login`, never the SPA's `/login` page. */
+const isLoginApi = (url: URL): boolean => url.pathname === '/api/auth/login';
+
 /** Every hotel card on the search page. */
 const HOTEL_RESULTS = '[data-testid^="hotel-result-"]';
 
@@ -160,7 +166,14 @@ test('duplicate registration shows an inline 409', async ({ page }) => {
     await fillBound(page, 'register-email', email.replace(/^[^@]+/, (local) => local.toUpperCase()));
     await fillBound(page, 'register-password', TEST_PASSWORD);
     await fillBound(page, 'register-full-name', 'States Guest');
+    // Any other failing status with the same problem body shows the same
+    // message through its `detail`, so only the response itself proves the
+    // API answered 409. The method filter keeps a CORS preflight from matching.
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
     await page.getByTestId('register-submit').click();
+    expect((await registration).status()).toBe(409);
   });
 
   await test.step('stay on the register page with the 409 inline', async () => {
@@ -177,7 +190,13 @@ test('wrong password shows an inline 401', async ({ page }) => {
   await test.step('log in with a wrong password', async () => {
     await fillBound(page, 'login-email', email);
     await fillBound(page, 'login-password', `${TEST_PASSWORD}x`);
+    // As for registration, the inline text alone cannot tell a 401 from
+    // another failing status with the same problem body.
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
     await page.getByTestId('login-submit').click();
+    expect((await login).status()).toBe(401);
   });
 
   await test.step('stay on the login page with the 401 inline, signed out', async () => {

@@ -16,7 +16,9 @@
  * users, each with its own `APIRequestContext`; 20 warm-up requests, one per
  * user, discarded; then 25 sequential requests per user with no think time,
  * all users running concurrently, for 500 samples of wall-clock time per
- * request. The nearest-rank 95th percentile must be at most 1,000 ms.
+ * request. The nearest-rank 95th percentile must be at most 1,000 ms. Search
+ * requests do not follow redirects, so a 3xx fails rather than standing in for
+ * the direct `GET /api/hotels` response.
  *
  * API requests use absolute URLs from `apiUrl()`, because the configured
  * `baseURL` is the web origin.
@@ -67,6 +69,9 @@ const WARM_UP = 20;
 
 /** The highest acceptable 95th-percentile latency. */
 const THRESHOLD_MS = 1_000;
+
+/** Request options that return a redirect as-is, so only the direct response is checked and timed. */
+const NO_REDIRECTS = { maxRedirects: 0 } as const;
 
 /** Builds an absolute API URL with `query` encoded, so `New York` is safe. */
 function apiQueryUrl(path: string, query: Record<string, string>): string {
@@ -153,7 +158,7 @@ test('hotel search p95 within 1 second with 20 concurrent users', async () => {
     }
 
     const warmUp = await Promise.all(
-      Array.from({ length: WARM_UP }, (_, i) => contexts[i % contexts.length].get(url)),
+      Array.from({ length: WARM_UP }, (_, i) => contexts[i % contexts.length].get(url, NO_REDIRECTS)),
     );
     for (const res of warmUp) {
       expect(res.status(), 'warm-up GET /api/hotels').toBe(200);
@@ -165,7 +170,7 @@ test('hotel search p95 within 1 second with 20 concurrent users', async () => {
       contexts.map(async (ctx, user) => {
         for (let i = 0; i < REQUESTS_PER_USER; i += 1) {
           const start = performance.now();
-          const res = await ctx.get(url);
+          const res = await ctx.get(url, NO_REDIRECTS);
           const elapsed = performance.now() - start;
           samples.push(elapsed);
           // Checked outside the timed span, and recorded rather than thrown,
