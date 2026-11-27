@@ -16,12 +16,12 @@ import {
 import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, DOCUMENT, DatePipe, Location, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
-import { Router, RouterLink } from '@angular/router';
-import { finalize, skip, switchMap, tap } from 'rxjs';
+import { NavigationEnd, Router, RouterLink } from '@angular/router';
+import { type Subscription, catchError, filter, finalize, of, skip, switchMap, tap, throwError } from 'rxjs';
 
 import { BookingsApiService } from '../../core/api/bookings-api.service';
 import type { Booking } from '../../core/api/models';
-import { AuthService } from '../../core/auth/auth.service';
+import { AuthService, type Session } from '../../core/auth/auth.service';
 import { type UiError, toUiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
@@ -74,6 +74,11 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
  * page, which holds the newest booking, and it keeps its page across the
  * reload after a cancel, so the cancelled row stays in view.
  *
+ * Cancel feedback: a cancellation the server confirms is announced through
+ * the page's live region, which then shows as a visible status banner for as
+ * long as the session that cancelled lasts. "Cancel" is drawn outlined, so it
+ * does not look like the filled "Book".
+ *
  * Confirmation banner: after a 201, `HotelDetailPageComponent` navigates here
  * with the new booking in the router state, a
  * {@link BookingConfirmationState} held only in the router's memory and never
@@ -97,7 +102,8 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
  * 401 handling, split with `authInterceptor`: the interceptor clears the
  * session when a `/api/bookings` request is rejected with 401 and never
  * navigates; this page decides what follows.
- * - The entry `GET /api/bookings` redirects to
+ * - The entry `GET /api/bookings`, sent again when a navigation such as nav
+ *   "My bookings" re-enters the open page, redirects to
  *   `/login?returnUrl=%2Fbookings&reason=session-expired`, where the login
  *   page shows its session-expired notice.
  * - "Cancel", and the list reload that follows it, stay on the page and show
@@ -107,12 +113,23 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
  * Every other error renders inline through `ErrorMessageComponent`; nothing
  * is swallowed.
  *
+ * Session: the rows belong to the session whose token loaded them. Once that
+ * session ends, at its expiry or when a 401 clears it, every row, the empty
+ * message, the pager and every "Cancel" disappear in the same render, and a
+ * list response that arrives for an ended session is discarded. The inline
+ * error stays; without a 401 there, a notice says the session has expired and
+ * offers "Log in again", and the live region announces it. When that render
+ * removes the element on this page that has focus, focus moves to the page's
+ * "Log in again", or to its heading when there is none, rather than to the
+ * document body; focus elsewhere is left alone.
+ *
  * Cancel boundary: "Cancel" is offered on `Confirmed` bookings whose check-in
  * is not earlier than the current UTC calendar date, the boundary the API
  * applies (a check-in before today, UTC, gives 409). The date is kept current
  * while the page stays open, so a stay whose check-in has passed stops offering
  * "Cancel" without a reload. The check is display-only; the server stays the
- * authority and its 409 still shows inline.
+ * authority. Its 409 shows inline, the booking stops offering "Cancel" for
+ * good, and the list is reloaded so the row reads the server's status.
  */
 @Component({
   selector: 'app-bookings-page',
@@ -141,7 +158,8 @@ export class BookingsPageComponent implements AfterViewInit {
 
   /**
    * The page's document: the resume listeners of the UTC date, and the focused
-   * element the confirmation banner and the cancel focus handoff check.
+   * element the confirmation banner and the cancel and session-end focus
+   * handoffs check.
    */
   private readonly document = inject(DOCUMENT);
 
@@ -161,10 +179,23 @@ export class BookingsPageComponent implements AfterViewInit {
   @ViewChild('confirmationBanner') private confirmationBanner?: ElementRef<HTMLElement>;
 
   /**
-   * The caller's bookings in server order; `null` until the first load
-   * succeeds, and after an entry load that failed.
+   * The last list the server returned, with the session whose token fetched
+   * it; `null` until the first load succeeds, and once that session ends.
    */
-  protected readonly bookings = signal<Booking[] | null>(null);
+  private readonly loaded = signal<{ readonly list: Booking[]; readonly session: Session } | null>(null);
+
+  /**
+   * The caller's bookings in server order, or `null` while there is none to
+   * show: until the first load succeeds, after an entry load that failed, and
+   * whenever the current session is not the one that loaded the list. That
+   * check hides every row, the empty message, the pager and every "Cancel" in
+   * the same change-detection pass that clears the session, whether its
+   * expiry or a 401 cleared it.
+   */
+  protected readonly bookings = computed<Booking[] | null>(() => {
+    const loaded = this.loaded();
+    return loaded !== null && loaded.session === this.auth.session() ? loaded.list : null;
+  });
 
   /**
    * The zero-based page the guest last asked for. A reload does not reset it;
@@ -224,6 +255,29 @@ export class BookingsPageComponent implements AfterViewInit {
   protected readonly cancelPending = signal(false);
 
   /**
+   * Whether the page is leaving for the login page because its entry load was
+   * rejected with 401; the session-ended notice stays hidden meanwhile.
+   */
+  private readonly redirecting = signal(false);
+
+  /**
+   * The entry load in flight, or the last one. A new entry load or a cancel
+   * unsubscribes it, so an older list never overwrites a newer one, and so
+   * does the end of the session it was sent under, because its result belongs
+   * to that session; unsubscribing aborts its request.
+   */
+  private entryLoad: Subscription | undefined;
+
+  /**
+   * Whether the session-ended notice, with its "Log in again" link, is shown:
+   * while no session exists, unless the inline error is a 401, which carries
+   * its own "Log in again", or the entry load's 401 is redirecting to login.
+   */
+  protected readonly signedOut = computed(
+    () => this.auth.session() === null && !this.redirecting() && this.error()?.status !== 401,
+  );
+
+  /**
    * The text of the page's polite live region (`role="status"`). It starts
    * empty, and the entry message waits until the region has been in the page
    * for {@link LIVE_REGION_DELAY_MS} (see {@link ngAfterViewInit}): the
@@ -231,9 +285,30 @@ export class BookingsPageComponent implements AfterViewInit {
    * the banner does, or "You have no bookings yet." when the entry load finds
    * no bookings. Each 204 announces the cancelled booking. A cancel clears it
    * first, so a repeated message is announced again. Errors are announced by
-   * the inline alert instead.
+   * the inline alert instead. When the session ends without a 401 shown
+   * inline, it holds the session-ended notice's sentence. Write it only
+   * through {@link announce}.
    */
   protected readonly announcement = signal('');
+
+  /**
+   * The session whose 204 wrote the cancellation message now in
+   * {@link announcement}, or `null` while it holds any other text.
+   */
+  private readonly cancellationSession = signal<Session | null>(null);
+
+  /**
+   * Whether the live region shows as a visible status banner: while it holds
+   * a cancellation message and the session that produced it is still the
+   * current one. Otherwise it stays visually hidden, since every other
+   * message repeats content already on screen. Like {@link bookings}, it
+   * hides the banner in the same change-detection pass that clears the
+   * session.
+   */
+  protected readonly cancellationShown = computed(() => {
+    const session = this.cancellationSession();
+    return session !== null && session === this.auth.session();
+  });
 
   /**
    * Whether the live region has been in the page for
@@ -256,17 +331,27 @@ export class BookingsPageComponent implements AfterViewInit {
   protected readonly today = signal(utcToday());
 
   /**
+   * The ids of the bookings whose cancel the server refused with 409: already
+   * cancelled, or check-in passed. Neither ever reverts, so these never offer
+   * "Cancel" again on this page, whatever a later list or the local date says.
+   */
+  private readonly refusedIds = signal<ReadonlySet<number>>(new Set<number>());
+
+  /**
    * The ids of the bookings that offer "Cancel": `Confirmed`, with a check-in
-   * of {@link today} or later. Exact `yyyy-MM-dd` strings order correctly as
-   * text. Recomputed only when the list or the UTC date changes, never per
-   * change-detection pass; empty while no list is loaded. Display-only: the
-   * server stays the authority and its 409 still shows inline.
+   * of {@link today} or later, and not refused by the server
+   * ({@link refusedIds}). Exact `yyyy-MM-dd` strings order correctly as text.
+   * Recomputed only when the list, the refusals or the UTC date changes, never
+   * per change-detection pass; empty while no list is shown, including once
+   * the session that loaded it has ended. Display-only: the server stays the
+   * authority, its 409 shows inline and removes that booking's "Cancel".
    */
   protected readonly cancellableIds = computed<ReadonlySet<number>>(() => {
     const today = this.today();
+    const refused = this.refusedIds();
     const ids = new Set<number>();
     for (const b of this.bookings() ?? []) {
-      if (b.status === 'Confirmed' && b.checkIn >= today) {
+      if (b.status === 'Confirmed' && b.checkIn >= today && !refused.has(b.id)) {
         ids.add(b.id);
       }
     }
@@ -302,9 +387,64 @@ export class BookingsPageComponent implements AfterViewInit {
     // Any change of the session ends the handoff: a logout, the session
     // cleared after a 401, or a new login. `skip(1)` passes over the session
     // current at construction, which the handoff was accepted under.
+    // `bookings` has already hidden the rows; this also drops a list of
+    // another session, and any announcement naming one of its bookings, from
+    // memory. An entry load still in flight belongs to the session that has
+    // ended, so it is dropped too: unsubscribing aborts its request, which
+    // lowers the loading indicator at once and leaves no later error, such as
+    // the deadline's status 0, to show beside the session-ended notice. An
+    // entry load rejected with 401 has already settled and started its
+    // redirect to login by the time this runs, since the interceptor clears
+    // the session while that error is passed on, so the redirect is
+    // untouched. A cancel in flight, with its reload, is not dropped: the
+    // DELETE may already have been applied, and its outcome still reports
+    // inline. The inline error stays, so a 401 from "Cancel" keeps its
+    // "Log in again". A session that ends with no such error, as at its
+    // expiry, is announced with the notice's own sentence. A session change
+    // reaches this before change detection renders it, so at an expiry the
+    // element on this page that has focus is still in the document and is
+    // noted first. When the render here removes it, as it does a "Cancel", a
+    // status cell, the table region, a pager button or the banner, focus
+    // moves to this page's "Log in again", or else to its heading, instead of
+    // falling to the document body. Focus outside the page, or on an element
+    // still shown, such as the "Log in again" that a 401 from "Cancel" has
+    // already focused, is left alone.
     toObservable(this.auth.session)
       .pipe(skip(1), takeUntilDestroyed())
-      .subscribe(() => this.handoff.set(null));
+      .subscribe((session) => {
+        const host = this.host.nativeElement;
+        const active = this.document.activeElement;
+        const focused = active instanceof HTMLElement && host.contains(active) ? active : null;
+
+        this.handoff.set(null);
+        this.entryLoad?.unsubscribe();
+        if (this.loaded()?.session !== session) {
+          this.loaded.set(null);
+        }
+        this.announce(this.signedOut() ? SIGNED_OUT_MESSAGE : '');
+
+        if (focused !== null) {
+          this.changeDetector.detectChanges();
+          if (!focused.isConnected) {
+            const target =
+              host.querySelector<HTMLElement>('[data-testid="login-again"]') ??
+              host.querySelector<HTMLElement>('h1');
+            target?.focus();
+          }
+        }
+      });
+
+    // A navigation other than the one constructing this page that ends with
+    // the page still in place re-entered it, as nav "My bookings" on
+    // `/bookings` does once `authGuard` has admitted it again. Navigating
+    // away destroys the page first, which ends this subscription.
+    const entryNavigationId = this.router.getCurrentNavigation()?.id;
+    this.router.events
+      .pipe(
+        filter((e): e is NavigationEnd => e instanceof NavigationEnd && e.id !== entryNavigationId),
+        takeUntilDestroyed(),
+      )
+      .subscribe(() => this.reenter());
 
     this.keepTodayCurrent();
     this.loadOnEntry();
@@ -335,12 +475,29 @@ export class BookingsPageComponent implements AfterViewInit {
    * confirmation handoff when it is the handed-over booking, so its banner
    * goes even if the reload fails, and announces the cancellation through
    * {@link announcement}; the list is then reloaded and, when the reload
-   * succeeds, replaced from the server. Every error of the cancel or of that
-   * reload, 401 included, is shown inline and the page stays where it is.
-   * After a reload error the row keeps the `Cancelled` status the 204
-   * confirmed, so it no longer offers "Cancel". An entry message still waiting
-   * to be published (see {@link ngAfterViewInit}) is dropped when the cancel
-   * starts, so it never overwrites the cancellation's message.
+   * succeeds, replaced from the server. A 409 (already cancelled, or check-in
+   * passed) is final: it shows inline at once, adds the booking to
+   * {@link refusedIds} so its row stops offering "Cancel", and the same reload
+   * then brings the row's status from the server while the 409 stays shown.
+   * Every other error of the cancel, and every error of the reload, 401
+   * included, is shown inline and the page stays where it is. After a 204 a
+   * reload error is shown alone. After a 409 a reload 401 replaces the 409, so
+   * its "Log in again" shows; any other reload error is added to the 409's
+   * detail (see {@link withRefreshFailure}), so the server's refusal stays
+   * shown together with the news that the list could not be refreshed. The
+   * 409 is kept for that in a variable of this call, so only a reload that
+   * follows this cancel's own 409 is reported that way. After a reload error
+   * the row keeps the `Cancelled` status the 204 confirmed, or the refusal the
+   * 409 recorded, so it no longer offers "Cancel". An entry message still
+   * waiting to be published (see {@link ngAfterViewInit}) is dropped when the
+   * cancel starts, so it never overwrites the cancellation's message, and an
+   * entry load in flight is dropped, because this reload supersedes it. The
+   * pager keeps its page throughout.
+   *
+   * Session: the cancel runs only while a session exists, and its outcome is
+   * bound to that session. Once it has ended, the 204 changes no row and
+   * announces nothing, the reload is not sent, and a reload response is
+   * discarded, because the rows are hidden.
    *
    * The pending flag blocks concurrent DELETEs: it is set before the request
    * and released only once the cancel and its reload have both settled. While
@@ -348,69 +505,119 @@ export class BookingsPageComponent implements AfterViewInit {
    * request, because the disabled binding reaches the DOM only on the next
    * change-detection pass and a click landing before it still calls here. The
    * flag does not track the server: a booking cancelled elsewhere offers
-   * "Cancel" until the next load, and the server's 409 then shows inline. The
+   * "Cancel" until the next load or until the server's 409 for it. The
    * subscription is bound to the stored `DestroyRef`, because this runs from
    * an event callback, outside an injection context.
    *
    * Focus: the button is disabled at once and removed when the 204 marks the
-   * row `Cancelled`, so when `trigger` holds focus as the guest activates it,
-   * focus moves synchronously, before the disabled binding renders, to the
-   * booking's status cell, and the cancel owns that focus. When `trigger` does
-   * not hold focus (some browsers do not focus a clicked button) the cancel
-   * owns nothing and never moves focus. Once the cancel and its reload have
-   * settled, {@link settleCancel} moves focus on only while the cancel still
-   * owns it.
+   * row `Cancelled` or a 409 refuses it, so when `trigger` holds focus as the
+   * guest activates it, focus moves synchronously, before the disabled binding
+   * renders, to the booking's status cell, and the cancel owns that focus.
+   * When `trigger` does not hold focus (some browsers do not focus a clicked
+   * button) the cancel owns nothing and moves no focus now; it notes the
+   * element on this page that does hold focus, if any, because the render of
+   * the outcome can remove it, as it removes every row once a 401 has ended
+   * the session. Once the cancel and its reload have settled,
+   * {@link settleCancel} moves focus on only while the cancel still owns it,
+   * or when that noted element has left the document and focus fell to the
+   * body.
    *
    * @param b - The booking to cancel.
    * @param trigger - The "Cancel" button the guest activated; focus is handed
    *   off from it only when it holds focus.
    */
   protected cancel(b: Booking, trigger: HTMLButtonElement): void {
-    if (this.cancelPending()) {
+    const session = this.auth.session();
+    if (this.cancelPending() || session === null) {
       return;
     }
 
+    this.entryLoad?.unsubscribe();
     this.clearLiveRegionTimer();
     this.error.set(null);
-    this.announcement.set('');
+    this.announce('');
     this.cancelPending.set(true);
 
-    const owned = this.document.activeElement === trigger ? this.statusCell(b.id) : null;
+    const active = this.document.activeElement;
+    const owned = active === trigger ? this.statusCell(b.id) : null;
+    const focusedElsewhere =
+      active !== trigger && active instanceof HTMLElement && this.host.nativeElement.contains(active)
+        ? active
+        : null;
     owned?.focus();
+
+    // The server's 409 for this cancel, once it has refused it; `null` while
+    // the DELETE is in flight, after its 204 and after any other error.
+    let conflict: UiError | null = null;
 
     this.api
       .cancel(b.id)
       .pipe(
         // The 204 already proves the booking cancelled, so its row stops
         // offering "Cancel" and its banner goes now, even if the reload below
-        // fails.
+        // fails. Once the session has ended the rows are hidden, so neither
+        // the row nor the announcement is touched.
         tap(() => {
           if (this.handoff() === b.id) {
             this.handoff.set(null);
           }
-          this.bookings.update((list) =>
-            list === null
-              ? null
-              : list.map((row): Booking => (row.id === b.id ? { ...row, status: 'Cancelled' } : row)),
+          if (this.auth.session() !== session) {
+            return;
+          }
+          this.loaded.update((loaded) =>
+            loaded === null || loaded.session !== session
+              ? loaded
+              : {
+                  session,
+                  list: loaded.list.map(
+                    (row): Booking => (row.id === b.id ? { ...row, status: 'Cancelled' } : row),
+                  ),
+                },
           );
-          this.announcement.set(
+          this.announce(
             `Booking cancelled: ${b.hotelName}, room ${b.roomNumber}, ` +
               `${this.displayDate(b.checkIn)} to ${this.displayDate(b.checkOut)}.`,
+            session,
           );
         }),
-        switchMap(() => this.api.list()),
+        // A 409 is the server's final word on this booking: it is already
+        // cancelled or its check-in has passed. The error shows now, the row
+        // stops offering "Cancel", and the reload below brings its status
+        // from the server. Every other error passes on, leaving "Cancel" for a
+        // retry.
+        catchError((err: unknown) => {
+          if (!(err instanceof HttpErrorResponse) || err.status !== 409) {
+            return throwError(() => err);
+          }
+          conflict = toUiError(err);
+          this.error.set(conflict);
+          this.refusedIds.update((ids) => new Set(ids).add(b.id));
+          return of(undefined);
+        }),
+        // Without the session the reload would go out with no token, so it is
+        // skipped and `null` stands for its list. A reload that succeeds keeps
+        // a 409 shown above; how one that fails is shown is decided in the
+        // `error` callback below.
+        switchMap(() => (this.auth.session() === session ? this.api.list() : of(null))),
         finalize(() => this.cancelPending.set(false)),
         takeUntilDestroyed(this.destroyRef),
       )
       .subscribe({
         next: (list) => {
-          this.bookings.set(list);
-          this.settleCancel(b.id, owned, false);
+          if (list !== null && this.auth.session() === session) {
+            this.loaded.set({ list, session });
+          }
+          this.settleCancel(b.id, owned, focusedElsewhere, false);
         },
         error: (err: HttpErrorResponse) => {
           const uiError = toUiError(err);
-          this.error.set(uiError);
-          this.settleCancel(b.id, owned, uiError.status === 401);
+          // With a 409 recorded, this error is its reload's. A 401 replaces
+          // the 409, so "Log in again" shows; any other failure is added to
+          // it, so the refusal stays shown and the stale row is explained.
+          this.error.set(
+            conflict !== null && uiError.status !== 401 ? withRefreshFailure(conflict, uiError) : uiError,
+          );
+          this.settleCancel(b.id, owned, focusedElsewhere, uiError.status === 401);
         },
       });
   }
@@ -422,14 +629,22 @@ export class BookingsPageComponent implements AfterViewInit {
    * {@link cancel} focused, still has focus, or `owned` left the document with
    * its row and focus fell to the body or to nothing. Focus on the body alone
    * is never enough, because a guest who moved on and clicked blank space also
-   * leaves it there; and with `owned` `null` focus is never moved.
+   * leaves it there. With `owned` `null`, focus moves only when
+   * `focusedElsewhere`, the element on this page that held focus as the cancel
+   * started, has left the document and focus fell to the body or to nothing,
+   * as when the rows it sat among are hidden after a 401; focus the guest has
+   * since moved elsewhere stays there, and with `focusedElsewhere` `null` too
+   * focus is never moved.
    *
-   * The target is "Log in again" after a 401, as on the hotel page, because
-   * the session is gone and that link is the way on; otherwise the booking's
-   * "Cancel" when it is shown and enabled again, so a failed cancel restores
-   * focus to it; otherwise the booking's status cell, which keeps focus and
-   * reads `Cancelled` after a 204; and the page heading when the row is no
-   * longer shown. Targets are looked up inside this page only.
+   * The target is "Log in again" after a 401 or whenever the session has
+   * ended, as on the hotel page, because that link, in the inline error or in
+   * the session-ended notice, is the way on; otherwise the booking's "Cancel"
+   * when it is shown and enabled again, so a cancel that failed with an error
+   * other than 409 restores focus to it; otherwise the booking's status cell,
+   * which keeps focus and reads the server's status: `Cancelled` after a 204,
+   * and after a 409 whatever the reload returned, a refused "Cancel" being
+   * gone for good; and the page heading when the row is no longer shown.
+   * Targets are looked up inside this page only.
    *
    * It runs from the `next` and `error` callbacks, never on teardown: when the
    * page is destroyed mid-request, `takeUntilDestroyed` only completes the
@@ -438,23 +653,34 @@ export class BookingsPageComponent implements AfterViewInit {
    * @param id - The booking the cancel was for.
    * @param owned - The element the cancel moved focus to, or `null` when it
    *   took no focus.
+   * @param focusedElsewhere - The element on this page that held focus when
+   *   the cancel started without its "Cancel" focused; `null` when that
+   *   "Cancel" held focus, or when no element on this page did.
    * @param unauthorized - Whether the cancel or its reload failed with 401.
    */
-  private settleCancel(id: number, owned: HTMLElement | null, unauthorized: boolean): void {
+  private settleCancel(
+    id: number,
+    owned: HTMLElement | null,
+    focusedElsewhere: HTMLElement | null,
+    unauthorized: boolean,
+  ): void {
     this.cancelPending.set(false);
     this.changeDetector.detectChanges();
 
-    if (owned === null) {
-      return;
-    }
     const active = this.document.activeElement;
-    const stillOwned =
-      active === owned || (!owned.isConnected && (active === null || active === this.document.body));
-    if (!stillOwned) {
+    const fellToBody = active === null || active === this.document.body;
+    const moveFocus =
+      owned === null
+        ? focusedElsewhere !== null && !focusedElsewhere.isConnected && fellToBody
+        : active === owned || (!owned.isConnected && fellToBody);
+    if (!moveFocus) {
       return;
     }
     const host = this.host.nativeElement;
-    const loginAgain = unauthorized ? host.querySelector<HTMLElement>('[data-testid="login-again"]') : null;
+    const loginAgain =
+      unauthorized || this.auth.session() === null
+        ? host.querySelector<HTMLElement>('[data-testid="login-again"]')
+        : null;
     const target =
       loginAgain ??
       host.querySelector<HTMLElement>(`[data-testid="cancel-${id}"]:enabled`) ??
@@ -554,9 +780,22 @@ export class BookingsPageComponent implements AfterViewInit {
   }
 
   /**
-   * Loads the caller's bookings when the page opens. This protected-page
-   * request is the only one whose 401 redirects to the login page; any other
-   * error is shown inline.
+   * Loads the caller's bookings when the page opens, and again when it is
+   * re-entered ({@link reenter}). This protected-page request is the only one
+   * whose 401 redirects to the login page; any other error is shown inline. A
+   * load still in flight is dropped first. A load is also dropped when the
+   * session that requested it ends while it is in flight (see the
+   * constructor), which aborts its request, so it neither keeps the loading
+   * indicator on nor reports an error for that ended session; a list that
+   * still arrives after that session has ended is discarded.
+   *
+   * Focus: a load that re-enters the open page replaces a list already on
+   * screen, and the new one can drop the element on this page that has focus,
+   * such as the "Cancel" of a booking that is now cancelled or whose check-in
+   * has passed. Focus then moves to that booking's status cell, or to the page
+   * heading when the element was not a "Cancel" or its row is gone, rather
+   * than falling to the document body (see {@link keepFocusOnPage}). Focus
+   * outside this page, or on an element the new list keeps, is left alone.
    *
    * Once the live region is ready, the loaded list publishes the entry message
    * (see {@link publishEntryAnnouncement}); before that, the live-region timer
@@ -564,12 +803,18 @@ export class BookingsPageComponent implements AfterViewInit {
    * the announcement unchanged.
    */
   private loadOnEntry(): void {
-    this.api
+    const session = this.auth.session();
+    this.entryLoad?.unsubscribe();
+    this.entryLoad = this.api
       .list()
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe({
         next: (list) => {
-          this.bookings.set(list);
+          // A list that arrives after its session ended is never shown.
+          if (session === null || this.auth.session() !== session) {
+            return;
+          }
+          this.keepFocusOnPage(() => this.loaded.set({ list, session }), 'page');
           if (this.liveRegionReady()) {
             this.publishEntryAnnouncement();
           }
@@ -579,15 +824,42 @@ export class BookingsPageComponent implements AfterViewInit {
           if (err.status === 401) {
             // `replaceUrl` drops the rejected `/bookings` entry from history,
             // so Back does not return to a page that bounces to login again.
-            void this.router.navigate(['/login'], {
-              queryParams: { returnUrl: '/bookings', reason: 'session-expired' },
-              replaceUrl: true,
-            });
+            // The session-ended notice stays hidden while the page leaves; it
+            // shows if the redirect does not take place.
+            this.redirecting.set(true);
+            void this.router
+              .navigate(['/login'], {
+                queryParams: { returnUrl: '/bookings', reason: 'session-expired' },
+                replaceUrl: true,
+              })
+              .then((navigated) => {
+                if (!navigated) {
+                  this.redirecting.set(false);
+                }
+              });
             return;
           }
           this.error.set(toUiError(err));
         },
       });
+  }
+
+  /**
+   * Refreshes the page after a navigation that kept it in place, such as nav
+   * "My bookings" clicked on `/bookings`: the inline error and any
+   * cancellation message are cleared and {@link loadOnEntry} runs again, so
+   * its 401 redirects to login exactly as on entry, and a refreshed list that
+   * removes the focused element, such as a "Cancel" that no longer applies,
+   * keeps focus on the page as described there. The pager keeps its page.
+   * While a cancel is pending nothing is done, because its own reload follows.
+   */
+  private reenter(): void {
+    if (this.cancelPending()) {
+      return;
+    }
+    this.error.set(null);
+    this.announce('');
+    this.loadOnEntry();
   }
 
   /**
@@ -649,8 +921,22 @@ export class BookingsPageComponent implements AfterViewInit {
   private publishEntryAnnouncement(): void {
     const message = this.entryAnnouncement();
     if (message !== '') {
-      this.announcement.set(message);
+      this.announce(message);
     }
+  }
+
+  /**
+   * Writes `text` into {@link announcement}, recording whether it is a
+   * cancellation message and, if so, the session whose 204 produced it.
+   *
+   * @param text - The live region's new text; empty to clear it.
+   * @param cancelledUnder - For a cancellation message, the session the
+   *   cancel ran under, which keeps it shown as a visible banner while that
+   *   session lasts; `null` for every other text.
+   */
+  private announce(text: string, cancelledUnder: Session | null = null): void {
+    this.announcement.set(text);
+    this.cancellationSession.set(cancelledUnder);
   }
 
   /**
@@ -747,28 +1033,54 @@ export class BookingsPageComponent implements AfterViewInit {
    * stops offering "Cancel", so when the "Cancel" on this page that has focus
    * is removed by the change, focus moves to that booking's status cell
    * instead of falling to the document body. The removal is rendered at once
-   * to find out; focus anywhere else is left alone.
+   * to find out; focus anywhere else is left alone (see
+   * {@link keepFocusOnPage}).
    *
    * @param date - The new current UTC date, as `yyyy-MM-dd`.
    */
   private applyToday(date: string): void {
+    this.keepFocusOnPage(() => this.today.set(date), 'cancel');
+  }
+
+  /**
+   * Applies `change`, a state update whose render can remove the element on
+   * this page that has focus, without letting focus fall to the document
+   * body. The focused element is noted first, and so is, when it is a
+   * "Cancel", the status cell of its row; rows are kept by booking id, so that
+   * cell outlives the button. When the noted element is one `scope` follows,
+   * the change is rendered at once, and only if the element has left the
+   * document does focus move: to the noted status cell while it is still
+   * shown, otherwise, with `scope` `'page'`, to the page heading. Focus
+   * outside this page, on an element `scope` does not follow, or on one the
+   * render keeps is left alone.
+   *
+   * @param change - The state update to apply.
+   * @param scope - `'cancel'` follows only a focused "Cancel" and moves focus
+   *   only to its status cell; `'page'` follows any focused element on this
+   *   page and falls back to the page heading.
+   */
+  private keepFocusOnPage(change: () => void, scope: 'cancel' | 'page'): void {
+    const host = this.host.nativeElement;
     const active = this.document.activeElement;
-    const focusedCancel =
-      active !== null &&
-      this.host.nativeElement.contains(active) &&
-      active.matches('[data-testid^="cancel-"]')
-        ? active
-        : null;
-    const row = focusedCancel?.closest('tr');
-    const status = row?.querySelector<HTMLElement>('[data-testid^="booking-status-"]') ?? null;
+    const focused = active instanceof HTMLElement && host.contains(active) ? active : null;
+    const focusedCancel = focused?.matches('[data-testid^="cancel-"]') ? focused : null;
+    const status =
+      focusedCancel?.closest('tr')?.querySelector<HTMLElement>('[data-testid^="booking-status-"]') ?? null;
 
-    this.today.set(date);
+    change();
 
-    if (focusedCancel !== null) {
-      this.changeDetector.detectChanges();
-      if (!focusedCancel.isConnected) {
-        status?.focus();
-      }
+    const followed = scope === 'page' ? focused : focusedCancel;
+    if (followed === null) {
+      return;
+    }
+    this.changeDetector.detectChanges();
+    if (followed.isConnected) {
+      return;
+    }
+    if (status?.isConnected) {
+      status.focus();
+    } else if (scope === 'page') {
+      host.querySelector<HTMLElement>('h1')?.focus();
     }
   }
 }
@@ -783,6 +1095,12 @@ const DAY_MS = 86_400_000;
  * frame the region is inserted.
  */
 const LIVE_REGION_DELAY_MS = 100;
+
+/**
+ * The session-ended notice's sentence, which the live region announces when
+ * the session ends while the page is open.
+ */
+const SIGNED_OUT_MESSAGE = 'Your session has expired. Log in again to see your bookings.';
 
 /**
  * The current UTC calendar date as `yyyy-MM-dd`. It is derived from the ISO
@@ -800,6 +1118,39 @@ function utcToday(): string {
  */
 function msUntilNextUtcMidnight(): number {
   return DAY_MS - (Date.now() % DAY_MS);
+}
+
+/**
+ * A cancel's 409 with the failure of the list reload that followed it added,
+ * for one inline error that reports both. The conflict keeps its status and
+ * title, so it still says why the booking offers no "Cancel"; its detail, or
+ * none, is followed by "The bookings list could not be refreshed: " and the
+ * reload's title, then by the reload's own detail when it has one, each
+ * trimmed and ended as a sentence. The reload's field errors follow the
+ * conflict's, so nothing the reload reported is dropped. Every part is plain
+ * text from {@link toUiError}, rendered through interpolation only.
+ *
+ * @param conflict - The 409 the server answered the cancel with.
+ * @param reload - The reload's error; never a 401, which replaces the 409.
+ * @returns The error to show inline in place of the 409 alone.
+ */
+function withRefreshFailure(conflict: UiError, reload: UiError): UiError {
+  const sentences = [
+    conflict.detail,
+    `The bookings list could not be refreshed: ${reload.title.trim()}`,
+    reload.detail,
+  ]
+    .filter((text): text is string => text !== null && text.trim() !== '')
+    .map((text) => {
+      const trimmed = text.trim();
+      return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+    });
+  return {
+    status: conflict.status,
+    title: conflict.title,
+    detail: sentences.join(' '),
+    fieldErrors: [...conflict.fieldErrors, ...reload.fieldErrors],
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

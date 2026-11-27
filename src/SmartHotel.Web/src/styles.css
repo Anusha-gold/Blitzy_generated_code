@@ -1,5 +1,6 @@
-/* Global base styles for the SmartHotel SPA: document-wide defaults only.
-   Each component's layout lives in the .css file beside that component. */
+/* Global base styles for the SmartHotel SPA: document-wide defaults and the
+   shared classes below. Each component's layout lives in the .css file beside
+   that component. */
 
 :root {
   --sh-color-text: #1f2933;
@@ -149,6 +150,29 @@ input:not(:disabled):active {
 button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* Outlined secondary action. Its :not(:disabled) states outrank the filled
+   button's hover and press, which would fill it. Accent on white 6.4:1, on
+   the tint 5.7:1. */
+.button-secondary {
+  border-color: var(--sh-color-control-border);
+  font-weight: 600;
+  color: var(--sh-color-accent);
+  background-color: var(--sh-color-bg);
+}
+
+@media (hover: hover) {
+  .button-secondary:not(:disabled):hover {
+    border-color: var(--sh-color-accent);
+    background-color: var(--sh-color-accent-tint);
+  }
+}
+
+.button-secondary:not(:disabled):active {
+  border-color: var(--sh-color-accent-pressed);
+  color: var(--sh-color-accent-pressed);
+  background-color: var(--sh-color-accent-tint);
 }
 
 table {

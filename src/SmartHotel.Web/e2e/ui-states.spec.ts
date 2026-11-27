@@ -23,12 +23,12 @@
  * notice, and "Book" must stay on the hotel page with the 401 shown inline
  * and a "Log in again" link. "Cancel" is an action too: with only its DELETE
  * rejected, after a successful entry load, My bookings stays put and shows
- * the 401 above the list with a focused "Log in again" back to
- * `/login?returnUrl=%2Fbookings`, the booking stays `Confirmed` on the page
- * and on the server, no reload follows, and logging in again through that
- * link returns to the list with "Cancel" still offered. In every branch the
- * auth interceptor has cleared the session, so the nav bar offers "Log in"
- * again.
+ * the 401 inline with a focused "Log in again" back to
+ * `/login?returnUrl=%2Fbookings`, the guest's bookings leave the screen with
+ * the session while the booking stays `Confirmed` on the server, no reload
+ * follows, and logging in again through that link returns to the list with
+ * "Cancel" still offered. In every branch the auth interceptor has cleared
+ * the session, so the nav bar offers "Log in" again.
  *
  * Auth and network errors: a password too short for the server's 8 to 128
  * rule shows the register page's 400 inline on the password field alone,
@@ -71,6 +71,13 @@
  * that guest takes the last free room after the page has shown it, "Book"
  * gets the API's real 409, shown above the room table on the same URL, and
  * the revalidation shows no room left and "Book" disabled.
+ *
+ * "Cancel" conflict: a booking the guest has cancelled elsewhere, through the
+ * API, still shows `Confirmed` with "Cancel" on the open My bookings page.
+ * Clicking it gets the API's real 409, shown above the list; the list is
+ * reloaded, with no other request, so the row reads `Cancelled` without
+ * "Cancel" and its status takes the focus the removed button held, the
+ * guest's other booking keeps its "Cancel", and the guest stays signed in.
  *
  * Session expiry: with the browser's clock faked and moved past the token's
  * 60 minutes, the nav bar must show the guest signed out on the public page
@@ -2006,12 +2013,13 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     await expect(error).toBeVisible();
     await expect(error.getByRole('alert').locator('strong')).toHaveText('Unauthorized');
     await expect(error.getByRole('alert').locator('p')).toHaveText('A valid bearer token is required.');
-    // Cancel errors show at the top of the list: the alert precedes the table.
-    const aboveTable = await error.evaluate((el) => {
-      const table = el.ownerDocument.querySelector('[data-testid="bookings-table"]');
-      return table !== null && (el.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
-    });
-    expect(aboveTable, 'the inline error precedes the bookings table').toBe(true);
+    // The 401 signed the guest out, so none of their bookings stay on screen;
+    // the inline error holds the only recovery link.
+    await expect(page.getByTestId('bookings-table')).toHaveCount(0);
+    await expect(page.getByTestId(`booking-row-${id}`)).toHaveCount(0);
+    await expect(page.getByTestId(`cancel-${id}`)).toHaveCount(0);
+    await expect(page.getByTestId('bookings-signed-out')).toHaveCount(0);
+    await expect(page.getByTestId('login-again')).toHaveCount(1);
     const loginAgain = error.getByTestId('login-again');
     await expect(loginAgain).toHaveText('Log in again');
     await expect(loginAgain).toHaveAttribute('href', '/login?returnUrl=%2Fbookings');
@@ -2023,8 +2031,7 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
   });
 
-  await test.step('the booking stays Confirmed on the page and on the server', async () => {
-    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+  await test.step('the booking stays Confirmed on the server', async () => {
     // A rejected cancel reloads nothing: the DELETE is the only API request.
     expect(
       sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
@@ -2046,6 +2053,115 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     await expect(page).toHaveURL(bookingsUrl);
     await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
     await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+  });
+});
+
+test('Cancel answering a real 409 shows it above the list and reloads the row as Cancelled', async ({ page, request }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  const { session, stale, other } = await test.step('book two later Seattle stays for the guest through the API', async () => {
+    const [staleIn, staleOut, otherIn, otherOut] = utcDates(124, 126, 128, 130);
+    const staleStay: Stay = { checkIn: staleIn, checkOut: staleOut, guests: 1 };
+    const otherStay: Stay = { checkIn: otherIn, checkOut: otherOut, guests: 1 };
+
+    const search = await fixtureRequest('searching hotels', () =>
+      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', ...staleStay } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const hotels: unknown = await search.json();
+    const hotel: unknown = Array.isArray(hotels) ? (hotels as unknown[])[0] : undefined;
+    const hotelId = isRecord(hotel) ? hotel['id'] : undefined;
+    expect(typeof hotelId === 'number' && Number.isInteger(hotelId), 'the fixture search returns a hotel').toBe(true);
+
+    // One room type with a free room on both stays, so both bookings succeed.
+    const freeLater = new Set(
+      (await apiRoomTypes(request, Number(hotelId), otherStay)).filter((rt) => rt.availableRooms > 0).map((rt) => rt.id),
+    );
+    const free = (await apiRoomTypes(request, Number(hotelId), staleStay)).find(
+      (rt) => rt.availableRooms > 0 && freeLater.has(rt.id),
+    );
+    expect(free !== undefined, 'the hotel has a room type free on both stays').toBe(true);
+
+    const guest = await apiSignIn(request, credentials);
+    const book = (stay: Stay): Promise<number> =>
+      apiBook(request, guest, { hotelId: Number(hotelId), roomTypeId: Number(free?.id), ...stay });
+    const staleId = await book(staleStay);
+    return { session: guest, stale: staleId, other: await book(otherStay) };
+  });
+
+  const bookingsUrl = await test.step('open My bookings: both bookings are Confirmed and offer Cancel', async () => {
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the entry GET returns 200').toBe(200);
+    await expect(page).toHaveURL(/\/bookings$/);
+    for (const id of [stale, other]) {
+      await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+      await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+    }
+    return page.url();
+  });
+
+  await test.step('cancel the booking elsewhere: the open page still offers it', async () => {
+    // The guest's other tab or device; nothing tells this page about it.
+    const cancelled = await fixtureRequest('cancelling a booking', () =>
+      request.delete(`${apiUrl()}/bookings/${stale}`, { headers: session.headers }),
+    );
+    expect(cancelled.status(), 'the cancel elsewhere returns 204').toBe(204);
+    await expect(page.getByTestId(`booking-status-${stale}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${stale}`)).toBeEnabled();
+  });
+
+  const sent = await test.step('click Cancel: the API answers 409 and the list reloads', async () => {
+    const recorded = recordApiRequests(page);
+    const refused = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/bookings/${stale}`) && r.request().method() === 'DELETE',
+    );
+    const reloaded = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId(`cancel-${stale}`).click();
+    // Awaited together, so a waiter that fails after the other is still handled.
+    const [refusal, reload] = await Promise.all([refused, reloaded]);
+    expect(refusal.status(), 'the API refuses the DELETE').toBe(409);
+    expect(reload.status(), 'the reload GET returns 200').toBe(200);
+    return recorded;
+  });
+
+  await test.step('the 409 stays inline above the list, which shows the server status', async () => {
+    const error = page.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    await expect(error.getByRole('alert').locator('strong')).toHaveText('Booking already cancelled');
+    await expect(error.getByRole('alert').locator('p')).toHaveText('This booking has already been cancelled.');
+    // Cancel errors show at the top of the list: the alert precedes the table.
+    const aboveTable = await error.evaluate((el) => {
+      const table = el.ownerDocument.querySelector('[data-testid="bookings-table"]');
+      return table !== null && (el.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    });
+    expect(aboveTable, 'the inline error precedes the bookings table').toBe(true);
+    // The reloaded row reads the server's status, and the refused "Cancel" is
+    // gone; the other booking keeps its own.
+    await expect(page.getByTestId(`booking-status-${stale}`)).toHaveText('Cancelled');
+    await expect(page.getByTestId(`cancel-${stale}`)).toHaveCount(0);
+    await expect(page.getByTestId(`booking-status-${other}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${other}`)).toBeEnabled();
+    // The clicked "Cancel" held focus and is gone, so focus moves to its row's
+    // status.
+    await expect(page.getByTestId(`booking-status-${stale}`)).toBeFocused();
+    await expect(page).toHaveURL(bookingsUrl);
+    // A 409 ends no session: the guest stays signed in with the rows shown.
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    await expect(page.getByTestId('bookings-signed-out')).toHaveCount(0);
+  });
+
+  await test.step('the reload is the only request after the DELETE', async () => {
+    expect(
+      sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
+      'the API requests after the click',
+    ).toEqual([`DELETE /api/bookings/${stale}`, 'GET /api/bookings']);
+    expect(await apiBookingStatus(request, session, stale), 'the server status of the refused booking').toBe('Cancelled');
+    expect(await apiBookingStatus(request, session, other), 'the server status of the other booking').toBe('Confirmed');
   });
 });
 

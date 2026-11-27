@@ -23,7 +23,11 @@ import { SearchPageComponent } from './features/search/search-page.component';
  * - `login`: reads `returnUrl`, `registered` and `reason` from the query.
  * - `register`: guest registration.
  * - `bookings`: the guest's own bookings, guarded by `authGuard`, which
- *   redirects a guest without a live session to `/login?returnUrl=…`.
+ *   redirects a guest without a live session to `/login?returnUrl=…`. The
+ *   guard runs on every navigation to it (`runGuardsAndResolvers: 'always'`),
+ *   a same-URL one included, so nav "My bookings" clicked on the open page
+ *   after the session ended redirects to login, and with a live session the
+ *   page reloads its list.
  * - `**`: every unknown URL redirects to `search`.
  *
  * Query parameters are not declared here: each page reads its own through
@@ -69,6 +73,7 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./features/bookings/bookings-page.component').then((m) => m.BookingsPageComponent),
     canActivate: [authGuard],
+    runGuardsAndResolvers: 'always',
     title: 'My bookings · SmartHotel',
   },
   { path: '**', redirectTo: 'search' },

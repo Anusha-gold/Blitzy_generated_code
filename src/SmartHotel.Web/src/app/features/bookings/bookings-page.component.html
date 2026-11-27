@@ -1,6 +1,14 @@
 <h1 tabindex="-1">My bookings</h1>
 
-<p class="visually-hidden" role="status" aria-live="polite" data-testid="bookings-announcement">{{ announcement() }}</p>
+<!-- Visible as a banner only while it holds a cancellation message; every
+     other message repeats what the page already shows. -->
+<p
+  [class.visually-hidden]="!cancellationShown()"
+  [class.cancel-notice]="cancellationShown()"
+  role="status"
+  aria-live="polite"
+  data-testid="bookings-announcement"
+>{{ announcement() }}</p>
 
 <section
   *ngIf="confirmation() as c"
@@ -25,6 +33,12 @@
     data-testid="login-again"
   >Log in again</a>
 </app-error-message>
+
+<p *ngIf="signedOut()" data-testid="bookings-signed-out">
+  Your session has expired.
+  <a routerLink="/login" [queryParams]="{ returnUrl: '/bookings' }" data-testid="login-again">Log in again</a>
+  to see your bookings.
+</p>
 
 <ng-container *ngIf="bookings() as list">
   <p *ngIf="list.length === 0" class="empty" data-testid="bookings-empty">You have no bookings yet.</p>
@@ -81,6 +95,7 @@
               <button
                 *ngIf="cancellableIds().has(b.id)"
                 type="button"
+                class="button-secondary"
                 [attr.data-testid]="'cancel-' + b.id"
                 [disabled]="cancelPending()"
                 #cancelButton

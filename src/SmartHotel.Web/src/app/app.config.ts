@@ -77,11 +77,16 @@ function browserDateFormat(): string {
  * - Zone.js change detection, with event coalescing. `zone.js` is the
  *   polyfill configured in `angular.json`.
  * - The router with {@link routes}, using path-based URLs, which the hosting
- *   nginx serves through its `index.html` fallback. A Back or Forward step
- *   that a guard refuses, as the hotel detail page refuses one while it
- *   settles a booking in flight, moves the browser back to the history entry
- *   it left (`canceledNavigationResolution: 'computed'`), so the entry the
- *   guest stepped to stays in history rather than being overwritten.
+ *   nginx serves through its `index.html` fallback. A navigation to the
+ *   current URL is processed (`onSameUrlNavigation: 'reload'`) rather than
+ *   ignored, so nav "My bookings" on `/bookings` re-runs `authGuard` and
+ *   refreshes the list. The search page's query observable does not emit for
+ *   an unchanged query, so it re-runs a search only through its own rerun.
+ *   A Back or Forward step that a guard refuses, as the hotel detail page
+ *   refuses one while it settles a booking in flight, moves the browser back
+ *   to the history entry it left (`canceledNavigationResolution: 'computed'`),
+ *   so the entry the guest stepped to stays in history rather than being
+ *   overwritten.
  * - `HttpClient` on its default XHR backend, with two functional
  *   interceptors in this order:
  *   1. {@link loadingInterceptor} is outermost, so the loading counter spans
@@ -113,7 +118,10 @@ function browserDateFormat(): string {
 export const appConfig: ApplicationConfig = {
   providers: [
     provideZoneChangeDetection({ eventCoalescing: true }),
-    provideRouter(routes, withRouterConfig({ canceledNavigationResolution: 'computed' })),
+    provideRouter(
+      routes,
+      withRouterConfig({ onSameUrlNavigation: 'reload', canceledNavigationResolution: 'computed' }),
+    ),
     provideHttpClient(withInterceptors([loadingInterceptor, authInterceptor])),
     { provide: DATE_PIPE_DEFAULT_OPTIONS, useFactory: (): DatePipeConfig => ({ dateFormat: browserDateFormat() }) },
   ],
