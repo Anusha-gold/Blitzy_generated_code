@@ -1,0 +1,8 @@
+/* Shell layout for AppComponent: the nav bar, the loading indicator and the main region.
+   The main region's measure (at most 64rem wide, centred, 1rem padding) is the global
+   `main` rule in src/styles.css. It is not repeated here, because a scoped copy would
+   override that rule and leave two copies to keep in step. */
+:host {
+  /* Custom elements default to inline; the shell is a block that stacks its children. */
+  display: block;
+}
