@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text;
 using System.Text.RegularExpressions;
 
 using Microsoft.AspNetCore.Mvc;
@@ -30,7 +31,8 @@ namespace SmartHotel.Api.Modules.Auth;
 /// </param>
 /// <param name="FullName">
 /// Required. After trimming: not blank, at most 200 characters, and free of the null character (U+0000), which
-/// PostgreSQL text cannot store.
+/// PostgreSQL text cannot store. The limit counts Unicode scalar values, the characters PostgreSQL counts for
+/// <c>varchar(200)</c>, so a character outside the Basic Multilingual Plane counts once.
 /// </param>
 public sealed partial record RegisterRequest(
     [ModelBinder(Name = RegisterRequest.EmailMember)]
@@ -78,7 +80,10 @@ public sealed partial record RegisterRequest(
         if (FullName is not null)
         {
             string trimmed = FullName.Trim();
-            if (trimmed.Length == 0 || trimmed.Length > MaxFullNameLength)
+
+            // Length counts UTF-16 code units, so it would count a character outside the Basic Multilingual Plane
+            // twice; the column's varchar(200) limit counts characters, which are Unicode scalar values.
+            if (trimmed.Length == 0 || !IsWithinFullNameLength(trimmed))
             {
                 yield return new ValidationResult(FullNameMessage, [FullNameMember]);
             }
@@ -88,6 +93,33 @@ public sealed partial record RegisterRequest(
                 yield return new ValidationResult(FullNameNulMessage, [FullNameMember]);
             }
         }
+    }
+
+    // Whether value holds at most MaxFullNameLength Unicode scalar values. Each scalar value takes one or two UTF-16
+    // code units, so only a value of MaxFullNameLength + 1 to 2 * MaxFullNameLength code units needs counting, and
+    // the count stops as soon as it passes the limit.
+    private static bool IsWithinFullNameLength(string value)
+    {
+        if (value.Length <= MaxFullNameLength)
+        {
+            return true;
+        }
+
+        if (value.Length > 2 * MaxFullNameLength)
+        {
+            return false;
+        }
+
+        int scalarValues = 0;
+        foreach (Rune rune in value.EnumerateRunes())
+        {
+            if (++scalarValues > MaxFullNameLength)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsAcceptableEmail(string trimmed)

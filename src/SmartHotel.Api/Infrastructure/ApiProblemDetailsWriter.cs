@@ -61,7 +61,8 @@ public sealed class ApiProblemDetailsWriter : IProblemDetailsWriter
         // A custom writer inherits none of the default writer's customization step.
         _problemDetailsOptions.CustomizeProblemDetails?.Invoke(context);
 
-        // context.Exception is deliberately never read, so no exception data can reach the body.
+        // context.Exception is never read, so this writer adds no exception data of its own. The body holds
+        // only what the caller put in the problem plus the shared defaults; callers must supply safe content.
         // Only Content-Type and the body are written: WWW-Authenticate from the bearer challenge and
         // Allow from a 405 must survive. The runtime type keeps derived members such as
         // HttpValidationProblemDetails.Errors in the output.

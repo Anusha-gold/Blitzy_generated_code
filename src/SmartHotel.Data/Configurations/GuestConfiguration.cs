@@ -42,9 +42,10 @@ internal sealed class GuestConfiguration : IEntityTypeConfiguration<Guest>
         builder.Property(g => g.CreatedAt)
             .IsRequired();
 
-        // AuthService maps a 23505 to 409 only when its ConstraintName is UX_Guests_Email.
+        // The name comes from the shared constant that AuthService also matches: it maps a 23505 to 409 only
+        // when the violation's ConstraintName is this index.
         builder.HasIndex(g => g.Email)
             .IsUnique()
-            .HasDatabaseName("UX_Guests_Email");
+            .HasDatabaseName(Guest.EmailUniqueIndexName);
     }
 }

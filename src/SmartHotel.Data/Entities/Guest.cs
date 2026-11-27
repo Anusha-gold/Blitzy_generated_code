@@ -7,6 +7,13 @@ namespace SmartHotel.Data.Entities;
 public sealed class Guest
 {
     /// <summary>
+    /// Database name of the unique index on <see cref="Email"/>. PostgreSQL reports it as the
+    /// <c>ConstraintName</c> of the unique violation (SQLSTATE <c>23505</c>) that a duplicate email
+    /// raises, and the API maps exactly that violation to a duplicate registration.
+    /// </summary>
+    public const string EmailUniqueIndexName = "UX_Guests_Email";
+
+    /// <summary>
     /// Database-generated identity. Exposed to clients as <c>guestId</c> and carried as the
     /// token's <c>sub</c> claim.
     /// </summary>

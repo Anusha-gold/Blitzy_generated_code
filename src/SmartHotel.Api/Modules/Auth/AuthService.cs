@@ -38,10 +38,6 @@ public sealed partial class AuthService(
     TimeProvider timeProvider,
     ILogger<AuthService> logger)
 {
-    // The unique index on "Guests"."Email", named in GuestConfiguration. PostgreSQL reports it as the
-    // ConstraintName of the 23505 that a concurrent duplicate registration raises.
-    private const string EmailUniqueIndex = "UX_Guests_Email";
-
     // One hash of a random secret per process, verified against when no account can match, so that every rejected
     // login costs one PBKDF2 verification. Every host in the process configures the same iteration count, so
     // sharing it across instances keeps the cost equal to a real account's. The lock makes concurrent first use
@@ -116,7 +112,7 @@ public sealed partial class AuthService(
         catch (DbUpdateException ex) when (ex.InnerException is PostgresException
         {
             SqlState: PostgresErrorCodes.UniqueViolation,
-            ConstraintName: EmailUniqueIndex,
+            ConstraintName: Guest.EmailUniqueIndexName,
         })
         {
             // The rejected insert stays tracked as Added; detaching it keeps a later save in this scope from
