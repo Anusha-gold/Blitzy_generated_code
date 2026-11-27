@@ -30,7 +30,8 @@ namespace SmartHotel.Api.Modules.Bookings;
 /// <summary>
 /// Body of <c>POST /api/bookings</c>. The request never carries a price: the server computes the total from the
 /// room type's nightly price and the number of nights. Error messages are fixed sentences that never echo the
-/// input. The numeric fields must be JSON numbers: a quoted number is a wrong JSON type and returns 400.
+/// input and never name their own field, which the error key identifies. The numeric fields must be JSON numbers:
+/// a quoted number is a wrong JSON type and returns 400.
 /// </summary>
 /// <param name="HotelId">Required, at least 1, and the id of an existing hotel (otherwise 404).</param>
 /// <param name="RoomTypeId">
@@ -51,18 +52,18 @@ namespace SmartHotel.Api.Modules.Bookings;
 [JsonNumberHandling(JsonNumberHandling.Strict)]
 public sealed record CreateBookingRequest(
     [ModelBinder(Name = "hotelId")]
-    [Required(ErrorMessage = "hotelId is required.")]
-    [Range(1, int.MaxValue, ErrorMessage = "hotelId must be at least 1.")]
+    [Required(ErrorMessage = "A value is required.")]
+    [Range(1, int.MaxValue, ErrorMessage = "The value must be at least 1.")]
     int? HotelId,
     [ModelBinder(Name = "roomTypeId")]
-    [Required(ErrorMessage = "roomTypeId is required.")]
-    [Range(1, int.MaxValue, ErrorMessage = "roomTypeId must be at least 1.")]
+    [Required(ErrorMessage = "A value is required.")]
+    [Range(1, int.MaxValue, ErrorMessage = "The value must be at least 1.")]
     int? RoomTypeId,
     string? CheckIn,
     string? CheckOut,
     [ModelBinder(Name = "guests")]
-    [Required(ErrorMessage = "guests is required.")]
-    [Range(1, int.MaxValue, ErrorMessage = "guests must be at least 1.")]
+    [Required(ErrorMessage = "A value is required.")]
+    [Range(1, int.MaxValue, ErrorMessage = "The value must be at least 1.")]
     int? Guests);
 
 /// <summary>

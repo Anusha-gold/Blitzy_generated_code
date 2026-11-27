@@ -22,12 +22,12 @@ public readonly record struct StayPeriod(DateOnly CheckIn, DateOnly CheckOut)
     private const string CheckInKey = "checkIn";
     private const string CheckOutKey = "checkOut";
 
-    private const string CheckInRequiredMessage = "checkIn is required.";
-    private const string CheckOutRequiredMessage = "checkOut is required.";
-    private const string CheckInFormatMessage = "checkIn must be a date in the format " + IsoDate.Format + ".";
-    private const string CheckOutFormatMessage = "checkOut must be a date in the format " + IsoDate.Format + ".";
-    private const string CheckOutNotAfterCheckInMessage = "checkOut must be after checkIn.";
-    private const string CheckInInPastMessage = "checkIn cannot be in the past.";
+    // No message names its own field: the error key identifies the date, and a client shows its own label for that
+    // field beside the message. Both dates therefore share the syntax messages.
+    private const string DateRequiredMessage = "A date is required.";
+    private const string DateFormatMessage = "The date must be in the format " + IsoDate.Format + ".";
+    private const string CheckOutNotAfterCheckInMessage = "The date must be after the check-in date.";
+    private const string CheckInInPastMessage = "The date cannot be in the past.";
 
     // StayRules.MaxNights is the single home of the 30-night maximum, shared with PriceCalculator;
     // the message is built from it rather than from a local copy, so the rule and its text cannot drift.
@@ -57,7 +57,8 @@ public readonly record struct StayPeriod(DateOnly CheckIn, DateOnly CheckOut)
     /// <see cref="StayRules.MaxNights"/> nights.
     /// </para>
     /// <para>
-    /// Every message is a fixed English sentence and never contains any part of the input.
+    /// Every message is a fixed English sentence and never contains any part of the input. None names its own
+    /// field, because the key already identifies it.
     /// </para>
     /// </remarks>
     /// <param name="checkIn">
@@ -92,10 +93,8 @@ public readonly record struct StayPeriod(DateOnly CheckIn, DateOnly CheckOut)
         period = default;
         errors = new Dictionary<string, string[]>(StringComparer.Ordinal);
 
-        bool checkInParsed = TryParseField(
-            checkIn, CheckInKey, CheckInRequiredMessage, CheckInFormatMessage, errors, out DateOnly parsedIn);
-        bool checkOutParsed = TryParseField(
-            checkOut, CheckOutKey, CheckOutRequiredMessage, CheckOutFormatMessage, errors, out DateOnly parsedOut);
+        bool checkInParsed = TryParseField(checkIn, CheckInKey, errors, out DateOnly parsedIn);
+        bool checkOutParsed = TryParseField(checkOut, CheckOutKey, errors, out DateOnly parsedOut);
         if (!checkInParsed || !checkOutParsed)
         {
             return false;
@@ -129,21 +128,19 @@ public readonly record struct StayPeriod(DateOnly CheckIn, DateOnly CheckOut)
     private static bool TryParseField(
         string? value,
         string key,
-        string requiredMessage,
-        string formatMessage,
         Dictionary<string, string[]> errors,
         out DateOnly date)
     {
         if (string.IsNullOrEmpty(value))
         {
             date = default;
-            AddError(errors, key, requiredMessage);
+            AddError(errors, key, DateRequiredMessage);
             return false;
         }
 
         if (!IsoDate.TryParse(value, out date))
         {
-            AddError(errors, key, formatMessage);
+            AddError(errors, key, DateFormatMessage);
             return false;
         }
 

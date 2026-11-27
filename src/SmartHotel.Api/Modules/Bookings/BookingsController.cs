@@ -108,12 +108,7 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
                 this.BadRequestProblem(
                     new Dictionary<string, string[]>
                     {
-                        ["guests"] =
-                        [
-                            string.Create(
-                                CultureInfo.InvariantCulture,
-                                $"guests exceeds this room type's capacity of {capacityExceeded.MaxGuests}."),
-                        ],
+                        ["guests"] = [CapacityMessage(capacityExceeded.MaxGuests)],
                     },
                     "The requested guest count exceeds the room type's capacity."),
             CreateBookingResult.NoRoomAvailable noRoomAvailable =>
@@ -209,5 +204,14 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     private static string FormatDate(DateOnly date)
     {
         return date.ToString(IsoDate.Format, CultureInfo.InvariantCulture);
+    }
+
+    // The capacity message states the room type's limit, never the requested count, and does not name its own
+    // field, which the errors key identifies. The noun agrees with the limit, which can be 1.
+    private static string CapacityMessage(int maxGuests)
+    {
+        return maxGuests == 1
+            ? "This room type takes at most 1 guest."
+            : string.Create(CultureInfo.InvariantCulture, $"This room type takes at most {maxGuests} guests.");
     }
 }

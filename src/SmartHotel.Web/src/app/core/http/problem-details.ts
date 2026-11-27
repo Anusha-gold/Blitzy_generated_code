@@ -30,6 +30,23 @@ const PROBLEM_MEDIA_TYPE = 'application/problem+json';
 const DEADLINE_STATUS_TEXT = 'Request deadline exceeded';
 /** A JSON path naming one top-level member, such as `$.email`; group 1 is the member. */
 const TOP_LEVEL_JSON_PATH = /^\$\.([A-Za-z_][A-Za-z0-9_]*)$/;
+/**
+ * The label the guest sees for each request field the API names in `errors`:
+ * the form `<label>` text on the search, login and register pages, and the
+ * table headers for the booked hotel and room type. One map serves every page,
+ * because a field name means the same input wherever it is sent.
+ */
+const FIELD_LABELS: ReadonlyMap<string, string> = new Map<string, string>([
+  ['city', 'City'],
+  ['checkIn', 'Check-in'],
+  ['checkOut', 'Check-out'],
+  ['guests', 'Guests'],
+  ['email', 'Email'],
+  ['password', 'Password'],
+  ['fullName', 'Full name'],
+  ['hotelId', 'Hotel'],
+  ['roomTypeId', 'Room type'],
+]);
 
 /**
  * How long, in milliseconds, a request bounded by {@link withRequestDeadline}
@@ -183,6 +200,24 @@ export function fieldErrorIds(error: UiError | null, idPrefix: string): Readonly
     ids.set(field, existing === undefined ? messageIds.join(' ') : [existing, ...messageIds].join(' '));
   });
   return ids;
+}
+
+/**
+ * Returns the label the guest sees for the request field a server error key
+ * names, such as `Check-out` for `checkOut`, so a field error can be
+ * identified by its visible label instead of the API's field name. A key that
+ * is a top-level JSON path member, such as `$.email`, names that member, as in
+ * {@link fieldErrorIds}. Names are compared with case. A key that names no
+ * labelled field, such as the body-level `$`, a deeper path or any other
+ * name, gives `null`, and its messages then stand on their own. The function
+ * is pure.
+ *
+ * @param key - A field key from {@link UiError.fieldErrors}, exactly as the
+ * server sent it.
+ * @returns The visible label, or `null` when the key names no labelled field.
+ */
+export function fieldLabel(key: string): string | null {
+  return FIELD_LABELS.get(fieldNameOf(key)) ?? null;
 }
 
 /** The member a top-level JSON path key (`$.email`) names; any other key unchanged. */

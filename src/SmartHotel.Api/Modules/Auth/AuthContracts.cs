@@ -43,14 +43,14 @@ namespace SmartHotel.Api.Modules.Auth;
 /// </param>
 public sealed partial record RegisterRequest(
     [ModelBinder(Name = RegisterRequest.EmailMember)]
-    [Required(ErrorMessage = "email is required.")]
+    [Required(ErrorMessage = "A value is required.")]
     string? Email,
     [ModelBinder(Name = RegisterRequest.PasswordMember)]
-    [Required(ErrorMessage = "password is required and must not be blank.")]
-    [RegisterRequest.PasswordLength(ErrorMessage = "password must be 8 to 128 characters long.")]
+    [Required(ErrorMessage = "A value is required.")]
+    [RegisterRequest.PasswordLength(ErrorMessage = "The value must be 8 to 128 characters long.")]
     string? Password,
     [ModelBinder(Name = RegisterRequest.FullNameMember)]
-    [Required(ErrorMessage = "fullName is required and must not be blank.")]
+    [Required(ErrorMessage = "A value is required.")]
     string? FullName)
     : IValidatableObject
 {
@@ -69,9 +69,12 @@ public sealed partial record RegisterRequest(
     private const string PasswordMember = "password";
     private const string FullNameMember = "fullName";
 
-    private const string EmailMessage = "email must be a valid ASCII email address of at most 254 characters.";
-    private const string FullNameMessage = "fullName must not be blank and must be at most 200 characters.";
-    private const string FullNameNulMessage = "fullName must not contain the null character (U+0000).";
+    // No message names its own field: the error key identifies the member, and a client shows its own label for
+    // that field beside the message.
+    private const string EmailMessage =
+        "The value must be a valid email address of at most 254 characters, using only ASCII characters.";
+    private const string FullNameMessage = "The value must not be blank and must be at most 200 characters.";
+    private const string FullNameNulMessage = "The value contains a character that is not allowed.";
 
     /// <summary>
     /// Applies the email and full-name bounds to the trimmed values, yielding at most one error per field.

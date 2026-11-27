@@ -551,7 +551,7 @@ public static class ProblemDetailsSetup
     {
         return status switch
         {
-            400 => "The request contains invalid input. See the errors member for details.",
+            400 => "Some of the information provided is missing or not valid. Correct it and try again.",
             401 => "A valid bearer token is required.",
             403 => "You do not have permission to perform this action.",
             404 => "The requested resource was not found.",

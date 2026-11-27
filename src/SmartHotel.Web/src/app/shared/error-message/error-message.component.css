@@ -44,3 +44,8 @@
 .inline-error ul {
   padding-inline-start: 1.25rem;
 }
+
+/* The visible label that names a field error's field. */
+.inline-error__field {
+  font-weight: 600;
+}

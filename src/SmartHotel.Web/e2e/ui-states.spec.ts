@@ -260,13 +260,15 @@ test('search with check-out equal to check-in shows an inline 400', async ({ pag
   const error = page.getByTestId('inline-error');
   await expect(error).toBeVisible();
   await expect(error.getByRole('alert').locator('strong')).toHaveText(/\S/);
-  await expect(error).toContainText('checkOut must be after checkIn.');
+  // The field error names its field by the visible label, never by the API's key.
+  await expect(error).toContainText('Check-out: The date must be after the check-in date.');
+  await expect(error).not.toContainText('checkOut');
   await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
 
   // Only the rejected input is marked invalid, described by its own message.
   const checkOut = page.getByTestId('search-check-out');
   await expect(checkOut).toHaveAttribute('aria-invalid', 'true');
-  await expect(checkOut).toHaveAccessibleDescription('checkOut must be after checkIn.');
+  await expect(checkOut).toHaveAccessibleDescription('The date must be after the check-in date.');
   await expect(page.getByTestId('search-check-in')).not.toHaveAttribute('aria-invalid');
 });
 

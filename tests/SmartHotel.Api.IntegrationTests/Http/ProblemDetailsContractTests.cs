@@ -83,6 +83,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private const string HealthScenario = "health";
 
     private const string HttpsOnlyDetail = "This API accepts HTTPS requests only.";
+    private const string InvalidInputDetail =
+        "Some of the information provided is missing or not valid. Correct it and try again.";
     private const string HttpsWebOrigin = "https://localhost:4200";
 
     private const string SearchGuestsMarkerScenario = "search-guests-marker";
@@ -1293,6 +1295,12 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         // keys, never a key from the response, can reach this failure message.
         int keyCount = problem.GetProperty("errors").EnumerateObject().Count();
         Assert.True(keyCount == 1, $"Expected the errors object to hold only the case's key but it holds {keyCount}.");
+
+        // The default 400 detail is the fixed guest-facing sentence. It is compared as a boolean with a fixed message,
+        // so a failure prints no response text.
+        Assert.True(
+            string.Equals(InvalidInputDetail, problem.GetProperty("detail").GetString(), StringComparison.Ordinal),
+            $"Expected the 400 detail to be exactly '{InvalidInputDetail}'.");
 
         foreach (string disclosure in BindingDisclosures)
         {

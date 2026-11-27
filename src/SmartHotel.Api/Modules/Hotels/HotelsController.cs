@@ -42,8 +42,11 @@ namespace SmartHotel.Api.Modules.Hotels;
 public sealed class HotelsController(HotelQueryService hotelQueryService, TimeProvider timeProvider) : ControllerBase
 {
     private const int DefaultGuests = 1;
-    private const string GuestsRangeMessage = "guests must be at least 1.";
-    private const string GuestsIntegerMessage = "guests must be an integer of at least 1.";
+
+    // No message names its own field: the error key identifies the parameter, and a client shows its own label for
+    // that field beside the message.
+    private const string GuestsRangeMessage = "The value must be at least 1.";
+    private const string GuestsIntegerMessage = "The value must be a whole number of at least 1.";
 
     /// <summary>
     /// Searches a city for hotels that can host the party for the whole stay: <c>GET /api/hotels</c>.
@@ -85,8 +88,8 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
     [HttpGet]
     public async Task<ActionResult<IReadOnlyList<HotelSummaryResponse>>> Search(
         [FromQuery]
-        [Required(ErrorMessage = "city is required.")]
-        [MaxCharacters(100, ErrorMessage = "city must be at most 100 characters.")]
+        [Required(ErrorMessage = "A value is required.")]
+        [MaxCharacters(100, ErrorMessage = "The value can be at most 100 characters.")]
         string? city,
         [FromQuery] string? checkIn,
         [FromQuery] string? checkOut,

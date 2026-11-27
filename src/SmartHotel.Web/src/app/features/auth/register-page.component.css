@@ -60,3 +60,10 @@ a:focus-visible {
   outline: 2px solid var(--sh-color-accent);
   outline-offset: 2px;
 }
+
+/* A field the server rejected: a 2px error-coloured edge, the inset shadow adding the second pixel without a
+   layout shift. Its specificity and later order beat the plain and hover borders. */
+input[aria-invalid="true"] {
+  border-color: var(--sh-color-error);
+  box-shadow: inset 0 0 0 1px var(--sh-color-error);
+}

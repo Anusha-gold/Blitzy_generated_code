@@ -1,6 +1,6 @@
 import { ChangeDetectionStrategy, Component, Input } from '@angular/core';
 import { NgFor, NgIf } from '@angular/common';
-import { fieldErrorId, type UiError } from '../../core/http/problem-details';
+import { fieldErrorId, fieldLabel, type UiError } from '../../core/http/problem-details';
 
 /**
  * Renders one inline error in a styled wrapper (`data-testid="inline-error"`)
@@ -17,9 +17,13 @@ import { fieldErrorId, type UiError } from '../../core/http/problem-details';
  * Server-supplied text is rendered by interpolation only, never as HTML. The
  * component maps no status to text: it shows the {@link UiError} it receives.
  *
- * Each field error reads `field: message`. With a `fieldErrorIdPrefix`, the
- * message text carries the id from `fieldErrorId`, so the rejected input can
- * name it in `aria-describedby` through `fieldErrorIds`; without one, the
+ * Each field error reads `Label: message`, where the label is the one the
+ * guest sees for that field, from `fieldLabel`, so the list names each field
+ * as the form does. A key with no such label, such as the body-level `$`,
+ * shows its message alone; the server's field name is never shown. With a
+ * `fieldErrorIdPrefix`, the message text alone carries the id from
+ * `fieldErrorId`, so the rejected input can name it in `aria-describedby`
+ * through `fieldErrorIds` without repeating its own label; without one, the
  * messages carry no ids.
  */
 @Component({
@@ -39,6 +43,9 @@ export class ErrorMessageComponent {
    * reference them through `aria-describedby`; `null` gives them no ids.
    */
   @Input() fieldErrorIdPrefix: string | null = null;
+
+  /** The visible label for a field-error key, or `null` when it has none. */
+  protected readonly fieldLabel = fieldLabel;
 
   /**
    * The id of one field-error message, or `null` when no prefix is set.
