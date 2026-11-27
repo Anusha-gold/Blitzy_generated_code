@@ -117,17 +117,28 @@ services:
       interval: 5s
       retries: 20
 
-  # Integration-test database, started only with --profile test. It trusts
-  # every connection, so it sits alone on the testdb network and is published
-  # on host loopback only. testdb is not internal: an internal network cannot
-  # publish a port.
+  # Integration-test database. The test profile keeps it out of an ordinary
+  # `up`: it starts when that profile is enabled or when it is named on the
+  # command line, and the test fixture does both. It trusts every connection,
+  # so it sits alone on the testdb network and is published on host loopback
+  # only. testdb is not internal: an internal network cannot publish a port.
+  # Loopback publishing keeps other hosts out only on Docker Engine 28.0 or
+  # later; on a Linux host running firewalld, engines 28.2.0 through 28.3.2
+  # lose that protection when firewalld reloads (CVE-2025-54388), so such a
+  # host needs 28.3.3 or later; see Tools under Prerequisites in README.md.
   db-test:
     image: postgres:16.16-alpine3.24
     profiles: ["test"]
-    # Value-free server log, as for db: by default an error record carries
-    # DETAIL, which can hold a guest's email, and the failed statement with its
-    # bind parameters. Clients still receive the SQLSTATE, the constraint name
-    # and DETAIL, which the tests and the API's 23505/23P01 translation need.
+    # Fewer value-bearing diagnostics in the server log, as for db. terse
+    # drops DETAIL, where a unique violation prints the conflicting key (a
+    # guest's email, for one), with HINT, QUERY and CONTEXT; panic keeps the
+    # failing statement out of every error record below PANIC; the two 0
+    # settings keep bind parameters out of error records and logged
+    # statements. The primary message is still logged and can quote a
+    # rejected value. The server still sends clients the SQLSTATE, the
+    # constraint name and DETAIL. Npgsql redacts DETAIL, because no
+    # connection sets Include Error Detail, and the tests and the API's
+    # 23505/23P01 translation need only the SQLSTATE and the constraint name.
     # The image entrypoint passes these options to its init server as well.
     command: ["postgres",
       "-c", "log_error_verbosity=terse",

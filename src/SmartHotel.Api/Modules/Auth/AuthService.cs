@@ -40,9 +40,10 @@ public sealed partial class AuthService(
     ILogger<AuthService> logger)
 {
     // One hash of a random secret per process, verified against when no account can match, so that every rejected
-    // login costs one PBKDF2 verification. Every host in the process configures the same iteration count, so
-    // sharing it across instances keeps the cost equal to a real account's. The lock makes concurrent first use
-    // compute the hash once rather than merely publish one of several computed results.
+    // login costs one PBKDF2 verification and no hashing. AuthModule's start-up service creates it through
+    // EnsureDummyHash when the host starts, before the server accepts requests. Every host in the process configures
+    // the same iteration count, so sharing it across instances keeps the cost equal to a real account's. The lock makes
+    // concurrent first use compute the hash once rather than merely publish one of several computed results.
     private static string? s_dummyHash;
     private static object? s_dummyHashLock;
 
@@ -204,9 +205,10 @@ public sealed partial class AuthService(
     /// registered password followed by null characters from logging in: the hash's HMAC pads a short key with zero
     /// bytes, so such a value would otherwise verify against the registered password's hash.
     /// When no account can match, the password (or an empty string in place of <see langword="null"/>)
-    /// is still verified against a dummy hash made with the same settings, so every rejection performs one PBKDF2
-    /// verification. That makes the hashing work comparable, not the timing constant: the database lookup can
-    /// still take different times.
+    /// is still verified against a dummy hash made with the same settings. The hash is created once per process when
+    /// the host starts, before the server accepts requests, so every rejection, the first included, performs one
+    /// PBKDF2 verification and no hashing. That makes the hashing work comparable, not the timing constant: the
+    /// database lookup can still take different times.
     /// </para>
     /// <para>
     /// A stored hash made with an older format or fewer iterations is replaced with a current one after a
@@ -272,20 +274,36 @@ public sealed partial class AuthService(
         return new LoginResponse(token, expiresAtUtc);
     }
 
-    private LoginResponse? RejectWithoutAccount(string? password)
+    /// <summary>
+    /// Returns the process's dummy hash, first creating it with <paramref name="passwordHasher"/> when no call in the
+    /// process has yet.
+    /// </summary>
+    /// <remarks>
+    /// The hash is of a random secret that never leaves the process. <c>AuthModule</c>'s start-up service calls this
+    /// before the server accepts requests, so a login never pays for the hashing. Concurrent first calls compute the
+    /// hash once, and every later call returns it without hashing.
+    /// </remarks>
+    /// <param name="passwordHasher">The host's hasher, carrying the configured iteration count.</param>
+    /// <returns>The dummy hash, in the hasher's current format.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="passwordHasher"/> is <see langword="null"/>.</exception>
+    internal static string EnsureDummyHash(IPasswordHasher<Guest> passwordHasher)
     {
-        // The result is discarded: only the work matters. The hasher throws on a null password.
-        _ = passwordHasher.VerifyHashedPassword(new Guest(), GetDummyHash(), password ?? string.Empty);
-        LogLoginFailed(logger);
-        return null;
-    }
+        ArgumentNullException.ThrowIfNull(passwordHasher);
 
-    private string GetDummyHash()
-    {
         return LazyInitializer.EnsureInitialized(
             ref s_dummyHash,
             ref s_dummyHashLock,
             () => passwordHasher.HashPassword(new Guest(), Guid.NewGuid().ToString("N")));
+    }
+
+    private LoginResponse? RejectWithoutAccount(string? password)
+    {
+        // The result is discarded: only the work matters. The hasher throws on a null password. The dummy hash already
+        // exists once the host has started, so this verifies without hashing; a host that never ran AuthModule's
+        // start-up service creates it here, once.
+        _ = passwordHasher.VerifyHashedPassword(new Guest(), EnsureDummyHash(passwordHasher), password ?? string.Empty);
+        LogLoginFailed(logger);
+        return null;
     }
 
     // Stops tracking the guest the latest registration attempt added, if the context still tracks one.

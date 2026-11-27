@@ -148,7 +148,10 @@ public abstract record CreateBookingResult
     /// <param name="MaxGuests">The room type's maximum number of guests.</param>
     public sealed record CapacityExceeded(int MaxGuests) : CreateBookingResult;
 
-    /// <summary>Every room of the type has a confirmed booking that overlaps the stay (409).</summary>
+    /// <summary>
+    /// No room was allocated (409): either no room of the type was free for the stay, or the selected room conflicted
+    /// with another confirmed booking, in which case another room of the type may still be free.
+    /// </summary>
     /// <param name="RoomTypeName">The room type's display name.</param>
     /// <param name="CheckIn">The requested check-in date.</param>
     /// <param name="CheckOut">The requested check-out date, the exclusive end of the stay.</param>

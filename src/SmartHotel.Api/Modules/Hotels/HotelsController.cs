@@ -48,6 +48,9 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
     private const string GuestsRangeMessage = "The value must be at least 1.";
     private const string GuestsIntegerMessage = "The value must be a whole number of at least 1.";
 
+    // Unlike the other asynchronous methods, these actions carry no Async suffix: each keeps the fixed name of the
+    // endpoint operation it serves, the name MVC would report even with the suffix, since it trims a trailing Async.
+
     /// <summary>
     /// Searches a city for hotels that can host the party for the whole stay: <c>GET /api/hotels</c>.
     /// </summary>

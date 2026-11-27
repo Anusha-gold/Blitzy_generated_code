@@ -8,9 +8,9 @@
  * handle `/config.json`.
  *
  * Deadline: the request and the reading of its body are bounded together by
- * {@link CONFIG_DEADLINE_MS}. A response that stalls before its headers, or
- * after them while its body is still arriving, is aborted at the deadline, so
- * the SPA reaches its boot-error state instead of loading forever.
+ * {@link CONFIG_DEADLINE_MS}. A response whose headers or body have not fully
+ * arrived by the deadline is aborted, so the SPA reaches its boot-error state
+ * instead of loading forever.
  *
  * Transport rule: the API base URL must use `https` in every environment.
  * Plain `http` is accepted only for `localhost` or `127.0.0.1`, and only when
@@ -24,11 +24,10 @@ import { InjectionToken } from '@angular/core';
 const API_PATH = '/api';
 
 /**
- * How long, in milliseconds, {@link loadRuntimeConfig} waits for `/config.json`
- * before it gives up: 10 seconds, from the request until its body has been
- * read in full. The document is a few dozen bytes served by the web server
- * that served the page, so only a server or network that has stopped
- * answering reaches it.
+ * Maximum wait, in milliseconds, for the `/config.json` request and the reading
+ * of its body together: 10 seconds. When it expires, {@link loadRuntimeConfig}
+ * aborts the exchange, whether the server or network has stopped answering or
+ * the transfer is still active but too slow.
  */
 export const CONFIG_DEADLINE_MS = 10_000;
 

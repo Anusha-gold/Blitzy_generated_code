@@ -8,9 +8,10 @@
  * `boot-error` alert instead. The same alert covers a bootstrap that fails.
  *
  * Neither failure writes to the browser console: the boot-error alert is the
- * whole report. A configuration rejection can describe values from
- * `/config.json`, and a bootstrap error can carry provider or initialization
- * details, so neither is printed, by this file or by Angular's `ErrorHandler`.
+ * whole report, and no raw startup error is printed, by this file or by
+ * Angular's `ErrorHandler`. Configuration validation never includes the
+ * rejected values, and a bootstrap error can carry provider or initialization
+ * details.
  */
 import { ErrorHandler } from '@angular/core';
 import { bootstrapApplication } from '@angular/platform-browser';
@@ -104,13 +105,12 @@ class StartupErrorHandler extends ErrorHandler {
 }
 
 /**
- * Loads the runtime configuration, then bootstraps the application with it.
+ * Loads the runtime configuration, then bootstraps the application with it as
+ * `API_CONFIG`.
  *
- * Either failure ends in the boot-error state, and neither writes to the
- * console: the alert is the whole report. The configuration rejection can
- * describe values from `/config.json`, and a bootstrap error can carry provider
- * or initialization details, which {@link StartupErrorHandler} keeps Angular
- * from printing.
+ * Either failure shows the boot-error alert instead; when the configuration
+ * fails, Angular is not bootstrapped. The file header explains why neither
+ * failure is printed.
  */
 async function start(): Promise<void> {
   let config: ApiConfig;

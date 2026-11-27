@@ -20,8 +20,11 @@
  * rewriting the `Authorization` header of the app's own bookings requests,
  * so the 401 comes from the API's JwtBearer validation, not from a stub.
  * Entering My bookings must then redirect to login with the session-expired
- * notice, and "Book" must stay on the hotel page with the 401 shown inline
- * and a "Log in again" link. "Cancel" is an action too: with only its DELETE
+ * notice. When the browser throws on that redirect's history update, so the
+ * router rejects it, My bookings stays open instead with the 401 inline and a
+ * "Log in again" that leads back to the list, and no error goes unhandled.
+ * "Book" must stay on the hotel page with the 401 shown inline and a
+ * "Log in again" link. "Cancel" is an action too: with only its DELETE
  * rejected, after a successful entry load, My bookings stays put and shows
  * the 401 inline with a focused "Log in again" back to
  * `/login?returnUrl=%2Fbookings`, the guest's bookings leave the screen with
@@ -2248,6 +2251,103 @@ test('server 401 on entering My bookings redirects with session-expired', async 
     await expect(page.getByTestId('login-notice')).toHaveText('Your session has expired. Log in again.');
     await expect(page.getByTestId('nav-login')).toHaveText('Log in');
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+});
+
+test('server 401 on entering My bookings stays there with an inline error when the redirect to login fails', async ({ page }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  // Every uncaught exception, and every error the app reports to the console,
+  // such as Angular's report of a promise rejection nothing handled. The
+  // browser's own line for the entry GET's 401 is expected and left out. Only
+  // fixed labels are kept, an exception's error type or "console error", so
+  // no browser error text, which can carry URLs, tokens or email addresses,
+  // reaches the test output.
+  const reported: string[] = [];
+  page.on('pageerror', (error) => {
+    reported.push(`uncaught ${error.name}`);
+  });
+  page.on('console', (message) => {
+    const source = new URL(message.location().url || 'about:blank');
+    if (
+      message.type() !== 'error' ||
+      (message.text().startsWith('Failed to load resource:') && isBookingsCollection(source))
+    ) {
+      return;
+    }
+    reported.push('console error');
+  });
+
+  await test.step('make the history update of the redirect to login throw', async () => {
+    // The router writes the login URL with `replaceState` just before it
+    // activates the login page; Safari throws this `SecurityError` when a page
+    // updates history too often. The navigation then ends with an error, the
+    // router rejects its promise and restores `/bookings`, and My bookings
+    // stays active. Every other history update goes through unchanged.
+    await page.evaluate(() => {
+      const replaceState = History.prototype.replaceState;
+      (window as unknown as Record<string, unknown>)['__originalReplaceState'] = replaceState;
+      History.prototype.replaceState = function (
+        this: History,
+        data: unknown,
+        unused: string,
+        url?: string | URL | null,
+      ): void {
+        if (String(url ?? '').includes('reason=session-expired')) {
+          throw new DOMException('History updates are throttled.', 'SecurityError');
+        }
+        replaceState.call(this, data, unused, url);
+      };
+    });
+  });
+
+  await test.step('open My bookings with a token the API rejects', async () => {
+    await rejectBookingsToken(page);
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the API rejects the entry GET').toBe(401);
+  });
+
+  await test.step('stay on My bookings with the 401 inline, signed out', async () => {
+    const error = page.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    await expect(error.getByRole('alert').locator('strong')).toHaveText('Unauthorized');
+    await expect(error.getByRole('alert').locator('p')).toHaveText('A valid bearer token is required.');
+    // The inline error holds the only recovery link: the session-ended notice
+    // stays hidden, and no list was loaded.
+    const loginAgain = error.getByTestId('login-again');
+    await expect(loginAgain).toHaveText('Log in again');
+    await expect(loginAgain).toHaveAttribute('href', '/login?returnUrl=%2Fbookings');
+    await expect(page.getByTestId('login-again')).toHaveCount(1);
+    await expect(page.getByTestId('bookings-signed-out')).toHaveCount(0);
+    await expect(page.getByTestId('bookings-table')).toHaveCount(0);
+    await expect(page.getByTestId('bookings-empty')).toHaveCount(0);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+    await expect(page.getByTestId('nav-login')).toHaveText('Log in');
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+
+  await test.step('"Log in again" returns to My bookings once history updates work again', async () => {
+    await page.unroute(isBookingsApi);
+    await page.evaluate(() => {
+      History.prototype.replaceState = (window as unknown as Record<string, unknown>)[
+        '__originalReplaceState'
+      ] as History['replaceState'];
+    });
+    await page.getByTestId('login-again').click();
+    await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await logIn(page, credentials.email, credentials.password);
+    expect((await list).status(), 'the list GET after logging in again returns 200').toBe(200);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByTestId('bookings-empty')).toBeVisible();
+    await expect(page.getByTestId('inline-error')).toHaveCount(0);
   });
 });
 

@@ -105,7 +105,9 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
  * - The entry `GET /api/bookings`, sent again when a navigation such as nav
  *   "My bookings" re-enters the open page, redirects to
  *   `/login?returnUrl=%2Fbookings&reason=session-expired`, where the login
- *   page shows its session-expired notice.
+ *   page shows its session-expired notice. When that redirect does not
+ *   complete, the page stays and shows the 401 inline with a "Log in again"
+ *   link instead.
  * - "Cancel", and the list reload that follows it, stay on the page and show
  *   the 401 inline with a "Log in again" link.
  * - "Book" on `HotelDetailPageComponent` owns its own inline branch.
@@ -186,11 +188,13 @@ export class BookingsPageComponent implements AfterViewInit {
 
   /**
    * The caller's bookings in server order, or `null` while there is none to
-   * show: until the first load succeeds, after an entry load that failed, and
-   * whenever the current session is not the one that loaded the list. That
-   * check hides every row, the empty message, the pager and every "Cancel" in
-   * the same change-detection pass that clears the session, whether its
-   * expiry or a 401 cleared it.
+   * show: until the current session has loaded a list, and whenever the
+   * current session is not the one that loaded it. That check hides every
+   * row, the empty message, the pager and every "Cancel" in the same
+   * change-detection pass that clears the session, whether its expiry or a
+   * 401 cleared it. A refresh that fails with any other status, whether the
+   * re-entry load ({@link reenter}) or the reload after a cancel
+   * ({@link cancel}), keeps the list on screen beside the inline error.
    */
   protected readonly bookings = computed<Booking[] | null>(() => {
     const loaded = this.loaded();
@@ -256,7 +260,9 @@ export class BookingsPageComponent implements AfterViewInit {
 
   /**
    * Whether the page is leaving for the login page because its entry load was
-   * rejected with 401; the session-ended notice stays hidden meanwhile.
+   * rejected with 401; the session-ended notice stays hidden meanwhile. It is
+   * reset when that navigation does not complete, and the 401 then shows
+   * inline instead (see {@link showUnfinishedRedirect}).
    */
   private readonly redirecting = signal(false);
 
@@ -782,12 +788,14 @@ export class BookingsPageComponent implements AfterViewInit {
   /**
    * Loads the caller's bookings when the page opens, and again when it is
    * re-entered ({@link reenter}). This protected-page request is the only one
-   * whose 401 redirects to the login page; any other error is shown inline. A
-   * load still in flight is dropped first. A load is also dropped when the
-   * session that requested it ends while it is in flight (see the
-   * constructor), which aborts its request, so it neither keeps the loading
-   * indicator on nor reports an error for that ended session; a list that
-   * still arrives after that session has ended is discarded.
+   * whose 401 redirects to the login page; any other error is shown inline,
+   * and so is that 401 when the redirect does not complete (see
+   * {@link showUnfinishedRedirect}). A load still in flight is dropped first.
+   * A load is also dropped when the session that requested it ends while it
+   * is in flight (see the constructor), which aborts its request, so it
+   * neither keeps the loading indicator on nor reports an error for that
+   * ended session; a list that still arrives after that session has ended is
+   * discarded.
    *
    * Focus: a load that re-enters the open page replaces a list already on
    * screen, and the new one can drop the element on this page that has focus,
@@ -824,24 +832,49 @@ export class BookingsPageComponent implements AfterViewInit {
           if (err.status === 401) {
             // `replaceUrl` drops the rejected `/bookings` entry from history,
             // so Back does not return to a page that bounces to login again.
-            // The session-ended notice stays hidden while the page leaves; it
-            // shows if the redirect does not take place.
+            // The session-ended notice stays hidden while the page leaves. A
+            // redirect the router resolves without completing it, or rejects,
+            // shows this 401 inline instead, so neither outcome leaves the
+            // guest without a way to log in again.
             this.redirecting.set(true);
             void this.router
               .navigate(['/login'], {
                 queryParams: { returnUrl: '/bookings', reason: 'session-expired' },
                 replaceUrl: true,
               })
-              .then((navigated) => {
-                if (!navigated) {
-                  this.redirecting.set(false);
-                }
-              });
+              .then(
+                (navigated) => {
+                  if (!navigated) {
+                    this.showUnfinishedRedirect(err);
+                  }
+                },
+                () => this.showUnfinishedRedirect(err),
+              );
             return;
           }
           this.error.set(toUiError(err));
         },
       });
+  }
+
+  /**
+   * Shows the entry load's 401 inline once its redirect to login has ended
+   * without reaching the login page: the router resolved the navigation with
+   * anything but `true`, as when another navigation superseded it, or
+   * rejected it, as when the browser throws on the router's history update.
+   * {@link redirecting} is reset and the 401 renders through
+   * `ErrorMessageComponent` with its "Log in again" link to
+   * `/login?returnUrl=%2Fbookings`, which also keeps the session-ended notice
+   * hidden. The rejection reason is neither shown nor logged. A rejected
+   * redirect leaves this page active; when a navigation that superseded the
+   * redirect has destroyed the page instead, these signal writes render
+   * nothing.
+   *
+   * @param err - The entry load's 401.
+   */
+  private showUnfinishedRedirect(err: HttpErrorResponse): void {
+    this.redirecting.set(false);
+    this.error.set(toUiError(err));
   }
 
   /**

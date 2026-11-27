@@ -27,6 +27,9 @@ namespace SmartHotel.Api.Modules.Auth;
 [Route("api/auth")]
 public sealed class AuthController(AuthService authService) : ControllerBase
 {
+    // Unlike the other asynchronous methods, these actions carry no Async suffix: each keeps the fixed name of the
+    // endpoint operation it serves, the name MVC would report even with the suffix, since it trims a trailing Async.
+
     /// <summary>
     /// Registers a guest: <c>POST /api/auth/register</c>.
     /// </summary>
@@ -39,8 +42,16 @@ public sealed class AuthController(AuthService authService) : ControllerBase
     /// 415, from MVC, when <c>Content-Type</c> is absent or is not JSON, a bodyless request included.
     /// </description></item>
     /// <item><description>
-    /// 400 <see cref="ValidationProblemDetails"/>, from MVC, for an empty, malformed or non-object JSON body, a field
-    /// of the wrong JSON type, or a failed field check, keyed <c>email</c>, <c>password</c> or <c>fullName</c>.
+    /// 400 <see cref="ValidationProblemDetails"/>, from MVC, when the body does not bind: an empty, malformed or
+    /// non-object JSON body, or a field of the wrong JSON type. Binding stops at the first failure and no field check
+    /// runs. The error is keyed by the JSON path where reading stopped: <c>$.email</c>, <c>$.password</c> or
+    /// <c>$.fullName</c> when it stopped at that field's value, as for a field of the wrong JSON type, and otherwise
+    /// <c>$</c>, as for an empty or non-object body.
+    /// </description></item>
+    /// <item><description>
+    /// 400 <see cref="ValidationProblemDetails"/>, from MVC, once the body binds, for each field that fails its
+    /// checks, a missing or <see langword="null"/> field included, keyed <c>email</c>, <c>password</c> or
+    /// <c>fullName</c>. Every field is checked, so one response reports every invalid field, with one error each.
     /// </description></item>
     /// <item><description>
     /// 409 when the normalized email is already registered, found by the pre-check or by the unique index on a
@@ -74,7 +85,10 @@ public sealed class AuthController(AuthService authService) : ControllerBase
     /// <remarks>
     /// <list type="bullet">
     /// <item><description>
-    /// 200 with <c>{ "token": "&lt;jwt&gt;", "expiresAt": "yyyy-MM-ddTHH:mm:ssZ" }</c>.
+    /// 200 with <c>{ "token": "&lt;jwt&gt;", "expiresAt": "yyyy-MM-ddTHH:mm:ssZ" }</c> and exactly
+    /// <c>Cache-Control: no-store</c>: the body is a live bearer credential, so no cache, a browser's private cache
+    /// included, may store it. The 401 below carries the same header; MVC's 415 and 400, decided before the action
+    /// runs, do not.
     /// </description></item>
     /// <item><description>
     /// 415, from MVC, when <c>Content-Type</c> is absent or is not JSON, a bodyless request included.
@@ -87,8 +101,9 @@ public sealed class AuthController(AuthService authService) : ControllerBase
     /// <item><description>
     /// 401 for every bound request whose credentials do not match: a wrong password, an unknown email, or a
     /// missing, <see langword="null"/> or blank field. The title and detail are one fixed pair and there is no
-    /// <c>errors</c> member, so the responses differ only in <c>traceId</c> and never reveal whether an account
-    /// exists. Each carries the bare challenge <c>WWW-Authenticate: Bearer</c>, as JwtBearer's own 401s do.
+    /// <c>errors</c> member, so the response content differs only in <c>traceId</c> and does not disclose whether
+    /// an account exists. That is a guarantee about response content, not about response timing. Each carries the
+    /// bare challenge <c>WWW-Authenticate: Bearer</c>, as JwtBearer's own 401s do.
     /// </description></item>
     /// </list>
     /// </remarks>
@@ -96,6 +111,7 @@ public sealed class AuthController(AuthService authService) : ControllerBase
     /// <param name="cancellationToken">Cancels the database work when the request is aborted.</param>
     /// <returns>The 200 result or the 401 problem.</returns>
     [HttpPost("login")]
+    [ResponseCache(NoStore = true)]
     public async Task<IActionResult> Login([FromBody] LoginRequest request, CancellationToken cancellationToken)
     {
         LoginResponse? response = await authService.LoginAsync(request, cancellationToken);

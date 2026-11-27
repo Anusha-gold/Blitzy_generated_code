@@ -17,7 +17,8 @@ public static class AuthModule
     private const int PasswordHashIterations = 220_000;
 
     /// <summary>
-    /// Adds the guest password hasher, <see cref="AuthService"/> and <see cref="TokenService"/>.
+    /// Adds the guest password hasher, <see cref="AuthService"/>, <see cref="TokenService"/> and the hosted service
+    /// that creates the login dummy hash at start.
     /// </summary>
     /// <remarks>
     /// <list type="bullet">
@@ -41,6 +42,15 @@ public static class AuthModule
     /// <see cref="TimeProvider"/>, and builds its signing credentials once.
     /// </description>
     /// </item>
+    /// <item>
+    /// <description>
+    /// A hosted service that creates <see cref="AuthService"/>'s dummy hash with that hasher when the host starts. The
+    /// host starts its hosted services one after another, and the web server's own comes after every service the
+    /// application registers, so the hash exists before the server accepts requests. Every login that no account can
+    /// match then performs one PBKDF2 verification and no hashing, the first one included, as a wrong password does.
+    /// That keeps the hashing work comparable, not the timing constant.
+    /// </description>
+    /// </item>
     /// </list>
     /// <para>
     /// Only the hasher is taken from ASP.NET Core Identity: no Identity stores, managers or cookie schemes are
@@ -58,7 +68,40 @@ public static class AuthModule
         services.AddSingleton<IPasswordHasher<Guest>, PasswordHasher<Guest>>();
         services.AddScoped<AuthService>();
         services.AddSingleton<TokenService>();
+        services.AddHostedService<DummyHashWarmup>();
 
         return services;
+    }
+
+    /// <summary>
+    /// Creates <see cref="AuthService"/>'s dummy hash while the host starts, so no login has to.
+    /// </summary>
+    /// <param name="passwordHasher">The host's singleton hasher, the one every <see cref="AuthService"/> uses.</param>
+    private sealed class DummyHashWarmup(IPasswordHasher<Guest> passwordHasher) : IHostedService
+    {
+        /// <summary>
+        /// Creates the dummy hash unless the process already holds one. The work is one PBKDF2 hash and completes
+        /// before the host starts the next service.
+        /// </summary>
+        /// <param name="cancellationToken">Signals that the start was abandoned; the hash is then not created.</param>
+        /// <returns>A completed task.</returns>
+        /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> is canceled.</exception>
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            _ = AuthService.EnsureDummyHash(passwordHasher);
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Does nothing: the hash lives as long as the process.
+        /// </summary>
+        /// <param name="cancellationToken">Unused, because stopping has no work.</param>
+        /// <returns>A completed task.</returns>
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
     }
 }

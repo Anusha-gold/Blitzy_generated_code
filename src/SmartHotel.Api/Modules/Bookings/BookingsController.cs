@@ -47,6 +47,9 @@ namespace SmartHotel.Api.Modules.Bookings;
 [Route("api/bookings")]
 public sealed class BookingsController(BookingService bookings) : ControllerBase
 {
+    // Unlike the other asynchronous methods, these actions carry no Async suffix: each keeps the fixed name of the
+    // endpoint operation it serves, the name MVC would report even with the suffix, since it trims a trailing Async.
+
     /// <summary>
     /// Books a room of a hotel's room type for a stay: <c>POST /api/bookings</c>. The server assigns the room and
     /// computes the total, and the booking is confirmed at once.
@@ -77,7 +80,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// 400 keyed <c>guests</c> when the guest count exceeds the room type's capacity.
     /// </description></item>
     /// <item><description>
-    /// 409 when every room of the type has a confirmed booking that overlaps the stay.
+    /// 409 when no free room of the type is found for the stay, or a concurrent booking conflicts with the selected
+    /// room.
     /// </description></item>
     /// <item><description>
     /// 201 with the confirmed booking, <c>{ id, hotelId, hotelName, roomTypeId, roomTypeName, roomNumber, checkIn,

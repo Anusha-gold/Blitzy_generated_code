@@ -8,7 +8,7 @@ The product is inspired by Microsoft's SmartHotel360 reference application. It i
 
 | Component | Path | Technology | Role |
 |-----------|------|------------|------|
-| Web app | `src/SmartHotel.Web` | Angular 17 single-page app, served by nginx | Screens, routing, forms, loading and error states, and the in-memory session |
+| Web app | `src/SmartHotel.Web` | Angular 17 single-page app, served by nginx | Screens, routing, forms, the in-memory session, and the loading indicator, empty-result messages, inline errors and login redirects in [What the web app shows](#what-the-web-app-shows) |
 | API | `src/SmartHotel.Api` | ASP.NET Core 8 REST API | A modular monolith with Auth, Hotels, Bookings and Availability modules. The only component that reads or writes data. |
 | Data layer | `src/SmartHotel.Data` | Entity Framework Core 8 with the Npgsql provider | Entities, mappings and constraints, the `InitialCreate` migration and the seed routine |
 | Database | — | PostgreSQL 16 | Persistence and constraint enforcement, used only by the API |
@@ -75,6 +75,7 @@ These are the combinations that every prerequisite supports: Playwright 1.60.0's
 ### Tools
 
 - Docker Engine 28.0 or later, with Docker Compose v2.1.1 or later (`docker compose up --wait` needs 2.1.1). Docker Desktop releases that bundle those versions qualify. Engine 28.0 is also the first release that stops other hosts on the LAN from reaching ports published on `127.0.0.1`.
+  - On a Linux host that runs firewalld, use Docker Engine 28.3.3 or later. Engines 28.2.0 through 28.3.2 do not restore that protection after firewalld reloads (CVE-2025-54388), so other hosts with a route to the Docker host could then reach ports published on `127.0.0.1`, including the passwordless `db-test`. `docker version --format '{{.Server.Version}}'` prints the engine version, and `systemctl is-active firewalld` prints `active` when firewalld runs. A firewalld host that must keep an earlier engine needs host firewall rules of its own that block forwarded traffic to the Docker networks, verified before the test fixture starts `db-test`; otherwise point `SMARTHOTEL_TEST_POSTGRES` at another server. Docker Desktop and rootless mode are not affected.
 - .NET SDK 8.0.428 exactly. `global.json` pins it with roll-forward disabled, so `dotnet` commands in this repository fail unless that exact SDK is installed.
 - Node.js 20.20.2 with npm, for the web workspace and its tests.
 - Playwright's Chromium 148.0.7778.96, installed per machine with `npx playwright install chromium` (see [Web tests](#web-tests)).
@@ -164,6 +165,15 @@ On a first start the wrapper checks every override that is set before it writes 
 
 A bearer token is valid for 60 minutes. The web app keeps it only in memory, never in `localStorage`, `sessionStorage` or a cookie, so reloading the page or opening a new tab signs the guest out. Logging out clears that in-memory session and returns to the search page. There is no logout endpoint, so a discarded token stays valid on the server until it expires.
 
+### What the web app shows
+
+- Before the app starts, the page shows "Loading SmartHotel…" while it fetches `/config.json`. The "Loading…" indicator does not cover that request, and the app replaces the message once it starts. If the request fails, answers with an error status or takes longer than 10 seconds, if the configuration is not valid JSON or has an API base URL the app does not accept (see [HTTPS outside local development](#https-outside-local-development)), or if the app fails to start, the page shows "SmartHotel could not start: its configuration is unavailable. Reload to try again." in place of the app.
+- A "Loading…" indicator shows between the nav bar and the page while any request to the API is in flight. "Search", "Log in", "Create account", "Book" and "Cancel" stay disabled while their own request is pending.
+- A search that finds nothing shows "No hotels with available rooms in {city} for these dates.", and My bookings with none shows "You have no bookings yet."
+- A `400`, `409` or `401` from the API shows inline on the page that sent the request, with the problem's title, its detail and any field errors, except the `401` on entering My bookings, which redirects as described below. The login page's `401` reads "Email or password is incorrect." and the register page's `409` reads "An account with this email already exists." When the API cannot be reached, the page shows "The service is unreachable."
+- My bookings is the only protected page. Opening it without a live session, because the guest is signed out, the token has expired or the page was reloaded, goes to `/login?returnUrl=%2Fbookings`, and logging in returns to My bookings. "Book" while signed out also goes to the login page, and logging in returns to the same hotel and stay.
+- The API can reject a token before it expires. A `401` from a bookings request then signs the guest out, and the nav bar shows "Log in". On entering My bookings, the app goes to `/login?returnUrl=%2Fbookings&reason=session-expired`, which shows "Your session has expired. Log in again." After "Book" on a hotel or "Cancel" on My bookings, the guest stays on the page and sees the `401` inline with a "Log in again" link.
+
 ## Reset and override semantics
 
 The supported reset removes the database and the secrets together:
@@ -184,10 +194,10 @@ All endpoints are under `/api`. This table is a summary, not the full contract.
 
 | Method and path | Auth | Purpose | Success |
 |-----------------|------|---------|---------|
-| `POST /api/auth/register` | None | Register a guest with `email`, `password` (8–128 characters) and `fullName` | `201` with `{ "guestId": … }` |
+| `POST /api/auth/register` | None | Register a guest with `email`, `password` (8–128 characters) and `fullName` | `201` with the new guest's id, such as `{ "guestId": 42 }` |
 | `POST /api/auth/login` | None | Exchange an email and password for a bearer token | `200` with `token` and `expiresAt` |
-| `GET /api/hotels` | None | Search by `city`, `checkIn`, `checkOut` and `guests` (default 1). Lists the hotels with at least one free room, each with its lowest nightly price. | `200`; `[]` when none qualify |
-| `GET /api/hotels/{id}` | None | Hotel detail for `checkIn`, `checkOut` and `guests`: room types, nightly prices, available rooms per type and the stay total | `200` |
+| `GET /api/hotels` | None | Search by `city`, `checkIn`, `checkOut` and `guests` (optional, default 1). A hotel is listed only when at least one of its room types that fits the party (`maxGuests` ≥ `guests`) has a free room for the dates. Its `lowestNightlyPrice` is the lowest nightly price among those fitting, free room types. Results are ordered by that price, then by name. | `200`; `[]` when none qualify, including an unknown city |
+| `GET /api/hotels/{id}` | None | Hotel detail for `checkIn`, `checkOut` and `guests` (optional, default 1): room types, nightly prices, available rooms per type and the stay total. Each type's `availableRooms` counts its rooms with no overlapping `Confirmed` booking for the dates, whatever `guests` is: a count of physical inventory. The web app disables "Book" when `guests` exceeds a type's `maxGuests`. | `200` |
 | `POST /api/bookings` | Bearer | Book a room type with `hotelId`, `roomTypeId`, `checkIn`, `checkOut` and `guests`. The server assigns the room and computes the total. | `201` with the booking |
 | `GET /api/bookings` | Bearer | The caller's own bookings, newest first | `200`; `[]` when none |
 | `DELETE /api/bookings/{id}` | Bearer | Cancel one of the caller's own bookings | `204` |
@@ -195,15 +205,16 @@ All endpoints are under `/api`. This table is a summary, not the full contract.
 
 Conventions:
 
-- Requests and responses are JSON with camelCase property names. Enums are strings, such as `Confirmed` and `Cancelled`. Timestamps are UTC ISO 8601 with a `Z` suffix, and money is a number in USD with two decimals.
+- Request and response bodies are JSON with camelCase property names, with two success exceptions: `DELETE /api/bookings/{id}` answers `204` with no body, and `GET /api/health` answers `text/plain` `Healthy`. Enums are strings, such as `Confirmed` and `Cancelled`. Timestamps are UTC ISO 8601 with a `Z` suffix, and money is a number in USD with two decimals.
 - Dates are exactly `yyyy-MM-dd`. Other forms, such as `2026-1-5` or `12/07/2026`, return `400`.
-- Every error is `application/problem+json`, whatever the `Accept` header says, with `type`, `title`, `status`, `detail` and `traceId`. A `400` also carries `errors`.
+- Every error response has `Content-Type: application/problem+json`, whatever the `Accept` header says. Whenever HTTP permits a body, the body carries `type`, `title`, `status`, `detail` and `traceId`, and a `400` also carries `errors`. An error response to a `HEAD` request keeps that `Content-Type` and has no body.
 - That includes requests the server rejects before the API sees them, such as an over-long request line (`414`) or oversized headers (`431`), which is why the API serves HTTP/1.1.
 - A stay is 1–30 nights, and check-in cannot be earlier than today's UTC date.
 - The check-out day is not occupied: a stay that ends on the 12th and one that starts on the 12th can share a room.
 - A bearer token from `POST /api/auth/login` is valid for 60 minutes. Send it as `Authorization: Bearer <token>`.
 - Booking creation is atomic. Concurrent requests for the last free room produce one `201` and a `409` for every other request, never a double booking.
-- The main error statuses are `400` for invalid input, `401` for a missing or rejected token or wrong credentials, `403` for another guest's booking, `404` for an unknown hotel, room type or booking, `409` for an email already registered, no free room, or a booking already cancelled or whose check-in date has passed, and `415` for a body that is not JSON.
+- The main error statuses are `400` for invalid input, `401` for a missing or rejected token or wrong credentials, `403` for another guest's booking, `404` for an unknown hotel, room type or booking, `409` for an email already registered, no free room, or a booking already cancelled or whose check-in date has passed, and `415` for a register, login or booking-creation request without a JSON media type in a supported charset.
+- Those three endpoints decide between `415` and `400` by the request's media type first, then by its content. A `Content-Type` that is absent, is not a JSON media type (`application/json`, `text/json` or an `application/*+json` type), or names a `charset` other than UTF-8 or little-endian UTF-16 (such as `iso-8859-1`, `us-ascii` or `utf-16be`) returns `415` whatever the body, a bodyless request included. With a JSON media type read as UTF-8 (the default when no `charset` is given) or as little-endian UTF-16 (`charset=utf-16` or `utf-16le`), a body that is empty or just `null`, is malformed JSON, is not a JSON object, or gives a field a value of the wrong JSON type, such as a number for `email`, returns `400` with the JSON path of the failure in `errors`, such as `$` or `$.email`. A member set to `null` or left out of the object binds as `null` and goes on to the endpoint's own checks, so login answers `401`, while registration and booking creation answer `400` with their field errors. On booking creation, a missing or rejected token returns `401` before the body is considered.
 
 ## Testing
 
@@ -217,7 +228,7 @@ dotnet test
 
 This runs `SmartHotel.sln`: the unit tests in `tests/SmartHotel.Api.UnitTests` and the integration tests in `tests/SmartHotel.Api.IntegrationTests`, which drive the real API pipeline in-process against a real PostgreSQL 16 server.
 
-- By default the test fixture starts the `db-test` Compose service itself, in its own Compose project `smarthotel-test` with `--profile test`. The service is published on `127.0.0.1:55432`, accepts passwordless connections (trust authentication), sits alone on its own `testdb` network and keeps its data on tmpfs; its server log, like `db`'s, leaves out constraint DETAIL, failed statements and bind parameters. Docker must therefore be running. The fixture leaves the service running for the next run.
+- By default the test fixture starts the `db-test` Compose service itself, in its own Compose project `smarthotel-test` with `--profile test`. The service is published on `127.0.0.1:55432`, accepts passwordless connections (trust authentication), sits alone on its own `testdb` network and keeps its data on tmpfs; its server log, like `db`'s, leaves out constraint DETAIL, the failing statement of any error below PANIC, and bind parameters. Docker must therefore be running. The service's loopback-only publishing relies on the Docker Engine requirement under [Tools](#tools): 28.0 or later, and 28.3.3 or later on a Linux host that runs firewalld. The fixture leaves the service running for the next run.
 - To use another server instead, set `SMARTHOTEL_TEST_POSTGRES` to a full Npgsql connection string. The default is `Host=127.0.0.1;Port=55432;Username=postgres`. Its user must be a superuser, or have `CREATEDB` and `CREATEROLE` and, for each server log setting that could record the statement that sets a test role's password, either the `SET` privilege on it or a server value that keeps statement text out of the log: `log_statement` `none`, `log_min_error_statement` `panic`, `log_min_duration_statement` `-1`, `log_min_duration_sample` `-1` or `log_statement_sample_rate` `0`, and `log_transaction_sample_rate` `0`. PostgreSQL 16's defaults leave only `log_min_error_statement` to cover, for example with `GRANT SET ON PARAMETER log_min_error_statement TO <server user>`. The fixture turns each setting it may change off for that one statement's transaction, never changes the server's own settings, and otherwise refuses to set the password with a message that names the settings to cover. A connection string can carry a password, so the fixture never prints the value. Test connections name no client certificate. Whenever the string's `SSL Mode` is not `Disable`, the fixture refuses to start, before it connects to the server or creates any test database, if Npgsql could present an ambient client certificate in its place: when `PGSSLCERT` is set, even to an empty value, or else when `postgresql.crt` exists in `~/.postgresql` (`%APPDATA%\postgresql` on Windows). Unset `PGSSLCERT` and move that file aside for the test run, or add `SSL Mode=Disable` to `SMARTHOTEL_TEST_POSTGRES`. The default `db-test` run connects with `SSL Mode=Disable`, because `db-test` offers no TLS, so an ambient certificate never stops it. Each test class's connections are pooled without multiplexing at Npgsql's default pool limits, whatever pool settings the string carries; its host, port, timeouts and TLS settings such as `SSL Mode` and `Root Certificate` carry over.
 - Each test class creates its own `smarthotel_it_<guid>` database and its own login role of the same name, with a random password, which owns the database. The class connects only as that role, never with the server's credentials, and drops both afterwards.
 
@@ -303,6 +314,7 @@ From `src/SmartHotel.Web`:
 ```bash
 npx playwright test e2e/booking-journey.spec.ts
 npx playwright test e2e/navigation.spec.ts
+npx playwright test e2e/ui-states.spec.ts
 npx playwright test e2e/stack.spec.ts
 ```
 
@@ -317,7 +329,7 @@ Each one builds the acceptance stack first, unless reuse mode is on.
 | 3 | 20 concurrent bookings for a room type with 1 free room return exactly one `201` and nineteen `409` | `ConcurrentBookingTests` |
 | 4 | Every endpoint returns each listed error status for its trigger | The integration error matrix in `tests/SmartHotel.Api.IntegrationTests` |
 | 5 | Listing or cancelling bookings without a token returns `401`, and cancelling another guest's booking returns `403` | `ListBookingsTests` and `CancelBookingTests` |
-| 6 | Every route and component is reachable from the app's navigation, and every endpoint has a caller | `src/SmartHotel.Web/e2e/navigation.spec.ts` |
+| 6 | Every route and component is reachable from the app's navigation, and every endpoint has a caller | `src/SmartHotel.Web/e2e/navigation.spec.ts` reaches every navigable route by clicks, rendering `AppComponent`, `NavBarComponent` and the five pages, and separately checks that `/` and an unknown URL redirect to `/search`, which are not navigation targets. `src/SmartHotel.Web/e2e/ui-states.spec.ts` renders `LoadingIndicatorComponent` and `ErrorMessageComponent` for a `400`, `409` and `401`, and checks the empty-result message, the login redirect for My bookings and both outcomes of a server `401`. `booking-journey.spec.ts` calls the seven interface endpoints through the web app, and the integration tests in `tests/SmartHotel.Api.IntegrationTests` call each directly. `GET /api/health` has no web caller; the Compose healthcheck, the acceptance bootstrap in `e2e/global-setup.ts` and `stack.spec.ts` call it. |
 | 7 | One `docker compose up` starts and seeds everything, and hotel search answers within 1 second at the 95th percentile with 20 concurrent users | The acceptance-stack bootstrap, `src/SmartHotel.Web/e2e/stack.spec.ts` and `SeedTests` |
 | 8 | Unit tests cover price calculation and the overlap rule, including the check-out-day boundary, and each side runs with one command | The unit tests in `tests/SmartHotel.Api.UnitTests`, with `dotnet test` and `ng test` both exiting 0 |
 
@@ -339,7 +351,7 @@ ng build
 
 - `Directory.Build.props` sets `TreatWarningsAsErrors`, so any compiler, analyzer or NuGet warning fails `dotnet build` and `dotnet test`.
 - The root `.editorconfig` holds the unchanged rules that `dotnet new editorconfig` emits from SDK 8.0.428. They require C# files to use CRLF line endings with no final newline, so run `dotnet format SmartHotel.sln` before committing C# changes.
-- Commit C# files from a clone whose line-ending conversion is turned off for that repository only: `git clone -c core.autocrlf=false <repository-url>`. Its files keep their committed endings, and new files are committed as written. Git for Windows' default `core.autocrlf=true`, like `core.autocrlf=input`, commits a new CRLF C# file with LF endings, which `dotnet format --verify-no-changes` then rejects in every other checkout.
+- Commit C# files from a clone whose line-ending conversion is turned off for that repository only: `git clone -c core.autocrlf=false "$REPOSITORY_URL"`, with `REPOSITORY_URL` holding the repository's clone URL. Its files keep their committed endings, and new files are committed as written. Git for Windows' default `core.autocrlf=true`, like `core.autocrlf=input`, commits a new CRLF C# file with LF endings, which `dotnet format --verify-no-changes` then rejects in every other checkout.
 - `ng lint` applies angular-eslint 17's default rules with `maxWarnings: 0`, and `ng build` must finish without warnings.
 
 ### Commands a pipeline would run
@@ -360,17 +372,32 @@ The schema is the committed `InitialCreate` migration in `src/SmartHotel.Data/Mi
 
 Two statements in that migration are hand-added SQL: the exclusion constraint `EX_Bookings_Room_NoOverlap`, which uses the `btree_gist` extension so that no two `Confirmed` bookings of one room can overlap, and the expression index `IX_Hotels_City_Lower`, which serves the case-insensitive city search.
 
-To add a migration, from the repository root, replacing `<Name>` with the migration's name:
+To add a migration, run these commands from the repository root, with `migration_name` set to the new migration's name in PascalCase:
 
 ```bash
 dotnet tool restore
-dotnet ef migrations add <Name> --project src/SmartHotel.Data --startup-project src/SmartHotel.Api --output-dir Migrations
+migration_name=AddRoomTypeDescription
+dotnet ef migrations add "$migration_name" --project src/SmartHotel.Data --startup-project src/SmartHotel.Api --output-dir Migrations
 dotnet format SmartHotel.sln
 ```
 
 `dotnet tool restore` installs `dotnet-ef` 8.0.34 from `.config/dotnet-tools.json`, and `dotnet format` brings the generated files in line with the `.editorconfig` rules.
 
-The `dotnet ef` commands need none of the API's secrets or `DB_*` variables: they create the context through `src/SmartHotel.Data/DesignTimeDbContextFactory.cs`, whose connection string is a passwordless placeholder, so a command that must reach a database, such as `dotnet ef database update`, takes it from its `--connection "<connection string>"` option.
+The `dotnet ef` commands need none of the API's secrets or `DB_*` variables: they create the context through `src/SmartHotel.Data/DesignTimeDbContextFactory.cs`, whose connection string is a passwordless placeholder. A command that must reach a database, such as `dotnet ef database update`, takes its connection string from the `--connection` option. Never put `Password=`, or the password in any other form, in `--connection` or anywhere else on a command line, where process listings and shell history expose it. Give a connection string without a password instead, with `db_host` set to the database server's host name, and `Database` and `Username` changed to the target database and its user. `SSL Mode=VerifyFull` connects only to a server whose certificate is trusted and matches that host name:
+
+```bash
+db_host=db.example.com
+dotnet ef database update --project src/SmartHotel.Data --startup-project src/SmartHotel.Api --connection "Host=$db_host;Port=5432;Database=smarthotel;Username=smarthotel;SSL Mode=VerifyFull"
+```
+
+When the connection string has no password, Npgsql reads it from a PostgreSQL password file: the file the `PGPASSFILE` environment variable names, otherwise `~/.pgpass`, or `%APPDATA%\postgresql\pgpass.conf` on Windows. The file holds one line per server, `hostname:port:database:username:password`, with a `:` inside a value written as `\:` and a `\` written as `\\`. For the command above the line is `db.example.com:5432:smarthotel:smarthotel:` followed by the password. Create the file readable only by you, keep it outside the repository and never commit it. On Linux and macOS:
+
+```bash
+touch ~/.pgpass
+chmod 600 ~/.pgpass
+```
+
+Then add the line with a text editor rather than a shell command, which would record the password in the shell history.
 
 ## Configuration
 
@@ -427,14 +454,19 @@ The local Compose stack runs as `Development` over plain HTTP on loopback-bound 
 - When the host fails to start, for example because Kestrel cannot load the certificate, the API logs one critical event, `5202`, that names the exception types and the listener and certificate variables to check, never an exception message or a value, and exits with code 1.
 - The API refuses to start unless `Cors__AllowedOrigin` is an `https://` origin.
 - The hosting environment's TLS termination must serve the web origin over HTTPS.
-- `API_BASE_URL` must be `https://<api host>/api`. The SPA accepts an `http` API base only for `localhost` or `127.0.0.1`, and only when `WEB_ENVIRONMENT` is `Development`. Any other configuration shows a start-up error instead of the app.
+- Set the web container's `API_BASE_URL` to `https://<api host>/api` and `WEB_ENVIRONMENT` to `Production`. The container renders both into `/config.json`, which the SPA reads and checks before it starts.
+- `WEB_ENVIRONMENT` relaxes the HTTPS rule only when it is exactly `Development`, with that capitalization. The container serves every other value, an unset or empty one included, as `Production`, the SPA's strict mode. Strict mode alone does not stop the app: an `https` API base that meets the rules below starts it in every environment.
+- `API_BASE_URL` must be an absolute URL, so a relative `/api` is refused. It must have no user name or password, no query and no fragment; a bare `?` or `#` counts as one. Its path must be exactly `/api` once one trailing `/` is removed, so `/api` and `/api/` pass, and `/api//`, `/api/v1`, `/API` and `/` fail.
+- Its scheme must be `https`. `http` is accepted only when `WEB_ENVIRONMENT` is `Development` and the host is `localhost` or `127.0.0.1`. Any other scheme is refused.
+- The SPA calls the URL's origin followed by `/api`: it drops the trailing slash, lower-cases the host and omits a default port.
+- An `API_BASE_URL` that breaks these rules shows the start-up error `SmartHotel could not start: its configuration is unavailable. Reload to try again.` instead of the app, and Angular does not start. So does one that is unset or empty. A value holding a double quote, a single quote, a dollar sign, a backslash or an ASCII control character (U+0000–U+001F or U+007F), or longer than 1000 bytes, is served as empty too, because the web image's input checks clear it before it reaches `/config.json`.
 
 Certificate provisioning and deployment automation are out of scope for this version.
 
 ## Security notes
 
 - Passwords are hashed with PBKDF2-HMAC-SHA512 through ASP.NET Core Identity's password hasher, with 220,000 iterations and a 128-bit salt. No response ever contains a password hash.
-- Login answers an unknown email and a wrong password identically, so it does not reveal whether an account exists.
+- Login answers an unknown email, a wrong password and a missing, blank or `null` field with the same `401`. Its `type`, `title`, `status` and `detail` are the same in each case, so the response content does not disclose whether an account exists. Only the per-request `traceId` differs. Each of these failures performs one PBKDF2 verification, so the hashing work is comparable, but the response time is not guaranteed to be constant: the database lookup can take different times.
 - Guests can cancel only their own bookings. Cancelling another guest's booking returns `403`.
 - CORS admits only the web app's origin.
 - The web app keeps the token in memory only and attaches it only to requests for the API's `/api` paths.
@@ -462,7 +494,7 @@ Not part of this version:
 - Under `TreatWarningsAsErrors`, a NuGet audit advisory published later against a pinned package fails the build until it is addressed.
 - Playwright stays at 1.60.0, the newest release whose documentation lists Node.js 20 support. Later releases document only Node.js 22 and newer, which Angular 17 does not support.
 - The search latency check measures the machine that runs the stack, so its result depends on the hardware.
-- `db-test` accepts passwordless connections. Only its own Compose network and host loopback can reach it, and other LAN hosts are blocked from loopback-published ports only on Docker Engine 28.0 or later.
+- `db-test` accepts passwordless connections. Only its own Compose network and host loopback can reach it, and other LAN hosts are blocked from loopback-published ports only on Docker Engine 28.0 or later. On a Linux host that runs firewalld, engines 28.2.0 through 28.3.2 lose that block whenever firewalld reloads (CVE-2025-54388), so such a host needs 28.3.3 or later, or verified host firewall rules of its own that block forwarded traffic to the Docker networks.
 - Startup migrations are safe only while a single API instance runs.
 - A fresh `ng test` run resets only its own `smarthotel-acceptance` project. That stack stays up on ports 18080 and 14200 until the next run or `docker compose -p smarthotel-acceptance down -v`.
 - The token is kept in memory, so reloading the page or opening a new tab signs the guest out.

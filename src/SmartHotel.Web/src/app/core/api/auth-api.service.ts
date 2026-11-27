@@ -130,9 +130,10 @@ export class AuthApiService {
    *   neither a string nor `null`, or malformed JSON at that member, such as
    *   `{"email":"a","password":!}`. `fieldErrorIds` maps each member key to
    *   that field's input. Login validates no field, so no other key occurs;
-   * - 401 when the credentials do not match. Its `type`, `title`, `status`
-   *   and `detail` are identical whether or not the account exists, and only
-   *   its per-request `traceId` differs, so it never reveals one;
+   * - 401 when the credentials do not match. Whether or not the account
+   *   exists, every credential failure has the same `type`, `title`, `status`
+   *   and `detail`, and only its per-request `traceId` differs. This is a
+   *   guarantee about response content, not about response timing;
    * - 415 when `Content-Type` is absent or is not JSON, as for
    *   {@link AuthApiService.register}.
    *

@@ -56,10 +56,11 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         _factory = factory;
     }
 
-    // The four failures run on a host of their own whose password hasher records every verification, because identical
-    // responses alone would not change if the dummy verification were removed. Each failure must verify exactly once:
-    // a wrong password against the guest's stored hash, and every attempt no account can match against one dummy hash.
-    // Only counts and the hashes compared in memory are checked, never timings.
+    // The four failures run on a host of their own whose password hasher records every verification and counts every
+    // hash, because identical responses alone would not change if the dummy verification were removed. Each failure
+    // must verify exactly once: a wrong password against the guest's stored hash, and every attempt no account can
+    // match against one dummy hash. None may hash, because the dummy hash exists before the host accepts its first
+    // request. Only counts and the hashes compared in memory are checked, never timings.
     [Fact]
     public async Task Login_WrongCredentials_Returns401WithIdenticalContent()
     {
@@ -86,6 +87,10 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         (int guestId, string email) = await RegisterGuestAsync(client, ct);
         string unknownEmail = $"unknown+{Guid.NewGuid():N}@example.test";
 
+        // Registration has hashed its password by now, and the dummy hash has existed since the host started, so no
+        // hash may follow this mark.
+        int hashMark = hasher.HashCount;
+
         // Each attempt completes before the next starts, so the verifications recorded since a mark are its own.
         int mark = hasher.VerificationCount;
         JsonElement wrongPassword = await AssertUnauthorizedAsync(
@@ -110,6 +115,13 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         using StringContent nullContent = new("{\"email\":null,\"password\":null}", Encoding.UTF8, JsonMediaType);
         JsonElement nullFields = await AssertUnauthorizedAsync(client.Http.PostAsync(LoginRoute, nullContent, ct), ct);
         PasswordVerification nullFieldsCheck = hasher.SingleVerificationSince(mark, "null-fields");
+
+        // A failure that had to create the dummy hash would hash once on top of its verification. The message carries
+        // the count only.
+        int failureHashCount = hasher.HashCount - hashMark;
+        Assert.True(
+            failureHashCount == 0,
+            $"Expected none of the four failed logins to hash a password but they hashed {failureHashCount} time(s).");
 
         // Equality is transitive, so comparing the first problem with each of the others covers every pair. Only
         // traceId may differ, so no response reveals whether the account exists or which field was wrong.
@@ -154,7 +166,7 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
             unknownAccountCheck.ProvidedPasswordWasEmpty,
             "Expected the unknown-email login to verify the password it was sent.");
 
-        // A blank or null password is verified as the empty string, because the hasher rejects null.
+        // An empty password stays empty; null is replaced with an empty string because the hasher rejects null.
         (PasswordVerification Check, string Attempt)[] emptyPasswordChecks =
         [
             (blankFieldsCheck, "blank-fields"),
@@ -337,6 +349,9 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
 
         using HttpResponseMessage response = await client.LoginAsync(new { email, password = ValidPassword }, ct);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // The body is a live bearer credential, so no cache may store it.
+        ApiTestClient.AssertNoStore(response, "POST api/auth/login");
 
         // Compared in memory with a fixed message, so the response's own media type never reaches the test output.
         string? mediaType = response.Content.Headers.ContentType?.MediaType;
@@ -534,16 +549,21 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
     // only, and of the provided password only whether it was empty is kept.
     private sealed record PasswordVerification(int GuestId, string HashedPassword, bool ProvidedPasswordWasEmpty);
 
-    // Delegates to a real hasher and records every verification, so a test can count the PBKDF2 verifications a login
-    // performs without timing it. Safe for concurrent requests.
+    // Delegates to a real hasher, records every verification and counts every hash, so a test can count the PBKDF2 work
+    // a login performs without timing it. Safe for concurrent requests.
     private sealed class RecordingPasswordHasher(IPasswordHasher<Guest> inner) : IPasswordHasher<Guest>
     {
         private readonly ConcurrentQueue<PasswordVerification> _verifications = new();
+        private int _hashCount;
 
         public int VerificationCount => _verifications.Count;
 
+        public int HashCount => Volatile.Read(ref _hashCount);
+
         public string HashPassword(Guest user, string password)
         {
+            // Counted before delegating, so a hash the inner hasher rejects is counted too.
+            Interlocked.Increment(ref _hashCount);
             return inner.HashPassword(user, password);
         }
 

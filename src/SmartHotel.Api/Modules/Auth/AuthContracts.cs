@@ -19,11 +19,11 @@ namespace SmartHotel.Api.Modules.Auth;
 // while the error contract keys them by the camelCase JSON name (email). The name does not affect body binding.
 
 /// <summary>
-/// Body of <c>POST /api/auth/register</c>. Each member carries its required check and one bounds check, and every
-/// check runs on every request, so a 400 reports each invalid member, with at most one error per member. The email
-/// and full-name bounds apply to the trimmed values, the password bounds to the value as sent. The password and
-/// full-name lengths count Unicode scalar values, not UTF-16 code units. Error messages are fixed sentences that
-/// never echo the input.
+/// Body of <c>POST /api/auth/register</c>. Each member carries its required check and one bounds check. After the
+/// JSON object binds, every member's checks run independently, so a 400 reports each invalid member, with at most
+/// one validation error per member. The email and full-name bounds apply to the trimmed values, the password bounds
+/// to the value as sent. The password and full-name lengths count Unicode scalar values, not UTF-16 code units.
+/// Error messages are fixed sentences that never echo the input.
 /// </summary>
 /// <param name="Email">
 /// Required. After trimming: printable ASCII only (U+0021 to U+007E), at most 254 characters (the RFC 5321 path

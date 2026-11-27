@@ -27,8 +27,10 @@
 #   has a secret to write: it makes concurrent first starts on one volume
 #   take turns.
 #   POSTGRES_PASSWORD, exported from db_password for the image entrypoint.
-#   For a server start, value-free server log settings placed before the
-#   caller's postgres options.
+#   For a server start, log settings that keep DETAIL, HINT, QUERY and
+#   CONTEXT, the failing statement of any error below PANIC, and bind
+#   parameters out of the server log, placed before the caller's postgres
+#   options, which take precedence.
 #
 # Exit behaviour
 #   Exits 2 with a usage line on stderr, before anything is read or written,
@@ -324,15 +326,21 @@ export POSTGRES_PASSWORD
 # environment.
 unset SMARTHOTEL_DB_PASSWORD SMARTHOTEL_JWT_SIGNING_KEY
 
-# Value-free server log. At its default settings an error record in the
-# server log carries DETAIL, where a unique or exclusion violation prints the
-# conflicting key (a guest's email, for one), and the failed STATEMENT with
-# its bind parameters. TERSE drops DETAIL, HINT, QUERY and CONTEXT; PANIC
-# stops failed statements from being logged; 0 stops bind parameters from
-# being logged with errors and with logged statements. These settings shape
-# the server log only: the server still sends clients the SQLSTATE, the
-# constraint name and DETAIL, and the API's 23505 and 23P01 translation
-# needs only the SQLSTATE and the constraint name.
+# Fewer value-bearing diagnostics in the server log. At its default settings
+# an error record in the server log carries DETAIL, where a unique or
+# exclusion violation prints the conflicting key (a guest's email, for one),
+# and the failing STATEMENT, whose text can hold literal values; bind
+# parameters are logged in full with the statements that log_statement or
+# the duration settings log. TERSE drops DETAIL, HINT, QUERY and CONTEXT.
+# PANIC keeps the statement out of every error record below PANIC severity.
+# log_parameter_max_length_on_error=0, also the default, keeps bind
+# parameters out of error records, and log_parameter_max_length=0 keeps them
+# out of logged statements. The primary message is still logged and can
+# quote a rejected value, so the log is not free of values. These settings
+# shape the server log only: the server still sends clients the SQLSTATE,
+# the constraint name and DETAIL, Npgsql redacts DETAIL because no
+# connection sets Include Error Detail, and the API's 23505 and 23P01
+# translation needs only the SQLSTATE and the constraint name.
 # They are added only to a server start, and the image entrypoint passes the
 # same arguments to its initialization server and to `postgres -C`, so the
 # first start is covered as well. Later -c options in "$@" override them.
