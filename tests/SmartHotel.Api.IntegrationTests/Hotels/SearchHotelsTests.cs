@@ -6,7 +6,6 @@ using Microsoft.EntityFrameworkCore;
 using SmartHotel.Api.Common.Pricing;
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 using SmartHotel.Data.Entities;
-using SmartHotel.Data.Seed;
 
 namespace SmartHotel.Api.IntegrationTests.Hotels;
 
@@ -98,21 +97,23 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         DateOnly checkOut = today.AddDays(32);
         int downtownId = await _factory.GetHotelIdAsync(SeattleDowntown, cancellationToken);
         int waterfrontId = await _factory.GetHotelIdAsync(SeattleWaterfront, cancellationToken);
+        string downtownAddress = await GetStoredAddressAsync(downtownId, cancellationToken);
+        string waterfrontAddress = await GetStoredAddressAsync(waterfrontId, cancellationToken);
 
         // Standard, for 2 guests, is the cheapest type everywhere: 129.00 in hotel 1 and 10.00 more in hotel 2.
         IReadOnlyList<ApiTestClient.HotelSummary> forTwo =
             await SearchOkAsync(BaselineCity, checkIn, checkOut, 2, cancellationToken);
-        AssertSeattleHotels(forTwo, downtownId, 129.00m, waterfrontId, 139.00m);
+        AssertSeattleHotels(forTwo, downtownId, downtownAddress, 129.00m, waterfrontId, waterfrontAddress, 139.00m);
 
         // Standard and Deluxe host only 2 guests, so a party of 3 is priced from Family, the cheapest type that fits.
         IReadOnlyList<ApiTestClient.HotelSummary> forThree =
             await SearchOkAsync(BaselineCity, checkIn, checkOut, 3, cancellationToken);
-        AssertSeattleHotels(forThree, downtownId, 219.00m, waterfrontId, 229.00m);
+        AssertSeattleHotels(forThree, downtownId, downtownAddress, 219.00m, waterfrontId, waterfrontAddress, 229.00m);
 
         // The city matches whatever its letter case, and the stored spelling comes back.
         IReadOnlyList<ApiTestClient.HotelSummary> lowerCase =
             await SearchOkAsync("seattle", checkIn, checkOut, 2, cancellationToken);
-        AssertSeattleHotels(lowerCase, downtownId, 129.00m, waterfrontId, 139.00m);
+        AssertSeattleHotels(lowerCase, downtownId, downtownAddress, 129.00m, waterfrontId, waterfrontAddress, 139.00m);
         Assert.True(
             forTwo.SequenceEqual(lowerCase),
             "Expected the lower-case search to list the same hotels, in the same order, as the stored-case search.");
@@ -437,8 +438,10 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
     private static void AssertSeattleHotels(
         IReadOnlyList<ApiTestClient.HotelSummary> hotels,
         int downtownId,
+        string downtownAddress,
         decimal downtownPrice,
         int waterfrontId,
+        string waterfrontAddress,
         decimal waterfrontPrice)
     {
         // Each element is checked directly rather than through Assert.Collection, whose failure message prints every
@@ -447,10 +450,15 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         Assert.True(
             hotels.Count == 2,
             $"Expected the {BaselineCity} search to list exactly {SeattleDowntown} and {SeattleWaterfront}.");
-        AssertHotel(hotels[0], downtownId, SeattleDowntown, downtownPrice);
-        AssertHotel(hotels[1], waterfrontId, SeattleWaterfront, waterfrontPrice);
+        AssertHotel(hotels[0], downtownId, SeattleDowntown, downtownAddress, downtownPrice);
+        AssertHotel(hotels[1], waterfrontId, SeattleWaterfront, waterfrontAddress, waterfrontPrice);
 
-        static void AssertHotel(ApiTestClient.HotelSummary hotel, int id, string name, decimal lowestNightlyPrice)
+        static void AssertHotel(
+            ApiTestClient.HotelSummary hotel,
+            int id,
+            string name,
+            string storedAddress,
+            decimal lowestNightlyPrice)
         {
             Assert.True(hotel.Id == id, $"Expected the {name} search result to carry that hotel's id.");
             Assert.True(
@@ -460,13 +468,11 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
                 string.Equals(BaselineCity, hotel.City, StringComparison.Ordinal),
                 $"Expected the {name} search result to carry the city {BaselineCity}.");
 
-            // The address is this hotel's own stored text, so another hotel's address or any other text fails. The
-            // message names only the catalogue hotel, never the text the response carried.
-            SeedCatalog.HotelEntry stored = Assert.Single(
-                SeedCatalog.Hotels,
-                entry => string.Equals(entry.Name, name, StringComparison.Ordinal));
+            // The address is the text the database stores for this hotel, read by its id before the searches, so
+            // another hotel's address or any other text fails. The message names only the expected hotel, never the
+            // stored text or the text the response carried.
             Assert.True(
-                string.Equals(stored.Address, hotel.Address, StringComparison.Ordinal),
+                string.Equals(storedAddress, hotel.Address, StringComparison.Ordinal),
                 $"Expected the {name} search result to carry that hotel's stored address.");
 
             // Decimal equality ignores scale; ApiTestClient.ReadAsync has already required exactly two decimals.
@@ -542,6 +548,18 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
         return await _client.ReadAsync<IReadOnlyList<ApiTestClient.HotelSummary>>(response, cancellationToken);
+    }
+
+    // Reads a hotel's address as the database stores it, the text its search result must carry.
+    private async Task<string> GetStoredAddressAsync(int hotelId, CancellationToken cancellationToken)
+    {
+        return await _factory.ExecuteDbAsync(
+            (db, token) => db.Hotels
+                .AsNoTracking()
+                .Where(hotel => hotel.Id == hotelId)
+                .Select(static hotel => hotel.Address)
+                .SingleAsync(token),
+            cancellationToken);
     }
 
     // The search result expected for a hotel this class added, with the stored name, city and address.

@@ -52,7 +52,7 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// The lowest nightly price in USD among the hotel's room types that host at least the requested number of guests
     /// and have at least one room free for the whole stay.
     /// </param>
-    public sealed record HotelAvailability(
+    internal sealed record HotelAvailability(
         int HotelId,
         string Name,
         string City,
@@ -67,7 +67,7 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// The rooms of the type with no confirmed booking overlapping the stay; zero when every room is taken. It counts
     /// physical rooms and does not depend on the party size.
     /// </param>
-    public sealed record RoomTypeAvailability(int RoomTypeId, int AvailableRooms);
+    internal sealed record RoomTypeAvailability(int RoomTypeId, int AvailableRooms);
 
     /// <summary>
     /// Finds the hotels in a city that can host the party for the stay, each with its lowest qualifying nightly price,
@@ -91,7 +91,7 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// The qualifying hotels ordered by lowest nightly price, then name, then identifier. The list is empty when the
     /// city is unknown or cannot match a stored city, or no hotel qualifies.
     /// </returns>
-    public async Task<IReadOnlyList<HotelAvailability>> SearchHotelsAsync(
+    internal async Task<IReadOnlyList<HotelAvailability>> SearchHotelsAsync(
         string normalizedCity,
         StayPeriod period,
         int guests,
@@ -191,7 +191,7 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// One entry per room type of the hotel, zero counts included, ordered by room type identifier. The list is empty
     /// when no hotel has <paramref name="hotelId"/>; the caller decides what an unknown hotel means.
     /// </returns>
-    public async Task<IReadOnlyList<RoomTypeAvailability>> CountAvailableByRoomTypeAsync(
+    internal async Task<IReadOnlyList<RoomTypeAvailability>> CountAvailableByRoomTypeAsync(
         int hotelId,
         StayPeriod period,
         CancellationToken cancellationToken)

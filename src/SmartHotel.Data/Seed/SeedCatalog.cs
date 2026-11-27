@@ -37,7 +37,7 @@ public static class SeedCatalog
     /// <summary>
     /// Gets the seeded hotels in order, numbered from 1 to 5: two in Seattle, two in New York and one in Chicago.
     /// </summary>
-    public static IReadOnlyList<HotelEntry> Hotels { get; } =
+    internal static IReadOnlyList<HotelEntry> Hotels { get; } =
     [
         new(
             1,
@@ -80,7 +80,7 @@ public static class SeedCatalog
     /// <summary>
     /// Gets the four room types every hotel offers, in position order from 1 to 4.
     /// </summary>
-    public static IReadOnlyList<RoomTypeEntry> RoomTypes { get; } =
+    internal static IReadOnlyList<RoomTypeEntry> RoomTypes { get; } =
     [
         new(1, "Standard", 2, 129.00m),
         new(2, "Deluxe", 2, 169.00m),
@@ -139,7 +139,7 @@ public static class SeedCatalog
     /// <param name="City">The city, at most 100 characters, matched case-insensitively by the search.</param>
     /// <param name="Address">A fictional street address, at most 300 characters.</param>
     /// <param name="Description">An original description of the fictional property, at most 2,000 characters.</param>
-    public sealed record HotelEntry(int Number, string Name, string City, string Address, string Description);
+    internal sealed record HotelEntry(int Number, string Name, string City, string Address, string Description);
 
     /// <summary>
     /// One room type offered by every seeded hotel.
@@ -150,5 +150,5 @@ public static class SeedCatalog
     /// <param name="MaxGuests">The largest party one room of this type hosts, at least 1.</param>
     /// <param name="BasePrice">The nightly price in USD in hotel 1, before <see cref="NightlyPrice"/> adds the
     /// hotel's step.</param>
-    public sealed record RoomTypeEntry(int Position, string Name, int MaxGuests, decimal BasePrice);
+    internal sealed record RoomTypeEntry(int Position, string Name, int MaxGuests, decimal BasePrice);
 }
