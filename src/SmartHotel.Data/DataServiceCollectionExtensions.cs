@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 
 using Npgsql;
+using Npgsql.EntityFrameworkCore.PostgreSQL.Infrastructure;
 
 namespace SmartHotel.Data;
 
@@ -93,11 +94,23 @@ public static class DataServiceCollectionExtensions
     /// naming the switch, when it is not enabled. A host without the switch therefore fails the first time it resolves
     /// the context, before any connection is opened, instead of storing infinite dates.
     /// </para>
+    /// <para>
+    /// The Entity Framework Core design-time tools are the one exception to resolving the connection string. While
+    /// <c>dotnet ef</c> builds the host, <see cref="EF.IsDesignTime"/> is <see langword="true"/>, and the options are
+    /// configured after the switch check without calling <paramref name="connectionString"/>: the provider receives the
+    /// same retrying execution strategy and the same ignored events, but no connection string. The tools read these
+    /// options only to discover the context type, create the context through <see cref="DesignTimeDbContextFactory"/>,
+    /// and connect, when a command needs a database, with the connection string of their <c>--connection</c> option or
+    /// the factory's placeholder. <c>dotnet ef</c> therefore needs none of the host's secrets or database settings,
+    /// while a host running the application resolves and checks its connection string as described above.
+    /// </para>
     /// </remarks>
     /// <param name="services">The service collection to add the data services to.</param>
     /// <param name="connectionString">
     /// Returns the Npgsql connection string from the application's services. It is invoked whenever the context
-    /// options are built, once per scope, and never during registration. It runs only after the options' check of the
+    /// options are built, once per scope, and never during registration, nor while the Entity Framework Core
+    /// design-time tools build them (<see cref="EF.IsDesignTime"/> is <see langword="true"/>), so <c>dotnet ef</c>
+    /// needs none of the secrets the function reads. It runs only after the options' check of the
     /// <c>Npgsql.DisableDateTimeInfinityConversions</c> switch passes, so a host without the switch fails before the
     /// function is called. Its resolution throws <see cref="InvalidOperationException"/>, with a fixed message that
     /// quotes no part of the string, when the result is <see langword="null"/>, empty or whitespace, is not a valid
@@ -122,6 +135,18 @@ public static class DataServiceCollectionExtensions
             // and before any Npgsql type is touched.
             EnsureFiniteDateConversions();
 
+            if (EF.IsDesignTime)
+            {
+                // The design-time tools (dotnet ef) build the host only to discover the context type from these
+                // options. They create the context through DesignTimeDbContextFactory, whose placeholder connection
+                // string their --connection option replaces, so the application's connection string, and the secrets
+                // it is made from, are never resolved here, and the provider is configured without one.
+                options
+                    .UseNpgsql(EnableRetryOnTransientFailure)
+                    .ConfigureWarnings(IgnoreUnredactedEvents);
+                return;
+            }
+
             string? value = connectionString(serviceProvider);
             if (string.IsNullOrWhiteSpace(value))
             {
@@ -133,46 +158,57 @@ public static class DataServiceCollectionExtensions
 
             // The check only reads the string; Npgsql receives it exactly as it was supplied.
             options
-                .UseNpgsql(value, npgsql => npgsql.EnableRetryOnFailure(
-                    TransientFailureMaxRetryCount,
-                    TransientFailureMaxRetryDelay,
-                    errorCodesToAdd: null))
-                // EF Core writes each of these failure events before the caller sees the exception. Some hand the
-                // logger the original exception, whose message can quote database values, and the retry record
-                // copies the transient exception into its text. The command, connection and transaction records are
-                // Error records of their own, so a constraint violation the API translates to 409 would still count as
-                // an error, and the connection record names the database and the server. With all of them ignored,
-                // the host's sanitized exception record is the only record of a failure. Ignoring them changes logging
-                // only: the exception still reaches the caller. The Debug connection, data reader and migration
-                // lifecycle records listed after them name the database and the server from the connection string,
-                // so they are ignored too, whatever level the logging configuration admits for their categories.
-                .ConfigureWarnings(warnings => warnings.Ignore(
-                    CoreEventId.QueryIterationFailed,
-                    CoreEventId.SaveChangesFailed,
-                    CoreEventId.ExecutionStrategyRetrying,
-                    RelationalEventId.CommandError,
-                    RelationalEventId.ConnectionError,
-                    RelationalEventId.TransactionError,
-                    RelationalEventId.NonQueryOperationFailed,
-                    RelationalEventId.ExecuteDeleteFailed,
-                    RelationalEventId.ExecuteUpdateFailed,
-                    RelationalEventId.BatchExecutorFailedToRollbackToSavepoint,
-                    RelationalEventId.BatchExecutorFailedToReleaseSavepoint,
-                    RelationalEventId.ConnectionOpening,
-                    RelationalEventId.ConnectionOpened,
-                    RelationalEventId.ConnectionClosing,
-                    RelationalEventId.ConnectionClosed,
-                    RelationalEventId.ConnectionDisposing,
-                    RelationalEventId.ConnectionDisposed,
-                    RelationalEventId.DataReaderClosing,
-                    RelationalEventId.DataReaderDisposing,
-                    RelationalEventId.MigrateUsingConnection,
-                    // Not a failure: migrating an up-to-date database is routine on every start after the first, and
-                    // the host records that outcome itself, so this record would only repeat it.
-                    RelationalEventId.MigrationsNotApplied));
+                .UseNpgsql(value, EnableRetryOnTransientFailure)
+                .ConfigureWarnings(IgnoreUnredactedEvents);
         });
 
         return services;
+    }
+
+    // Shared by the run-time and the design-time options, so both use one execution strategy.
+    private static void EnableRetryOnTransientFailure(NpgsqlDbContextOptionsBuilder npgsql)
+    {
+        npgsql.EnableRetryOnFailure(
+            TransientFailureMaxRetryCount,
+            TransientFailureMaxRetryDelay,
+            errorCodesToAdd: null);
+    }
+
+    // EF Core writes each of these failure events before the caller sees the exception. Some hand the logger the
+    // original exception, whose message can quote database values, and the retry record copies the transient exception
+    // into its text. The command, connection and transaction records are Error records of their own, so a constraint
+    // violation the API translates to 409 would still count as an error, and the connection record names the database
+    // and the server. With all of them ignored, the host's sanitized exception record is the only record of a failure.
+    // Ignoring them changes logging only: the exception still reaches the caller. The Debug connection, data reader and
+    // migration lifecycle records listed after them name the database and the server from the connection string, so
+    // they are ignored too, whatever level the logging configuration admits for their categories. Shared by the
+    // run-time and the design-time options, so both ignore the same events.
+    private static void IgnoreUnredactedEvents(WarningsConfigurationBuilder warnings)
+    {
+        warnings.Ignore(
+            CoreEventId.QueryIterationFailed,
+            CoreEventId.SaveChangesFailed,
+            CoreEventId.ExecutionStrategyRetrying,
+            RelationalEventId.CommandError,
+            RelationalEventId.ConnectionError,
+            RelationalEventId.TransactionError,
+            RelationalEventId.NonQueryOperationFailed,
+            RelationalEventId.ExecuteDeleteFailed,
+            RelationalEventId.ExecuteUpdateFailed,
+            RelationalEventId.BatchExecutorFailedToRollbackToSavepoint,
+            RelationalEventId.BatchExecutorFailedToReleaseSavepoint,
+            RelationalEventId.ConnectionOpening,
+            RelationalEventId.ConnectionOpened,
+            RelationalEventId.ConnectionClosing,
+            RelationalEventId.ConnectionClosed,
+            RelationalEventId.ConnectionDisposing,
+            RelationalEventId.ConnectionDisposed,
+            RelationalEventId.DataReaderClosing,
+            RelationalEventId.DataReaderDisposing,
+            RelationalEventId.MigrateUsingConnection,
+            // Not a failure: migrating an up-to-date database is routine on every start after the first, and the
+            // host records that outcome itself, so this record would only repeat it.
+            RelationalEventId.MigrationsNotApplied);
     }
 
     /// <summary>

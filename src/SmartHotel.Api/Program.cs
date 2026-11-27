@@ -270,7 +270,9 @@ if (!app.Environment.IsDevelopment())
             new EventId(5201, "NoHttpsListener"),
             "Outside Development the API serves HTTPS only, but Kestrel bound no HTTPS address, so the API is "
             + "stopping. Set ASPNETCORE_HTTPS_PORTS or an https:// entry in ASPNETCORE_URLS, and the certificate "
-            + "through Kestrel__Certificates__Default__Path and Kestrel__Certificates__Default__Password.");
+            + "through Kestrel__Certificates__Default__Path and Kestrel__Certificates__Default__Password, or through "
+            + "Kestrel__Endpoints__<name>__Certificate__Path and Kestrel__Endpoints__<name>__Certificate__Password "
+            + "for an endpoint's own certificate.");
         Environment.ExitCode = 1;
         app.Lifetime.StopApplication();
     });
@@ -385,8 +387,10 @@ catch (Exception exception)
         "The API host failed and the API is exiting with code 1. Exception types: {ExceptionTypes}. Their messages are "
         + "not logged, because they can hold secrets. A failure at start-up most often means a listener or certificate "
         + "setting is missing or wrong: check ASPNETCORE_URLS or ASPNETCORE_HTTPS_PORTS, and "
-        + "Kestrel__Certificates__Default__Path and Kestrel__Certificates__Default__Password, which Kestrel reads only "
-        + "from the environment.",
+        + "Kestrel__Certificates__Default__Path and Kestrel__Certificates__Default__Password, or "
+        + "Kestrel__Endpoints__<name>__Certificate__Path and Kestrel__Endpoints__<name>__Certificate__Password for an "
+        + "endpoint's own certificate. Kestrel reads a certificate password only from the environment and ignores one "
+        + "set anywhere else.",
         DescribeExceptionTypes(exception));
     return 1;
 }

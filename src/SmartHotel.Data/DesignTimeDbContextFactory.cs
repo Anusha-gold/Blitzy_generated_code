@@ -9,9 +9,11 @@ namespace SmartHotel.Data;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The tools find this factory in the context's assembly and prefer it to the API host, so generating or inspecting
-/// migrations needs none of the API's secrets or environment variables. At run time the API registers the context
-/// through <c>AddSmartHotelData</c>, with the connection string from its environment-only secret source.
+/// The tools build the API host to discover the context type, then find this factory in the context's assembly and
+/// create the context through it rather than through the host. While they build the host, <c>AddSmartHotelData</c>
+/// configures the provider without resolving its connection string, so generating or inspecting migrations needs none
+/// of the API's secrets or environment variables. At run time the API registers the context through
+/// <c>AddSmartHotelData</c>, with the connection string from its environment-only secret source.
 /// </para>
 /// <para>
 /// The connection string here is a passwordless placeholder. <c>dotnet ef migrations add</c> builds the model without
@@ -32,9 +34,9 @@ public sealed class DesignTimeDbContextFactory : IDesignTimeDbContextFactory<Sma
         "Host=localhost;Port=5432;Database=smarthotel_design;Username=smarthotel";
 
     /// <summary>
-    /// Creates a context that uses the Npgsql provider with the placeholder connection string. The provider is
-    /// configured with the same plain <c>UseNpgsql</c> call as the runtime registration, so the design-time model
-    /// equals the model the API runs with.
+    /// Creates a context that uses the Npgsql provider with the placeholder connection string. The runtime
+    /// registration configures the same provider and adds Npgsql's retrying execution strategy and a list of ignored
+    /// logging events. Neither changes the model, so the design-time model equals the model the API runs with.
     /// </summary>
     /// <param name="args">
     /// The arguments the design-time tools pass after <c>--</c>. They are ignored, because the factory reads no

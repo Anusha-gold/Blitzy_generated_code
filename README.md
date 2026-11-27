@@ -368,6 +368,8 @@ dotnet format SmartHotel.sln
 
 `dotnet tool restore` installs `dotnet-ef` 8.0.34 from `.config/dotnet-tools.json`, and `dotnet format` brings the generated files in line with the `.editorconfig` rules.
 
+The `dotnet ef` commands need none of the API's secrets or `DB_*` variables: they create the context through `src/SmartHotel.Data/DesignTimeDbContextFactory.cs`, whose connection string is a passwordless placeholder, so a command that must reach a database, such as `dotnet ef database update`, takes it from its `--connection "<connection string>"` option.
+
 ## Configuration
 
 The API reads secrets only from process environment variables, never from `appsettings*.json`, command-line arguments or any other configuration source. A signing key placed in a JSON file is ignored, and startup then fails validation. The non-secret settings, `Jwt:Issuer`, `Jwt:Audience` and the log levels, are in `src/SmartHotel.Api/appsettings.json`.
@@ -390,7 +392,7 @@ The API reads secrets only from process environment variables, never from `appse
 | API | `ASPNETCORE_ENVIRONMENT` | `Production`, ASP.NET Core's default when unset | No |
 | API | `ASPNETCORE_HTTPS_PORTS` or `ASPNETCORE_URLS` | For example `443` or `https://+:443` | No |
 | API | `Kestrel__Certificates__Default__Path` | Path of the TLS certificate file | No |
-| API | `Kestrel__Certificates__Default__Password` | The certificate's password, read only from this environment variable | Yes |
+| API | `Kestrel__Certificates__Default__Password` | The default certificate's password, read only from this environment variable | Yes |
 | API | `ConnectionStrings__SmartHotel` | A full Npgsql connection string, used whole when set | Yes, it holds the password |
 | API | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | The connection string's parts, used when `ConnectionStrings__SmartHotel` is unset. `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASSWORD` must then be set and not blank; `DB_PORT` defaults to `5432`. The assembled string caps the connection pool at 50. | `DB_PASSWORD` only |
 | API | `Jwt__SigningKey` | At least 32 bytes in UTF-8 | Yes |
@@ -419,7 +421,7 @@ The local Compose stack runs as `Development` over plain HTTP on loopback-bound 
 - The API turns on HSTS and HTTPS redirection, and Kestrel serves HTTPS with the listener and certificate variables above.
 - A plaintext request the API cannot redirect, because it finds no HTTPS port to redirect to, is answered `403` with an `application/problem+json` body whose `detail` is `This API accepts HTTPS requests only.` It is refused before CORS and authentication, so credentials and tokens sent over plain HTTP are never processed. When Kestrel listens on several HTTPS ports beside an HTTP one, set `ASPNETCORE_HTTPS_PORT` to the port to redirect to; without it ASP.NET Core's redirection fails and every plaintext request gets a generic `500` problem, again before anything else runs.
 - When Kestrel binds no HTTPS address at all, the API logs a critical event that names `ASPNETCORE_HTTPS_PORTS`, `ASPNETCORE_URLS` and the certificate variables, never their values, and stops with exit code 1.
-- Kestrel reads the certificate password only from `Kestrel__Certificates__Default__Password` in the environment, as described under [Outside local development](#outside-local-development).
+- Kestrel reads a certificate password only from the environment: `Kestrel__Certificates__Default__Password` for the default certificate, or `Kestrel__Endpoints__<name>__Certificate__Password` for an endpoint's own certificate. A password in `appsettings*.json`, user secrets or on the command line is ignored, as described under [Outside local development](#outside-local-development).
 - When the host fails to start, for example because Kestrel cannot load the certificate, the API logs one critical event, `5202`, that names the exception types and the listener and certificate variables to check, never an exception message or a value, and exits with code 1.
 - The API refuses to start unless `Cors__AllowedOrigin` is an `https://` origin.
 - The hosting environment's TLS termination must serve the web origin over HTTPS.
