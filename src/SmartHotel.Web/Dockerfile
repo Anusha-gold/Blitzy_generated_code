@@ -57,4 +57,8 @@ if [ -n "${WEB_ENVIRONMENT-}" ] && {
 fi
 EOF
 
+# A Windows checkout with CRLF line endings gives the file above CRLF endings,
+# which the entrypoint's shell cannot source.
+RUN sed -i 's/\r$//' /docker-entrypoint.d/15-smarthotel-web-inputs.envsh
+
 EXPOSE 80

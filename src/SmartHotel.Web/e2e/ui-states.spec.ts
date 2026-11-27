@@ -24,6 +24,11 @@
  * detail page reused by one history traversal that changes both its hotel and
  * its stay loads once, for the hotel and stay it lands on.
  *
+ * Session expiry: with the browser's clock faked and moved past the token's
+ * 60 minutes, the nav bar must show the guest signed out on the public page
+ * they stayed on, without the app sending any API request, and focus left on
+ * "Log out" must move to the "Log in" link that replaces it.
+ *
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory.
  */
@@ -62,6 +67,9 @@ const isRegisterApi = (url: URL): boolean => url.pathname === '/api/auth/registe
 
 /** The login endpoint, `/api/auth/login`, never the SPA's `/login` page. */
 const isLoginApi = (url: URL): boolean => url.pathname === '/api/auth/login';
+
+/** Any API endpoint. The SPA's own routes never match, because none has an `/api` prefix. */
+const isApi = (url: URL): boolean => url.pathname === '/api' || url.pathname.startsWith('/api/');
 
 /** Every hotel card on the search page. */
 const HOTEL_RESULTS = '[data-testid^="hotel-result-"]';
@@ -236,6 +244,8 @@ test('loading indicator is visible while a request is pending', async ({ page })
 
   await expect(indicator).toBeHidden({ timeout: 10_000 });
   await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+  // The pending state disabled the focused button; focus returns to it.
+  await expect(page.getByTestId('search-submit')).toBeFocused();
 });
 
 test('search with check-out equal to check-in shows an inline 400', async ({ page }) => {
@@ -252,6 +262,12 @@ test('search with check-out equal to check-in shows an inline 400', async ({ pag
   await expect(error.getByRole('alert').locator('strong')).toHaveText(/\S/);
   await expect(error).toContainText('checkOut must be after checkIn.');
   await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+
+  // Only the rejected input is marked invalid, described by its own message.
+  const checkOut = page.getByTestId('search-check-out');
+  await expect(checkOut).toHaveAttribute('aria-invalid', 'true');
+  await expect(checkOut).toHaveAccessibleDescription('checkOut must be after checkIn.');
+  await expect(page.getByTestId('search-check-in')).not.toHaveAttribute('aria-invalid');
 });
 
 test('search with no availability shows the empty message', async ({ page }) => {
@@ -262,6 +278,8 @@ test('search with no availability shows the empty message', async ({ page }) => 
   await expect(page.getByTestId('search-empty')).toHaveText(
     'No hotels with available rooms in Atlantis for these dates.',
   );
+  // The message sits in the page's polite status region, so it is announced.
+  await expect(page.getByRole('status').filter({ has: page.getByTestId('search-empty') })).toHaveCount(1);
   await expectNoInlineError(page);
 });
 
@@ -473,8 +491,47 @@ test('server 401 on Book stays on the page with an inline error', async ({ page 
     const error = page.getByTestId('inline-error');
     await expect(error).toBeVisible();
     await expect(error.getByTestId('login-again')).toHaveText('Log in again');
+    // Focus moves from the disabled "Book" to the recovery link.
+    await expect(error.getByTestId('login-again')).toBeFocused();
     await expect(page).toHaveURL(hotelUrl);
     await expect(page.getByTestId('nav-login')).toBeVisible();
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
   });
+});
+
+test('token expiry signs the guest out of the nav bar without a request', async ({ page }) => {
+  // Installed before the app loads, so the app's Date and timers run on a clock
+  // the test can move forward. Until then it keeps pace with real time, so the
+  // server's expiresAt lies 60 minutes after the login on both clocks.
+  await page.clock.install();
+
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  const apiRequests: string[] = [];
+  page.on('request', (request) => {
+    if (isApi(new URL(request.url()))) {
+      apiRequests.push(`${request.method()} ${request.url()}`);
+    }
+  });
+
+  await test.step('59 minutes later the guest is still signed in', async () => {
+    await page.clock.fastForward('59:00');
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    await expect(page.getByTestId('nav-logout')).toBeVisible();
+  });
+
+  await test.step('past the 60 minutes the nav offers "Log in" on the same page', async () => {
+    // A keyboard guest left on "Log out" keeps focus in the nav when the
+    // button is removed at expiry.
+    await page.getByTestId('nav-logout').focus();
+    await expect(page.getByTestId('nav-logout')).toBeFocused();
+
+    await page.clock.fastForward('02:00');
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-login')).toBeFocused();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    await expect(page).toHaveURL(/\/search$/);
+  });
+
+  expect(apiRequests).toEqual([]);
 });

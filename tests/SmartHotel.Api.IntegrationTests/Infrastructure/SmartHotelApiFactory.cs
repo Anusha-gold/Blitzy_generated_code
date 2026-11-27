@@ -9,25 +9,28 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 
+using Npgsql;
+
 using SmartHotel.Api.Infrastructure;
 using SmartHotel.Data;
 
 namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 
 /// <summary>
-/// Hosts the real API pipeline in-process for one test class, on a PostgreSQL database and a JWT signing key of its
-/// own: an xUnit v3 class fixture built on <see cref="WebApplicationFactory{TEntryPoint}"/>.
+/// Hosts the real API pipeline in-process for one test class, on a PostgreSQL database, a database login role and a
+/// JWT signing key of its own: an xUnit v3 class fixture built on <see cref="WebApplicationFactory{TEntryPoint}"/>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="InitializeAsync"/> creates the database <see cref="DatabaseName"/> on the <see cref="TestPostgres"/>
-/// server and starts the host, so the API migrates and seeds that database during fixture setup.
-/// <see cref="DisposeAsync"/> stops the host and drops the database.
+/// <see cref="InitializeAsync"/> creates the database <see cref="DatabaseName"/> and its login role on the
+/// <see cref="TestPostgres"/> server and starts the host, so the API migrates and seeds that database during fixture
+/// setup. <see cref="DisposeAsync"/> stops the host and drops the database and the role.
 /// </para>
 /// <para>
 /// The host runs in the Development environment with in-memory <c>Cors:AllowedOrigin</c> configuration, and its
-/// <see cref="ISecretSource"/> is replaced by one that holds this factory's connection string and signing key. No
-/// process environment variable is read for a secret or set, so nothing is shared with another test class.
+/// <see cref="ISecretSource"/> is replaced by one that holds this factory's connection string and signing key. The
+/// connection string authenticates as this factory's own role with a random password, never as the server user, and
+/// no process environment variable is read for a secret or set, so no credential is shared with another test class.
 /// </para>
 /// <para>
 /// Every member is safe to call concurrently once the host has started. The connection string and the signing key are
@@ -47,8 +50,8 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     private int _disposed;
 
     /// <summary>
-    /// Creates a factory with a new database name and a new random signing key. Nothing is created or started until
-    /// <see cref="InitializeAsync"/> runs.
+    /// Creates a factory with a new database name, a new random password for the login role of the same name, and a
+    /// new random signing key. Nothing is created or started until <see cref="InitializeAsync"/> runs.
     /// </summary>
     /// <param name="postgres">The assembly's PostgreSQL server fixture, which xUnit v3 injects.</param>
     /// <exception cref="ArgumentNullException"><paramref name="postgres"/> is <see langword="null"/>.</exception>
@@ -59,7 +62,7 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
         _postgres = postgres;
         DatabaseName = DatabaseNamePrefix + Guid.NewGuid().ToString("N");
-        DatabaseConnectionString = postgres.ConnectionStringFor(DatabaseName);
+        DatabaseConnectionString = postgres.CreateDatabaseConnectionString(DatabaseName);
         SigningKey = RandomNumberGenerator.GetHexString(SigningKeyLength, lowercase: true);
         AllowedOrigin = WebOrigin;
     }
@@ -71,7 +74,8 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
     /// <summary>
     /// The Npgsql connection string for <see cref="DatabaseName"/>, the one the API uses, for tests that open their
-    /// own connections. It can carry a password, so it must never be written to output.
+    /// own connections. It authenticates as the database's owner, a login role named <see cref="DatabaseName"/> with a
+    /// random password, so it must never be written to output.
     /// </summary>
     public string DatabaseConnectionString { get; }
 
@@ -105,31 +109,64 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     public string JwtAudience => Services.GetRequiredService<IOptions<JwtOptions>>().Value.Audience;
 
     /// <summary>
-    /// Creates <see cref="DatabaseName"/>, then builds and starts the host, which validates its options, applies the
-    /// migrations and seeds the catalogue before it serves requests.
+    /// Creates <see cref="DatabaseName"/> and its login role, then builds and starts the host, which validates its
+    /// options, applies the migrations and seeds the catalogue before it serves requests.
     /// </summary>
     /// <remarks>
-    /// When the API fails to start, for example on invalid options or a failed migration, its exception propagates
-    /// unchanged. The database is dropped when the factory is disposed, which xUnit also does for a fixture whose
-    /// initialization threw.
+    /// When the API fails to start, its exception is replaced by an <see cref="InvalidOperationException"/> with no
+    /// inner exception, because provider and host messages can quote the username, the database or a configuration
+    /// value. Its message names only the operation, the exception types and any SQLSTATE, and says which server the
+    /// database is on, naming <c>SMARTHOTEL_TEST_POSTGRES</c> without its value. Invalid options, or a connection
+    /// string the data layer refuses, are reported by their own exception types. When database initialization fails,
+    /// for example on a failed migration, the API writes its sanitized initialization-failure record, disposes its
+    /// host and returns from its entry point without serving, so the reported type is the
+    /// <see cref="ObjectDisposedException"/> of the disposed host rather than the original failure's. The database
+    /// and the role are dropped when the factory is disposed, which xUnit also does for a fixture whose initialization
+    /// threw; a creation that fails partway drops them itself.
     /// </remarks>
     /// <returns>A task that completes once the host is serving requests.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The database could not be created, or the host failed to start. The message carries only the operation, the
+    /// exception types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">The test run was cancelled.</exception>
     public async ValueTask InitializeAsync()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
 
-        await _postgres.CreateDatabaseAsync(DatabaseName, cancellationToken);
+        // Outside the try below: a failure here is already described by TestPostgres.
+        await _postgres.CreateDatabaseAsync(DatabaseConnectionString, cancellationToken);
 
-        // Reading Server builds and starts the host synchronously; Task.Run keeps that start off xUnit's
-        // synchronization context.
-        await Task.Run(() => _ = Server, cancellationToken);
+        try
+        {
+            // Reading Server builds and starts the host synchronously; Task.Run keeps that start off xUnit's
+            // synchronization context.
+            await Task.Run(() => _ = Server, cancellationToken);
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            // Raised afresh, so that no host exception rides along as its inner exception.
+            throw new OperationCanceledException(cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException(
+                _postgres.DescribeServerFailure("Starting the API host failed.", exception));
+        }
     }
 
     /// <summary>
-    /// Stops and disposes the host and its clients, then drops <see cref="DatabaseName"/>, even when the shutdown
-    /// throws. Calls after the first do nothing.
+    /// Stops and disposes the host and its clients, then drops <see cref="DatabaseName"/> and its login role, even when
+    /// the shutdown throws or <see cref="InitializeAsync"/> never created them. Calls after the first do nothing.
     /// </summary>
-    /// <returns>A task that completes once the host is stopped and the database no longer exists.</returns>
+    /// <returns>
+    /// A task that completes once the host is stopped and neither the database nor the role exists.
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// The host failed to stop, or the database or the role could not be dropped. The message carries only the
+    /// operation, the exception types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c>, and no
+    /// inner exception.
+    /// </exception>
     public override async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1)
@@ -141,10 +178,15 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
         {
             await base.DisposeAsync();
         }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException(
+                _postgres.DescribeServerFailure("Stopping the API host failed.", exception));
+        }
         finally
         {
-            // Not the test's token: the database must be dropped even when the test run is being cancelled.
-            await _postgres.DropDatabaseAsync(DatabaseName, CancellationToken.None);
+            // Not the test's token: the database and the role must be dropped even when the run is being cancelled.
+            await _postgres.DropDatabaseAsync(DatabaseConnectionString, CancellationToken.None);
         }
     }
 
@@ -185,6 +227,41 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
         await using AsyncServiceScope scope = Services.CreateAsyncScope();
         SmartHotelDbContext db = scope.ServiceProvider.GetRequiredService<SmartHotelDbContext>();
         return await action(db, cancellationToken);
+    }
+
+    /// <summary>
+    /// Opens a new connection of the test's own to <see cref="DatabaseName"/>, outside the host's services, for a
+    /// session the API does not control, such as one that holds a row lock in a transaction of its own.
+    /// </summary>
+    /// <param name="cancellationToken">Cancels the open.</param>
+    /// <returns>The open connection, with no transaction begun; the caller disposes it.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The connection could not be opened. The message names only the operation, the exception types, any SQLSTATE
+    /// and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c> without its value, and carries no inner exception,
+    /// because a provider message can quote the username or the database.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<NpgsqlConnection> OpenDatabaseConnectionAsync(CancellationToken cancellationToken)
+    {
+        NpgsqlConnection connection = new(DatabaseConnectionString);
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+            return connection;
+        }
+        catch (Exception exception)
+        {
+            // A connection that failed to open is never handed out, so it is disposed here.
+            await connection.DisposeAsync();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // Raised afresh, so that no provider exception rides along as its inner exception.
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            throw new InvalidOperationException(
+                _postgres.DescribeServerFailure("Opening a connection to the test database failed.", exception));
+        }
     }
 
     /// <summary>

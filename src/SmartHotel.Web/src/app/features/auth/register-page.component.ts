@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, DestroyRef, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, DestroyRef, computed, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import type { HttpErrorResponse } from '@angular/common/http';
 import { NonNullableFormBuilder, ReactiveFormsModule } from '@angular/forms';
@@ -8,7 +8,7 @@ import { finalize } from 'rxjs';
 import { AuthApiService } from '../../core/api/auth-api.service';
 import type { RegisterRequest } from '../../core/api/models';
 import { AuthService } from '../../core/auth/auth.service';
-import { toUiError, type UiError } from '../../core/http/problem-details';
+import { fieldErrorIds, toUiError, type UiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
 /** The inline title shown when the email is already registered (409). */
@@ -68,6 +68,17 @@ export class RegisterPageComponent {
 
   /** The inline error of the last attempt, or `null` when there is none. */
   protected readonly error = signal<UiError | null>(null);
+
+  /** Prefix of the ids the inline error gives its field messages. */
+  protected readonly errorIdPrefix = 'register-error';
+
+  /**
+   * The ids of the server's messages per rejected field (`email`, `password`,
+   * `fullName`), which the inputs reference through `aria-describedby` and
+   * mark with `aria-invalid`; empty while there is no error, so each new
+   * attempt clears them. The 409 carries no field errors and so marks no field.
+   */
+  protected readonly fieldErrors = computed(() => fieldErrorIds(this.error(), this.errorIdPrefix));
 
   /**
    * Sends the registration. On the 201 it hands the email to the login page

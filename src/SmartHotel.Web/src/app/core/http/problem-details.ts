@@ -28,6 +28,8 @@ import type { MonoTypeOperatorFunction } from 'rxjs';
 const UNREACHABLE_TITLE = 'The service is unreachable.';
 const PROBLEM_MEDIA_TYPE = 'application/problem+json';
 const DEADLINE_STATUS_TEXT = 'Request deadline exceeded';
+/** A JSON path naming one top-level member, such as `$.email`; group 1 is the member. */
+const TOP_LEVEL_JSON_PATH = /^\$\.([A-Za-z_][A-Za-z0-9_]*)$/;
 
 /**
  * How long, in milliseconds, a request bounded by {@link withRequestDeadline}
@@ -126,6 +128,67 @@ export function toUiError(error: HttpErrorResponse): UiError {
     detail: hasText(detail) ? detail : null,
     fieldErrors: toFieldErrors(body['errors']),
   };
+}
+
+/**
+ * Returns the element id of one field-error message: `idPrefix`, the field's
+ * index in {@link UiError.fieldErrors} and the message's index within it,
+ * joined by `-`. The id is built from indexes, never from the field name, so a
+ * server key containing white space or any other character stays a valid id
+ * reference. `ErrorMessageComponent` gives each message this id, and form
+ * inputs reference it through {@link fieldErrorIds}.
+ *
+ * @param idPrefix - The page's prefix, unique within the document.
+ * @param fieldIndex - The field's index in `fieldErrors`.
+ * @param messageIndex - The message's index in that field's `messages`.
+ * @returns The id, for example `search-error-0-1`.
+ */
+export function fieldErrorId(idPrefix: string, fieldIndex: number, messageIndex: number): string {
+  return `${idPrefix}-${fieldIndex}-${messageIndex}`;
+}
+
+/**
+ * Maps each field named in the error's {@link UiError.fieldErrors} to the
+ * space-separated ids, from {@link fieldErrorId}, of its messages, so a form
+ * input can mark itself invalid and reference its messages through
+ * `aria-describedby`. A server key that is a top-level JSON path member, `$.`
+ * followed by a member name such as `$.email` (the form the API uses for a
+ * body field of the wrong JSON type), names that member, `email`; every other
+ * key is the field name exactly as the server sent it. Names are compared with
+ * case, so body-level keys such as `$` or `request` and deeper paths such as
+ * `$.items[0].name` match no form input and stay in the summary only. A field
+ * reported more than once, under either form, gets the ids of all its
+ * messages in order, and a field with no message is left out. The map is
+ * empty for `null`, so the associations end as soon as a page clears its
+ * error. The function is pure.
+ *
+ * @param error - The error being shown, or `null` when there is none.
+ * @param idPrefix - The prefix the same error's `ErrorMessageComponent` uses.
+ * @returns The ids per field name; `get` returns `undefined` for a field
+ * without an error.
+ */
+export function fieldErrorIds(error: UiError | null, idPrefix: string): ReadonlyMap<string, string> {
+  const ids = new Map<string, string>();
+  if (error === null) {
+    return ids;
+  }
+
+  error.fieldErrors.forEach((fe, fieldIndex) => {
+    if (fe.messages.length === 0) {
+      return;
+    }
+    const messageIds = fe.messages.map((_message, messageIndex) => fieldErrorId(idPrefix, fieldIndex, messageIndex));
+    const field = fieldNameOf(fe.field);
+    const existing = ids.get(field);
+    ids.set(field, existing === undefined ? messageIds.join(' ') : [existing, ...messageIds].join(' '));
+  });
+  return ids;
+}
+
+/** The member a top-level JSON path key (`$.email`) names; any other key unchanged. */
+function fieldNameOf(key: string): string {
+  const match = TOP_LEVEL_JSON_PATH.exec(key);
+  return match === null ? key : match[1];
 }
 
 function genericTitle(status: number): string {

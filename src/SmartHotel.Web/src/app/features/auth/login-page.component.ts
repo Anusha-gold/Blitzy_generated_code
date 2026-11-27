@@ -1,19 +1,25 @@
-import { ChangeDetectionStrategy, Component, DestroyRef, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, DestroyRef, computed, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { NonNullableFormBuilder, ReactiveFormsModule } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
-import { finalize } from 'rxjs';
+import { distinctUntilChanged, finalize, map, of, startWith, switchMap, timer } from 'rxjs';
 
 import { AuthService } from '../../core/auth/auth.service';
-import { UiError, toUiError } from '../../core/http/problem-details';
+import { UiError, fieldErrorIds, toUiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
 const REGISTERED_NOTICE = 'Account created. Log in to continue.';
 const SESSION_EXPIRED_NOTICE = 'Your session has expired. Log in again.';
 const WRONG_CREDENTIALS_TITLE = 'Email or password is incorrect.';
 const DEFAULT_RETURN_URL = '/search';
+
+/**
+ * How long after the empty notice region renders its text is written, so
+ * assistive technology registers the region before its content changes; Angular
+ * CDK's `LiveAnnouncer` waits the same 100 ms.
+ */
+const NOTICE_ANNOUNCE_DELAY_MS = 100;
 
 /**
  * The login page, route `login`, with the query parameters `returnUrl`,
@@ -23,7 +29,9 @@ const DEFAULT_RETURN_URL = '/search';
  * `reason=session-expired` shows "Your session has expired. Log in again.";
  * `registered=1` wins when both are present. The query is observed rather than
  * read once, because the router reuses this component when only the query
- * changes.
+ * changes. The notice is one `role="status"` region that stays mounted and is
+ * visually hidden while empty; a new notice's text is written into it shortly
+ * after it renders empty, so screen readers announce it on entry and on change.
  *
  * Email hand-off: with `registered=1`, the email the register page left in
  * `AuthService.pendingLoginEmail` pre-fills the form and the signal is set back
@@ -47,7 +55,7 @@ const DEFAULT_RETURN_URL = '/search';
 @Component({
   selector: 'app-login-page',
   standalone: true,
-  imports: [NgIf, ReactiveFormsModule, RouterLink, ErrorMessageComponent],
+  imports: [ReactiveFormsModule, RouterLink, ErrorMessageComponent],
   templateUrl: './login-page.component.html',
   styleUrl: './login-page.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -73,24 +81,50 @@ export class LoginPageComponent {
   /** The inline error of the last attempt, or `null` when there is none. */
   protected readonly error = signal<UiError | null>(null);
 
-  /** The notice derived from the query, or `null` when there is none. */
+  /** Prefix of the ids the inline error gives its field messages. */
+  protected readonly errorIdPrefix = 'login-error';
+
+  /**
+   * The ids of the server's messages per rejected field (`email`, `password`),
+   * which the inputs reference through `aria-describedby` and mark with
+   * `aria-invalid`; empty while there is no error, so each new attempt clears
+   * them. The 401 carries no field errors and so marks no field.
+   */
+  protected readonly fieldErrors = computed(() => fieldErrorIds(this.error(), this.errorIdPrefix));
+
+  /**
+   * The text of the always-mounted notice region, or `null` while it is empty.
+   * A new notice from the query is cleared first and set after
+   * `NOTICE_ANNOUNCE_DELAY_MS`, so it is announced; an unchanged one stays put.
+   */
   protected readonly notice = signal<string | null>(null);
 
   constructor() {
-    this.route.queryParamMap.pipe(takeUntilDestroyed()).subscribe((params) => {
-      if (params.get('registered') === '1') {
-        this.notice.set(REGISTERED_NOTICE);
-        const email = this.auth.pendingLoginEmail();
-        if (email !== null) {
-          this.form.controls.email.setValue(email);
-          this.auth.pendingLoginEmail.set(null);
-        }
-      } else if (params.get('reason') === 'session-expired') {
-        this.notice.set(SESSION_EXPIRED_NOTICE);
-      } else {
-        this.notice.set(null);
-      }
-    });
+    this.route.queryParamMap
+      .pipe(
+        map((params) => {
+          if (params.get('registered') === '1') {
+            const email = this.auth.pendingLoginEmail();
+            if (email !== null) {
+              this.form.controls.email.setValue(email);
+              this.auth.pendingLoginEmail.set(null);
+            }
+            return REGISTERED_NOTICE;
+          }
+          return params.get('reason') === 'session-expired' ? SESSION_EXPIRED_NOTICE : null;
+        }),
+        distinctUntilChanged(),
+        switchMap((message) =>
+          message === null
+            ? of(null)
+            : timer(NOTICE_ANNOUNCE_DELAY_MS).pipe(
+                map(() => message),
+                startWith(null),
+              ),
+        ),
+        takeUntilDestroyed(),
+      )
+      .subscribe((message) => this.notice.set(message));
   }
 
   /**

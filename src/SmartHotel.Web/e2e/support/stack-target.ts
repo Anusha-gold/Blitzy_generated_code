@@ -55,12 +55,16 @@ export const DEFAULT_REUSE_BASE_URL = 'http://localhost:4200';
 /** Reuse-mode default API base URL: the developer stack's API. */
 export const DEFAULT_REUSE_API_URL = 'http://localhost:8080/api';
 
-/** The web app and API a test run targets. */
+/**
+ * The web app and API a test run targets. Both URLs are canonical: scheme,
+ * host and port only, plus the fixed path `/api` for the API, with no user
+ * name, password, query, fragment or trailing slash.
+ */
 export interface StackTarget {
   /** Web origin, with no trailing slash, for example `http://localhost:14200`. */
   baseUrl: string;
   /**
-   * API base ending in `/api`, with no trailing slash, for example
+   * API base `<origin>/api`, with no trailing slash, for example
    * `http://localhost:18080/api`.
    */
   apiUrl: string;
@@ -82,9 +86,106 @@ const DROPPED_COMPOSE_VARIABLES = new Set([
 /** Prefix of the stack's own variables: ports and first-start secret overrides. */
 const SMARTHOTEL_VARIABLE_PREFIX = 'SMARTHOTEL_';
 
-/** Removes exactly one trailing `/`, if present. */
-function trimTrailingSlash(value: string): string {
-  return value.endsWith('/') ? value.slice(0, -1) : value;
+/**
+ * A reuse URL's host with an optional port: a host name of dot-separated
+ * labels of ASCII letters, digits and `-` (no empty label, no trailing dot),
+ * or a bracketed IPv6 literal, then optionally `:` and one to five digits.
+ */
+const REUSE_AUTHORITY = /^(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$/;
+
+/**
+ * Validates one reuse-mode URL setting and returns its canonical form.
+ *
+ * The raw value is checked against a strict grammar before any URL parsing,
+ * because the parser repairs input: it skips extra slashes after the scheme,
+ * resolves `.` and `..` segments, reads `\` as `/` and percent-encodes
+ * non-ASCII characters. The value must:
+ *
+ * - consist only of printable ASCII (U+0021 to U+007E) and hold no `\`;
+ * - start with `http://` or `https://`, in any letter case;
+ * - hold no `?` or `#` anywhere, so no query or fragment, not even an empty
+ *   one;
+ * - have, up to the first `/` or the end, a non-empty authority with no user
+ *   name or password (`@`) that is a host name of dot-separated labels of
+ *   letters, digits and `-` (no empty label, no trailing dot) or a bracketed
+ *   IPv6 literal, optionally followed by `:` and one to five digits;
+ * - for `web`, have no path beyond trailing `/`, so the URL is an origin; for
+ *   `api`, have the path `/api` exactly, in lower case, optionally followed by
+ *   trailing `/`.
+ *
+ * The URL parser then rejects what the grammar admits but no URL allows, such
+ * as a port above 65535 or a malformed IPv6 literal. The canonical form is the
+ * parsed scheme and host with its port, plus `/api` for `api`: parsing
+ * lower-cases the scheme and host and drops a default port. Only those
+ * components and the fixed `/api` reach the result, so it never carries a path
+ * of the caller's choosing, and canonicalizing a canonical value returns it
+ * unchanged.
+ *
+ * @param name - The variable the value came from, named in the error.
+ * @param value - The setting's value.
+ * @param kind - `web` for the web origin, `api` for the API base URL.
+ * @returns The canonical URL, with no trailing `/`.
+ * @throws Error naming the variable, the broken rule and the default. The
+ *   message never holds the value or any part of it, and the parser's own
+ *   error, whose message can echo the input, is neither shown nor attached.
+ */
+function canonicalReuseUrl(
+  name: 'E2E_BASE_URL' | 'E2E_API_URL',
+  value: string,
+  kind: 'web' | 'api',
+): string {
+  const rule =
+    kind === 'web'
+      ? `an absolute http or https URL in printable ASCII with no user name, password, query or fragment, and no path beyond a trailing / (default ${DEFAULT_REUSE_BASE_URL})`
+      : `an absolute http or https URL in printable ASCII with no user name, password, query or fragment, whose path is /api (default ${DEFAULT_REUSE_API_URL})`;
+  const invalid = (problem: string) =>
+    new Error(`${name} is not valid (${problem}). It must be ${rule}. Its value is not shown.`);
+
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x21 || code > 0x7e) {
+      throw invalid('it contains a character other than printable ASCII');
+    }
+  }
+  if (value.includes('\\')) {
+    throw invalid('it contains a backslash');
+  }
+  const scheme = /^https?:\/\//i.exec(value);
+  if (scheme === null) {
+    throw invalid('it does not start with http:// or https://');
+  }
+  if (value.includes('?') || value.includes('#')) {
+    throw invalid('it has a query or fragment');
+  }
+
+  const rest = value.slice(scheme[0].length);
+  const pathStart = rest.indexOf('/');
+  const authority = pathStart === -1 ? rest : rest.slice(0, pathStart);
+  const rawPath = pathStart === -1 ? '' : rest.slice(pathStart);
+  if (authority === '') {
+    throw invalid('it has no host');
+  }
+  if (authority.includes('@')) {
+    throw invalid('it has a user name or password');
+  }
+  if (!REUSE_AUTHORITY.test(authority)) {
+    throw invalid('its host or port is not valid');
+  }
+  if (kind === 'web' && !/^\/*$/.test(rawPath)) {
+    throw invalid('it has a path');
+  }
+  if (kind === 'api' && !/^\/api\/*$/.test(rawPath)) {
+    throw invalid('its path is not /api');
+  }
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    // The parser's message can quote the input, so it is dropped, not chained.
+    throw invalid('it is not a valid URL');
+  }
+  return kind === 'web' ? `${url.protocol}//${url.host}` : `${url.protocol}//${url.host}/api`;
 }
 
 /**
@@ -124,11 +225,21 @@ export function isReuseMode(env: Record<string, string | undefined> = process.en
  * `E2E_BASE_URL` and `E2E_API_URL` are ignored, so a stale value can never
  * point a fresh run at another stack.
  *
- * In reuse mode the target is `E2E_BASE_URL` and `E2E_API_URL`, each with one
- * trailing slash trimmed; an unset or empty value falls back to
- * {@link DEFAULT_REUSE_BASE_URL} or {@link DEFAULT_REUSE_API_URL}. Reuse mode
- * is for local iteration only and never counts as evidence for any success
- * criterion.
+ * In reuse mode the target is `E2E_BASE_URL` and `E2E_API_URL`; an unset or
+ * empty value falls back to {@link DEFAULT_REUSE_BASE_URL} or
+ * {@link DEFAULT_REUSE_API_URL}. Each must be an absolute `http` or `https`
+ * URL made only of printable ASCII, with no backslash, user name, password,
+ * query or fragment, and with a host name or bracketed IPv6 literal and an
+ * optional port; `E2E_BASE_URL` must be an origin, optionally with trailing
+ * `/`, and the path of `E2E_API_URL` must be `/api`, optionally with trailing
+ * `/`. The raw value is checked before URL parsing, so nothing the parser
+ * would repair is accepted. Each is returned in canonical form: the scheme
+ * and host lower-cased, the port only when it is not the scheme's default,
+ * no trailing `/`, and for `E2E_API_URL` the path `/api` and nothing else.
+ * Resolving a canonical pair again returns it unchanged, so the pair
+ * `playwright.config.ts` writes back into the environment resolves the same
+ * way in every worker. Reuse mode is for local iteration only and never
+ * counts as evidence for any success criterion.
  *
  * The fresh target uses `localhost`, never `127.0.0.1`: the stack derives its
  * CORS origin (`http://localhost:<web port>`) and the SPA's API base URL
@@ -142,6 +253,8 @@ export function isReuseMode(env: Record<string, string | undefined> = process.en
  *   the empty string, as {@link isReuseMode} reports it. `playwright.config.ts`
  *   resolves the target when it loads, so such a run fails before global
  *   setup makes any Compose call.
+ * @throws Error in reuse mode when `E2E_BASE_URL` or `E2E_API_URL` breaks
+ *   these rules. The message names the variable and the rule, never the value.
  */
 export function resolveStackTarget(
   env: Record<string, string | undefined> = process.env,
@@ -154,8 +267,8 @@ export function resolveStackTarget(
     };
   }
   return {
-    baseUrl: trimTrailingSlash(env['E2E_BASE_URL'] || DEFAULT_REUSE_BASE_URL),
-    apiUrl: trimTrailingSlash(env['E2E_API_URL'] || DEFAULT_REUSE_API_URL),
+    baseUrl: canonicalReuseUrl('E2E_BASE_URL', env['E2E_BASE_URL'] || DEFAULT_REUSE_BASE_URL, 'web'),
+    apiUrl: canonicalReuseUrl('E2E_API_URL', env['E2E_API_URL'] || DEFAULT_REUSE_API_URL, 'api'),
     reuse: true,
   };
 }

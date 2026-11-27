@@ -121,6 +121,8 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await page.getByTestId('nav-logout').click();
     await expect(page).toHaveURL(/\/search$/);
     await expect(page.getByTestId('nav-login')).toBeVisible();
+    // The removed "Log out" button hands keyboard focus to its replacement.
+    await expect(page.getByTestId('nav-login')).toBeFocused();
 
     await page.getByTestId('nav-bookings').click();
     await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);

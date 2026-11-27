@@ -22,4 +22,14 @@
     <RuntimeHostConfigurationOption Include="Npgsql.DisableDateTimeInfinityConversions" Value="true" />
   </ItemGroup>
 
+  <!--
+    DATAS (dynamic adaptation to application sizes). Server GC otherwise keeps one heap per core, with allocation
+    budgets sized to the host, so on a large machine the process retains gigabytes it does not need. DATAS adapts the
+    heap count and the budgets to the live data, so memory follows the load in any deployment, with or without a
+    container memory limit. The SDK writes it to runtimeconfig.json as System.GC.DynamicAdaptationMode.
+  -->
+  <PropertyGroup>
+    <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
+  </PropertyGroup>
+
 </Project>

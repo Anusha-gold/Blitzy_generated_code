@@ -11,6 +11,8 @@
         formControlName="email"
         autocomplete="email"
         required
+        [attr.aria-invalid]="fieldErrors().has('email') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('email') ?? null"
       />
     </div>
 
@@ -23,6 +25,8 @@
         formControlName="password"
         autocomplete="new-password"
         required
+        [attr.aria-invalid]="fieldErrors().has('password') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('password') ?? null"
       />
     </div>
 
@@ -35,10 +39,12 @@
         formControlName="fullName"
         autocomplete="name"
         required
+        [attr.aria-invalid]="fieldErrors().has('fullName') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('fullName') ?? null"
       />
     </div>
 
-    <app-error-message [error]="error()"></app-error-message>
+    <app-error-message [error]="error()" [fieldErrorIdPrefix]="errorIdPrefix"></app-error-message>
 
     <button type="submit" data-testid="register-submit" [disabled]="pending()">Create account</button>
   </form>

@@ -220,19 +220,51 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
         string routeTemplate,
         Exception exception)
     {
-        var (chain, typesTruncated) = CollectExceptionChain(exception);
-        var exceptionTypes = DescribeExceptionTypes(chain);
-        var postgresException = chain.OfType<PostgresException>().FirstOrDefault();
-        var (stackFrames, framesTruncated) = DescribeStackFrames(chain);
+        var description = DescribeSanitized(exception);
 
         // The exception is never passed as the logger's exception argument, because every provider would then
-        // print its message and formatted stack trace. Only SqlState and ConstraintName are read from a
-        // PostgresException: its message, detail, hint and query text can contain key values.
+        // print its message and formatted stack trace.
         LogUnhandledException(
             logger,
             traceId,
             method,
             routeTemplate,
+            description.ExceptionTypes,
+            description.ExceptionTypesTruncated,
+            description.SqlState,
+            description.ConstraintName,
+            description.StackFrames,
+            description.StackFramesTruncated);
+    }
+
+    /// <summary>
+    /// Describes <paramref name="exception"/> as the sanitized Error event does: the type names of the collected
+    /// exceptions, the <see cref="PostgresException.SqlState"/> and <see cref="PostgresException.ConstraintName"/>
+    /// of the first <see cref="PostgresException"/> among them, and their stack frames reduced to type and method
+    /// names, each list with its truncation flag, under the bounds the class remarks set.
+    /// </summary>
+    /// <remarks>
+    /// No message, <see cref="Exception.Data"/>, formatted stack trace or file information is read, so the
+    /// description can be logged wherever an exception must be reported without its text, such as a failed startup.
+    /// </remarks>
+    /// <param name="exception">The exception to describe.</param>
+    /// <returns>The sanitized description, in the order the Error event lists its fields.</returns>
+    internal static (
+        string[] ExceptionTypes,
+        bool ExceptionTypesTruncated,
+        string? SqlState,
+        string? ConstraintName,
+        string[] StackFrames,
+        bool StackFramesTruncated) DescribeSanitized(Exception exception)
+    {
+        var (chain, typesTruncated) = CollectExceptionChain(exception);
+        var exceptionTypes = DescribeExceptionTypes(chain);
+        var postgresException = chain.OfType<PostgresException>().FirstOrDefault();
+        var (stackFrames, framesTruncated) = DescribeStackFrames(chain);
+
+        // Only SqlState and ConstraintName are read from a PostgresException: its message, detail, hint and query
+        // text can contain key values.
+        return (
             exceptionTypes,
             typesTruncated,
             postgresException?.SqlState,

@@ -1,12 +1,25 @@
-import { ChangeDetectionStrategy, ChangeDetectorRef, Component, DestroyRef, computed, inject, signal } from '@angular/core';
-import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { CurrencyPipe, Location, NgFor, NgIf } from '@angular/common';
+import {
+  ChangeDetectionStrategy,
+  ChangeDetectorRef,
+  Component,
+  DestroyRef,
+  ElementRef,
+  Injector,
+  ViewChild,
+  afterNextRender,
+  computed,
+  inject,
+  signal,
+} from '@angular/core';
+import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
+import { CurrencyPipe, DOCUMENT, Location, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { Router, RouterLink } from '@angular/router';
-import { finalize, switchMap } from 'rxjs';
+import { finalize, skip, switchMap, tap } from 'rxjs';
 
 import { BookingsApiService } from '../../core/api/bookings-api.service';
 import type { Booking } from '../../core/api/models';
+import { AuthService } from '../../core/auth/auth.service';
 import { type UiError, toUiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
@@ -15,6 +28,39 @@ import { ErrorMessageComponent } from '../../shared/error-message/error-message.
  * rows, so a long booking history never becomes one unbounded DOM table.
  */
 const PAGE_SIZE = 10;
+
+/**
+ * The router state `HotelDetailPageComponent` passes to `/bookings` after a
+ * 201: the new booking, exactly as `POST /api/bookings` returned it. Create it
+ * with {@link bookingConfirmationState}, never as an object literal, so the
+ * booking stays in the router's memory and out of the browser's history.
+ *
+ * A type alias rather than an interface: an interface has no implicit index
+ * signature, so it would not be assignable to the router's `state` extra.
+ */
+export type BookingConfirmationState = { readonly booking: Booking };
+
+/**
+ * Creates the router state that hands a new booking to `/bookings`.
+ *
+ * The router copies a navigation's state into the browser's history entry,
+ * which the browser structured-clones and keeps for the life of the tab, past
+ * a logout and into a later guest's session. `booking` is therefore a
+ * non-enumerable property: a structured clone, like the object spread with
+ * which the router builds that entry, copies only own enumerable properties,
+ * so no history entry ever holds the booking. The router passes the state
+ * object itself, by reference, through its in-memory navigation, where
+ * {@link BookingsPageComponent} reads `booking` while that navigation
+ * constructs it.
+ *
+ * @param booking - The booking from the 201 of `POST /api/bookings`.
+ * @returns The state for the `state` extra of `Router.navigate`.
+ */
+export function bookingConfirmationState(booking: Booking): BookingConfirmationState {
+  const state = {} as BookingConfirmationState;
+  Object.defineProperty(state, 'booking', { value: booking, enumerable: false });
+  return state;
+}
 
 /**
  * The "My bookings" page, route `bookings`, behind `authGuard`. It lists the
@@ -27,11 +73,24 @@ const PAGE_SIZE = 10;
  * reload after a cancel, so the cancelled row stays in view.
  *
  * Confirmation banner: after a 201, `HotelDetailPageComponent` navigates here
- * with the server's booking in the one-shot router state `booking`. The page
- * reads that state once, at construction, and shows the banner only when the
- * value passes {@link isBooking}; absent or malformed state shows no banner
+ * with the new booking in the router state, a
+ * {@link BookingConfirmationState} held only in the router's memory and never
+ * written to the browser's history. The page accepts it once, at
+ * construction, from the router's in-memory navigation that is constructing
+ * it, never from history state: the navigation must be a fresh in-app one,
+ * made while a session exists, and its booking must carry a valid id. A page
+ * load, Back or Forward replays history state that may belong to an earlier
+ * guest's visit, so it never shows a banner. Whether or not it accepts one,
+ * the page removes any `booking` member from the current history entry. Of
+ * the handed-over booking the page keeps only its id; any change of the
+ * session (a logout, the session cleared after a 401, a new login) ends the
+ * handoff, and so does a 204 on that booking. The banner shows the booking's
+ * row from the caller's own list, never the router state, while a session
+ * exists and the row is `Confirmed`. Absent or invalid state shows no banner
  * and no error. A booking is confirmed on creation and no payment is taken
- * online, which the banner states.
+ * online, which the banner states. Once the banner renders it takes focus,
+ * unless the guest has already focused something, so keyboard navigation
+ * continues from the confirmation rather than from the top of the document.
  *
  * 401 handling, split with `authInterceptor`: the interceptor clears the
  * session when a `/api/bookings` request is rejected with 401 and never
@@ -63,8 +122,21 @@ export class BookingsPageComponent {
   private readonly api = inject(BookingsApiService);
   private readonly router = inject(Router);
   private readonly location = inject(Location);
+  private readonly auth = inject(AuthService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly changeDetector = inject(ChangeDetectorRef);
+
+  /** Tells whether focus is on nothing when the confirmation banner renders. */
+  private readonly document = inject(DOCUMENT);
+
+  /** Registers the banner focus after the next render, outside an injection context. */
+  private readonly injector = inject(Injector);
+
+  /**
+   * The rendered confirmation banner, the focus destination after a booking;
+   * `undefined` while no banner is shown.
+   */
+  @ViewChild('confirmationBanner') private confirmationBanner?: ElementRef<HTMLElement>;
 
   /**
    * The caller's bookings in server order; `null` until the first load
@@ -126,12 +198,38 @@ export class BookingsPageComponent {
   protected readonly today = new Date().toISOString().slice(0, 10);
 
   /**
-   * The booking just created, from the navigation's router state, or `null`
-   * when the page was reached any other way. Read once; it never changes.
+   * The id of the booking whose confirmation handoff this page accepted at
+   * construction, or `null` when the page was reached any other way. It is
+   * the only trace of the handoff the page keeps, in memory. Any change of the
+   * session, and a 204 on that booking, set it back to `null` for the life of
+   * the page.
    */
-  protected readonly confirmation: Booking | null = readConfirmation(this.location.getState());
+  private readonly handoff = signal<number | null>(this.takeHandoff());
+
+  /**
+   * The booking the banner confirms, or `null` for no banner. It is the
+   * handed-over booking's row in the caller's own list, so it appears once the
+   * list has loaded, and only while a session exists and the row is
+   * `Confirmed`. A cancelled booking, or one absent from the list, shows no
+   * banner. The session check hides the banner in the same change-detection
+   * pass that clears the session, before the handoff itself is ended.
+   */
+  protected readonly confirmation = computed<Booking | null>(() => {
+    const bookingId = this.handoff();
+    if (bookingId === null || this.auth.session() === null) {
+      return null;
+    }
+    return this.bookings()?.find((b) => b.id === bookingId && b.status === 'Confirmed') ?? null;
+  });
 
   constructor() {
+    // Any change of the session ends the handoff: a logout, the session
+    // cleared after a 401, or a new login. `skip(1)` passes over the session
+    // current at construction, which the handoff was accepted under.
+    toObservable(this.auth.session)
+      .pipe(skip(1), takeUntilDestroyed())
+      .subscribe(() => this.handoff.set(null));
+
     this.loadOnEntry();
   }
 
@@ -160,6 +258,13 @@ export class BookingsPageComponent {
     this.api
       .cancel(b.id)
       .pipe(
+        // The 204 already proves the handed-over booking cancelled, so its
+        // banner goes now, even if the reload below fails.
+        tap(() => {
+          if (this.handoff() === b.id) {
+            this.handoff.set(null);
+          }
+        }),
         switchMap(() => this.api.list()),
         finalize(() => this.cancelPending.set(false)),
         takeUntilDestroyed(this.destroyRef),
@@ -234,6 +339,31 @@ export class BookingsPageComponent {
   }
 
   /**
+   * Moves focus to the confirmation banner after the render that first shows
+   * it, which follows the entry load, because the banner confirms the
+   * handed-over booking's row in the loaded list. The "Book" button that sent
+   * the booking left the document with the hotel page, so focus is normally
+   * on the document body; it moves only from the body or from nothing, so an
+   * element the guest focused meanwhile keeps focus. Does nothing when the
+   * entry load shows no banner.
+   */
+  private focusConfirmationAfterRender(): void {
+    if (this.confirmation() === null) {
+      return;
+    }
+
+    afterNextRender(
+      () => {
+        const active = this.document.activeElement;
+        if (active === null || active === this.document.body) {
+          this.confirmationBanner?.nativeElement.focus();
+        }
+      },
+      { injector: this.injector },
+    );
+  }
+
+  /**
    * Loads the caller's bookings when the page opens. This protected-page
    * request is the only one whose 401 redirects to the login page; any other
    * error is shown inline.
@@ -243,7 +373,10 @@ export class BookingsPageComponent {
       .list()
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe({
-        next: (list) => this.bookings.set(list),
+        next: (list) => {
+          this.bookings.set(list);
+          this.focusConfirmationAfterRender();
+        },
         error: (err: HttpErrorResponse) => {
           if (err.status === 401) {
             // `replaceUrl` drops the rejected `/bookings` entry from history,
@@ -258,6 +391,58 @@ export class BookingsPageComponent {
         },
       });
   }
+
+  /**
+   * Accepts the confirmation handoff of the navigation constructing this page,
+   * after removing any `booking` member from the current history entry.
+   *
+   * The handoff is read from the router's in-memory navigation only. It counts
+   * when that navigation is imperative and follows an earlier one in this app,
+   * a session exists, and its state's `booking` carries a valid id. The
+   * initial navigation of a page load is imperative too, but it and every Back
+   * or Forward navigation replay history state, which may come from an earlier
+   * guest's visit; neither has the in-app predecessor, or the trigger, that
+   * this requires. Only the id is taken: the banner shows the booking from the
+   * caller's own list.
+   *
+   * @returns The handed-over booking's id, or `null` when there is no
+   *   handoff to accept.
+   */
+  private takeHandoff(): number | null {
+    this.clearHistoryReference();
+
+    const navigation = this.router.getCurrentNavigation();
+    if (
+      navigation === null ||
+      navigation.trigger !== 'imperative' ||
+      navigation.previousNavigation === null ||
+      this.auth.session() === null
+    ) {
+      return null;
+    }
+
+    const reference: unknown = navigation.extras.state?.['booking'];
+    return isBookingReference(reference) ? reference.id : null;
+  }
+
+  /**
+   * Removes any `booking` member from the current history entry's state, so a
+   * reload, Back or Forward finds no booking there. This app's handoff never
+   * puts one in history ({@link bookingConfirmationState}), but an entry
+   * written earlier in the same tab, such as by an older version of the app,
+   * may carry one. The router has already written this page's URL to history
+   * when the component is constructed, so the current entry is this page's.
+   * Every other member, such as the router's `navigationId`, is kept.
+   */
+  private clearHistoryReference(): void {
+    const state = this.location.getState();
+    if (!isRecord(state) || !('booking' in state)) {
+      return;
+    }
+    const kept: Record<string, unknown> = { ...state };
+    delete kept['booking'];
+    this.location.replaceState(this.location.path(true), '', kept);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -265,41 +450,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Whether router state holds a complete booking as the API returns it. Every
- * member of {@link Booking} is checked, because the state is untyped input:
- * a stale or foreign history entry must not render a partial banner.
+ * Whether the `booking` member of router state identifies a booking: an
+ * object whose `id` is a positive safe integer, the form of every id the API
+ * issues. The state is untyped input, so anything else, such as `1.5`, `NaN`,
+ * `Infinity`, `0`, a negative number, the string `"7"` or a missing id, is
+ * rejected. Only the id is checked, because it is all the page takes from the
+ * state; the banner's details come from the caller's own list.
  */
-function isBooking(value: unknown): value is Booking {
+function isBookingReference(value: unknown): value is Pick<Booking, 'id'> {
   if (!isRecord(value)) {
     return false;
   }
-  const status = value['status'];
-  return (
-    typeof value['id'] === 'number' &&
-    typeof value['hotelId'] === 'number' &&
-    typeof value['hotelName'] === 'string' &&
-    typeof value['roomTypeId'] === 'number' &&
-    typeof value['roomTypeName'] === 'string' &&
-    typeof value['roomNumber'] === 'string' &&
-    typeof value['checkIn'] === 'string' &&
-    typeof value['checkOut'] === 'string' &&
-    typeof value['nights'] === 'number' &&
-    typeof value['guests'] === 'number' &&
-    typeof value['totalPrice'] === 'number' &&
-    typeof value['createdAt'] === 'string' &&
-    (status === 'Confirmed' || status === 'Cancelled')
-  );
-}
-
-/**
- * Returns the `booking` member of the history state when it is a valid
- * {@link Booking}, and `null` otherwise. Other members, such as Angular's
- * `navigationId`, are ignored.
- */
-function readConfirmation(state: unknown): Booking | null {
-  if (!isRecord(state)) {
-    return null;
-  }
-  const booking = state['booking'];
-  return isBooking(booking) ? booking : null;
+  const id = value['id'];
+  return typeof id === 'number' && Number.isSafeInteger(id) && id >= 1;
 }

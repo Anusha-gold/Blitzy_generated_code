@@ -40,7 +40,7 @@ nav .brand:active {
   color: var(--sh-color-accent-pressed);
 }
 
-/* Short of room it wraps to its own row, then shrinks: the email truncates, never widening the page. */
+/* Short of room it wraps to its own row, then shrinks: the email wraps in full, never widening the page. */
 .account {
   display: flex;
   align-items: center;
@@ -50,9 +50,8 @@ nav .brand:active {
 }
 
 .email {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Unlike break-word, anywhere lowers min-content, so a long address breaks onto more lines. */
+  overflow-wrap: anywhere;
   color: var(--sh-color-text-muted);
 }
 

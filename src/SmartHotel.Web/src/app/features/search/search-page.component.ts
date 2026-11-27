@@ -1,6 +1,6 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, Injector, afterNextRender, computed, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
-import { CurrencyPipe, NgFor, NgIf } from '@angular/common';
+import { CurrencyPipe, DOCUMENT, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { ActivatedRoute, ParamMap, Router, RouterLink } from '@angular/router';
 import { NonNullableFormBuilder, ReactiveFormsModule } from '@angular/forms';
@@ -8,7 +8,7 @@ import { EMPTY, Observable, Subject, catchError, finalize, map, merge, switchMap
 
 import { HotelsApiService } from '../../core/api/hotels-api.service';
 import type { HotelSearchQuery, HotelSummary } from '../../core/api/models';
-import { UiError, toUiError } from '../../core/http/problem-details';
+import { UiError, fieldErrorIds, toUiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
 /**
@@ -68,6 +68,20 @@ export class SearchPageComponent {
   private readonly hotels = inject(HotelsApiService);
   private readonly fb = inject(NonNullableFormBuilder);
 
+  /** Tells which element has focus, at submit and once the search settles. */
+  private readonly document = inject(DOCUMENT);
+
+  /** Registers the focus restore after the next render, outside an injection context. */
+  private readonly injector = inject(Injector);
+
+  /**
+   * The element that had focus when the guest last submitted the form, held
+   * only until the search that submit starts begins: that search takes and
+   * clears it, so the record travels with that one request and no later
+   * search can act on it. `null` once taken, or when nothing was focused.
+   */
+  private focusedAtSubmit: HTMLElement | null = null;
+
   /**
    * The search criteria as entered. The date inputs yield raw `yyyy-MM-dd`
    * strings, and the number input yields `null` when it is emptied.
@@ -85,6 +99,17 @@ export class SearchPageComponent {
   /** The failed search's error, or `null` when the last search did not fail. */
   protected readonly error = signal<UiError | null>(null);
 
+  /** Prefix of the ids the inline error gives its field messages. */
+  protected readonly errorIdPrefix = 'search-error';
+
+  /**
+   * The ids of the server's messages per rejected field (`city`, `checkIn`,
+   * `checkOut`, `guests`), which the inputs reference through
+   * `aria-describedby` and mark with `aria-invalid`; empty while there is no
+   * error, so each new search clears them.
+   */
+  protected readonly fieldErrors = computed(() => fieldErrorIds(this.error(), this.errorIdPrefix));
+
   /** The completed search's hotels in server order; `null` until one completes. */
   protected readonly results = signal<HotelSummary[] | null>(null);
 
@@ -96,7 +121,17 @@ export class SearchPageComponent {
   constructor() {
     merge(this.route.queryParamMap, this.rerun$.pipe(map(() => this.route.snapshot.queryParamMap)))
       .pipe(
-        switchMap((params) => this.run(params)),
+        switchMap((params) => {
+          // The record belongs to the search this emission starts: taking it
+          // here means a cancelled search, or the idle state, cannot leave it
+          // for a later back/forward search to act on.
+          const target = this.focusedAtSubmit;
+          this.focusedAtSubmit = null;
+          // `complete` follows a response (`run` turns an error into a
+          // completion) but never an unsubscribe, so a search that a newer
+          // one cancels never moves focus.
+          return this.run(params).pipe(tap({ complete: () => this.restoreFocusAfterSearch(target) }));
+        }),
         takeUntilDestroyed(),
       )
       .subscribe();
@@ -106,9 +141,15 @@ export class SearchPageComponent {
    * Writes the form's criteria into the URL, which runs the search. An emptied
    * guest count is left out, and the server then uses 1. When the criteria
    * equal the current URL, the router would not emit, so the current query is
-   * replayed instead.
+   * replayed instead. The element focused at submit, normally the Search
+   * button that the pending state disables, is recorded for the search this
+   * submit starts, so focus can return to it once that search completes with
+   * a response; a search cancelled by a newer one never moves focus.
    */
   protected submit(): void {
+    const focused = this.document.activeElement;
+    this.focusedAtSubmit = focused instanceof HTMLElement && focused !== this.document.body ? focused : null;
+
     const { city, checkIn, checkOut, guests } = this.form.getRawValue();
     const queryParams: Record<string, string | number> = { city, checkIn, checkOut };
     if (guests !== null) {
@@ -188,6 +229,38 @@ export class SearchPageComponent {
         return EMPTY;
       }),
       finalize(() => this.pending.set(false)),
+    );
+  }
+
+  /**
+   * Returns focus to the element recorded at submit once the search that
+   * submit started has completed with a response, after the render that
+   * re-enables the Search button and shows the outcome. Disabling the focused
+   * button while the search is pending can drop focus to the document body,
+   * so focus moves only when it is still on the body, on nothing, or on that
+   * element, and only to an element that is still in the document and
+   * enabled; anything else the guest focused meanwhile keeps focus. A
+   * cancelled search never calls this, and a search that no submit started,
+   * such as one run by back/forward navigation or a deep link, passes `null`
+   * and never moves focus.
+   *
+   * @param target - The element recorded at the submit that started the
+   *   search, or `null` when no submit started it or nothing was focused.
+   */
+  private restoreFocusAfterSearch(target: HTMLElement | null): void {
+    if (target === null) {
+      return;
+    }
+
+    afterNextRender(
+      () => {
+        const active = this.document.activeElement;
+        const dropped = active === null || active === this.document.body || active === target;
+        if (dropped && target.isConnected && !target.matches(':disabled')) {
+          target.focus();
+        }
+      },
+      { injector: this.injector },
     );
   }
 }

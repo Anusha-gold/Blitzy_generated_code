@@ -1,7 +1,17 @@
 <section class="auth-page">
   <h1>Log in</h1>
 
-  <p *ngIf="notice() as message" class="notice" role="status" data-testid="login-notice">{{ message }}</p>
+  <!-- Always mounted: a live region inserted with its text already in it may go
+       unannounced. The static class keeps the empty region out of the layout
+       from its first frame, before the class bindings first apply. -->
+  <p
+    class="visually-hidden"
+    role="status"
+    aria-live="polite"
+    data-testid="login-notice"
+    [class.notice]="notice() !== null"
+    [class.visually-hidden]="notice() === null"
+  >{{ notice() }}</p>
 
   <form [formGroup]="form" (ngSubmit)="submit()">
     <div class="field">
@@ -13,6 +23,8 @@
         formControlName="email"
         autocomplete="username"
         required
+        [attr.aria-invalid]="fieldErrors().has('email') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('email') ?? null"
       />
     </div>
 
@@ -25,10 +37,12 @@
         formControlName="password"
         autocomplete="current-password"
         required
+        [attr.aria-invalid]="fieldErrors().has('password') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('password') ?? null"
       />
     </div>
 
-    <app-error-message [error]="error()"></app-error-message>
+    <app-error-message [error]="error()" [fieldErrorIdPrefix]="errorIdPrefix"></app-error-message>
 
     <button type="submit" data-testid="login-submit" [disabled]="pending()">Log in</button>
   </form>

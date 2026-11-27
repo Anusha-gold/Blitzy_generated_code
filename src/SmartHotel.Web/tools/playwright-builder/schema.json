@@ -6,6 +6,7 @@
   "properties": {
     "config": {
       "type": "string",
+      "minLength": 1,
       "description": "Path to the Playwright configuration, relative to the workspace root.",
       "default": "playwright.config.ts"
     }

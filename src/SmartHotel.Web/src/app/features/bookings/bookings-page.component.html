@@ -1,10 +1,12 @@
 <h1>My bookings</h1>
 
 <section
-  *ngIf="confirmation as c"
+  *ngIf="confirmation() as c"
+  #confirmationBanner
   class="confirmation"
   data-testid="booking-confirmation"
   aria-label="Booking confirmed"
+  tabindex="-1"
 >
   <h2>Booking confirmed</h2>
   <p>{{ c.hotelName }}, {{ c.roomTypeName }}, room {{ c.roomNumber }}</p>

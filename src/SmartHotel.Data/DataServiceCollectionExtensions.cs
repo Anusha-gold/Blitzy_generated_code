@@ -45,7 +45,13 @@ public static class DataServiceCollectionExtensions
     /// <see cref="RelationalEventId.BatchExecutorFailedToRollbackToSavepoint"/> and
     /// <see cref="RelationalEventId.BatchExecutorFailedToReleaseSavepoint"/>. Each would log the original exception,
     /// whose message can quote database values, ahead of the host's sanitized exception record. Only their logging
-    /// stops; the exceptions still propagate, and every other event, the command-failure record included, is kept.
+    /// stops; the exceptions still propagate, and every other failure event, the command-failure record included, is
+    /// kept.
+    /// </para>
+    /// <para>
+    /// <see cref="RelationalEventId.MigrationsNotApplied"/> is ignored as well. A host that migrates on every start
+    /// finds the database already up to date on all but the first, and records that outcome itself, so the event would
+    /// only repeat it. The migration still runs; only that record is dropped.
     /// </para>
     /// <para>
     /// Registration first requires the <c>Npgsql.DisableDateTimeInfinityConversions</c> switch to be enabled in the
@@ -104,7 +110,10 @@ public static class DataServiceCollectionExtensions
                     RelationalEventId.ExecuteDeleteFailed,
                     RelationalEventId.ExecuteUpdateFailed,
                     RelationalEventId.BatchExecutorFailedToRollbackToSavepoint,
-                    RelationalEventId.BatchExecutorFailedToReleaseSavepoint));
+                    RelationalEventId.BatchExecutorFailedToReleaseSavepoint,
+                    // Not a failure: migrating an up-to-date database is routine on every start after the first, and
+                    // the host records that outcome itself, so this record would only repeat it.
+                    RelationalEventId.MigrationsNotApplied));
         });
 
         return services;

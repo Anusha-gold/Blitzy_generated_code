@@ -46,8 +46,34 @@
 #   secrets and `db-data` must therefore be reset together, with
 #   "docker compose down -v".
 #
-# The file is bind-mounted and run as is: keep LF line endings. Never enable
-# shell tracing or print the environment, which would expose the secrets.
+# Line endings
+#   The file is bind-mounted and run as checked out, so it may have CRLF
+#   line endings, as a default Git for Windows checkout gives it. The guard
+#   below then runs its text again with every carriage return removed, or
+#   exits 1 with a stderr line naming the file when it cannot be read. An LF
+#   copy runs straight through.
+#
+# Never enable shell tracing or print the environment, which would expose
+# the secrets.
+#
+# Carriage-return guard. The quoted newline holds this file's own line
+# ending, so a CRLF copy is recognised without reading the file, and the
+# text it re-runs, which has no carriage return, cannot recurse. exec keeps
+# the process, and so the server it becomes, as PID 1. Every guard line ends
+# in a comment, which absorbs that line's carriage return, and no blank line
+# comes before the guard, because /bin/sh runs a lone carriage return as a
+# command.
+_line_end='
+' #
+case $_line_end in #
+    *"$(printf '\r')"*) #
+        _script=$(tr -d '\r' 2>/dev/null < "$0") && [ -n "$_script" ] && #
+            exec /bin/sh -c "$_script" "$0" "$@" #
+        printf 'db-entrypoint: failed to read %s\n' "$0" >&2 #
+        exit 1 #
+        ;; #
+esac #
+_line_end= #
 
 set -eu
 

@@ -11,7 +11,7 @@ The product is inspired by Microsoft's SmartHotel360 reference application. It i
 | Web app | `src/SmartHotel.Web` | Angular 17 single-page app, served by nginx | Screens, routing, forms, loading and error states, and the in-memory session |
 | API | `src/SmartHotel.Api` | ASP.NET Core 8 REST API | A modular monolith with Auth, Hotels, Bookings and Availability modules. The only component that reads or writes data. |
 | Data layer | `src/SmartHotel.Data` | Entity Framework Core 8 with the Npgsql provider | Entities, mappings and constraints, the `InitialCreate` migration and the seed routine |
-| Database | — | PostgreSQL 16 | Persistence and constraint enforcement, reached only by the API |
+| Database | — | PostgreSQL 16 | Persistence and constraint enforcement, used only by the API |
 
 ## Architecture
 
@@ -81,18 +81,12 @@ These are the combinations that every prerequisite supports: Playwright 1.60.0's
 
 ### Line endings
 
-The repository has no `.gitattributes`, so your Git settings decide the line endings of a checkout.
+Running the product needs no Git line-ending setting. The repository has no `.gitattributes`, so your Git settings decide the line endings of a checkout, and an LF or a CRLF checkout, Git for Windows' default included, starts with the same `docker compose up`:
 
-- `deploy/db/db-entrypoint.sh` and `src/SmartHotel.Api/docker-entrypoint.sh` must keep LF endings. The `db` service bind-mounts `db-entrypoint.sh` and runs it as is, so a CRLF copy stops `db`, and with it the whole stack, from starting. The API image build strips carriage returns from its own script.
-- C# files use CRLF, as the root `.editorconfig` requires.
+- The `db` service bind-mounts `deploy/db/db-entrypoint.sh` and runs it as checked out. A copy with CRLF endings runs itself again with the carriage returns removed.
+- The API and web image builds strip carriage returns from the shell scripts they place in their images.
 
-On Windows, clone inside a WSL 2 distribution, or turn off line-ending conversion before cloning:
-
-```bash
-git config --global core.autocrlf false
-```
-
-Git for Windows sets `core.autocrlf=true` by default, which converts the scripts to CRLF on checkout. `core.autocrlf=input` keeps the scripts intact, but it commits new CRLF C# files with LF endings, which `dotnet format --verify-no-changes` then rejects in every other checkout.
+C# files use CRLF, as the root `.editorconfig` requires. Committing new C# files needs a repository-local Git setting, described under [Quality gates](#quality-gates).
 
 ## Run the product
 
@@ -114,13 +108,15 @@ The services start in order, with no manual step:
 2. `api` applies the committed migration, seeds the catalogue and only then starts listening. It is healthy once `/api/health` answers, so a healthy `api` means a migrated and seeded database.
 3. `web` starts once `api` is healthy.
 
+The `api` container is limited to 1 GiB of memory, and the API's garbage collector adapts its heap to the load (DATAS) within that limit.
+
 | Address | Serves |
 |---------|--------|
 | `http://localhost:4200` | The web app |
 | `http://localhost:8080/api` | The API |
 | `http://localhost:8080/api/health` | The readiness probe: `200` with the plain-text body `Healthy` |
 
-Every published port is bound to `127.0.0.1`, so nothing listens on other host interfaces. The database port is not published at all: only the API reaches it.
+Every published port is bound to `127.0.0.1`, so nothing listens on other host interfaces. No database port is published, and the API is the only service that uses the database.
 
 To use other host ports, set `SMARTHOTEL_API_PORT` (default `8080`) and `SMARTHOTEL_WEB_PORT` (default `4200`) in the shell or in `.env`. Compose derives the API's CORS origin (`Cors__AllowedOrigin`) and the SPA's API base URL (`API_BASE_URL`) from the same two variables, so the web app and CORS always agree:
 
@@ -220,9 +216,9 @@ dotnet test
 
 This runs `SmartHotel.sln`: the unit tests in `tests/SmartHotel.Api.UnitTests` and the integration tests in `tests/SmartHotel.Api.IntegrationTests`, which drive the real API pipeline in-process against a real PostgreSQL 16 server.
 
-- By default the test fixture starts the `db-test` Compose service itself, in its own Compose project `smarthotel-test` with `--profile test`. The service is published on `127.0.0.1:55432`, accepts passwordless connections (trust authentication), sits alone on its own `testdb` network and keeps its data on tmpfs. Docker must therefore be running. The fixture leaves the service running for the next run.
-- To use another server instead, set `SMARTHOTEL_TEST_POSTGRES` to a full Npgsql connection string. The default is `Host=127.0.0.1;Port=55432;Username=postgres`. A connection string can carry a password, so the fixture never prints the value.
-- Each test class creates its own `smarthotel_it_<guid>` database and drops it afterwards.
+- By default the test fixture starts the `db-test` Compose service itself, in its own Compose project `smarthotel-test` with `--profile test`. The service is published on `127.0.0.1:55432`, accepts passwordless connections (trust authentication), sits alone on its own `testdb` network and keeps its data on tmpfs; its server log, like `db`'s, leaves out constraint DETAIL, failed statements and bind parameters. Docker must therefore be running. The fixture leaves the service running for the next run.
+- To use another server instead, set `SMARTHOTEL_TEST_POSTGRES` to a full Npgsql connection string. The default is `Host=127.0.0.1;Port=55432;Username=postgres`. Its user must be a superuser, or have `CREATEDB` and `CREATEROLE`. A connection string can carry a password, so the fixture never prints the value.
+- Each test class creates its own `smarthotel_it_<guid>` database and its own login role of the same name, with a random password, which owns the database. The class connects only as that role, never with the server's credentials, and drops both afterwards.
 
 Focused runs:
 
@@ -289,7 +285,7 @@ docker compose -p smarthotel-acceptance down -v
 
 #### Reuse mode
 
-For local iteration, `E2E_REUSE_STACK=1` skips the bootstrap and runs the specs against an already running stack at `E2E_BASE_URL` (default `http://localhost:4200`) and `E2E_API_URL` (default `http://localhost:8080/api`). Setup then only checks that `<E2E_API_URL>/health` answers `Healthy` and that the web root answers. Use `localhost` in both URLs, because the stack's CORS origin and the SPA's API base URL are `localhost` origins. `E2E_REUSE_STACK` accepts only `1`; leave it unset or empty for a fresh run. Any other value, such as `true`, `yes` or `0`, fails the run before any Compose call, so a mistyped value never removes and rebuilds the acceptance stack.
+For local iteration, `E2E_REUSE_STACK=1` skips the bootstrap and runs the specs against an already running stack at `E2E_BASE_URL` (default `http://localhost:4200`) and `E2E_API_URL` (default `http://localhost:8080/api`). Setup then only checks that `<E2E_API_URL>/health` answers `Healthy` and that the web root answers. Use `localhost` in both URLs, because the stack's CORS origin and the SPA's API base URL are `localhost` origins. `E2E_REUSE_STACK` accepts only `1`; leave it unset or empty for a fresh run. Any other value, such as `true`, `yes` or `0`, fails the run before any Compose call, so a mistyped value never removes and rebuilds the acceptance stack. Each URL must be an absolute `http` or `https` URL made only of printable ASCII, with no user name, password, query or fragment; `E2E_BASE_URL` must be an origin (a trailing `/` is allowed) and the path of `E2E_API_URL` must be `/api` (a trailing `/` is allowed), otherwise the run fails before any spec with an error that names the variable without printing its value.
 
 ```bash
 E2E_REUSE_STACK=1 ng test
@@ -340,6 +336,7 @@ ng build
 
 - `Directory.Build.props` sets `TreatWarningsAsErrors`, so any compiler, analyzer or NuGet warning fails `dotnet build` and `dotnet test`.
 - The root `.editorconfig` holds the unchanged rules that `dotnet new editorconfig` emits from SDK 8.0.428. They require C# files to use CRLF line endings with no final newline, so run `dotnet format SmartHotel.sln` before committing C# changes.
+- Commit C# files from a clone whose line-ending conversion is turned off for that repository only: `git clone -c core.autocrlf=false <repository-url>`. Its files keep their committed endings, and new files are committed as written. Git for Windows' default `core.autocrlf=true`, like `core.autocrlf=input`, commits a new CRLF C# file with LF endings, which `dotnet format --verify-no-changes` then rejects in every other checkout.
 - `ng lint` applies angular-eslint 17's default rules with `maxWarnings: 0`, and `ng build` must finish without warnings.
 
 ### Commands a pipeline would run
@@ -392,7 +389,7 @@ The API reads secrets only from process environment variables, never from `appse
 | API | `ASPNETCORE_ENVIRONMENT` | `Production`, ASP.NET Core's default when unset | No |
 | API | `ASPNETCORE_HTTPS_PORTS` or `ASPNETCORE_URLS` | For example `443` or `https://+:443` | No |
 | API | `Kestrel__Certificates__Default__Path` | Path of the TLS certificate file | No |
-| API | `Kestrel__Certificates__Default__Password` | The certificate's password | Yes |
+| API | `Kestrel__Certificates__Default__Password` | The certificate's password, read only from this environment variable | Yes |
 | API | `ConnectionStrings__SmartHotel` | A full Npgsql connection string, used whole when set | Yes, it holds the password |
 | API | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | The connection string's parts, used when `ConnectionStrings__SmartHotel` is unset. `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASSWORD` must then be set and not blank; `DB_PORT` defaults to `5432`. The assembled string caps the connection pool at 50. | `DB_PASSWORD` only |
 | API | `Jwt__SigningKey` | At least 32 bytes in UTF-8 | Yes |
@@ -403,11 +400,13 @@ The API reads secrets only from process environment variables, never from `appse
 
 Supply the secrets through the hosting environment's secret mechanism, never in a committed file. Outside Compose, leave `SMARTHOTEL_SECRETS_DIR` unset: the API container's entrypoint then reads no secret files and uses the variables above as they are set.
 
+Kestrel reads its `Kestrel` settings from the usual configuration sources, except a certificate password, which it reads only from the environment: `Kestrel__Certificates__Default__Password`, or `Kestrel__Endpoints__<name>__Certificate__Password` for an endpoint's own certificate. A password in `appsettings*.json`, user secrets or a `--Kestrel:...:Password` command-line argument is ignored, so a password-protected certificate configured that way fails to load and the API does not start.
+
 ### Host test runner variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SMARTHOTEL_TEST_POSTGRES` | Unset: the fixture starts `db-test` and uses `Host=127.0.0.1;Port=55432;Username=postgres` | The PostgreSQL server for the integration tests. A full connection string can carry a password, and the fixture never prints it. |
+| `SMARTHOTEL_TEST_POSTGRES` | Unset: the fixture starts `db-test` and uses `Host=127.0.0.1;Port=55432;Username=postgres` | The PostgreSQL server for the integration tests. Its user must be a superuser, or have `CREATEDB` and `CREATEROLE`. A full connection string can carry a password, and the fixture never prints it. |
 | `E2E_REUSE_STACK` | Unset | `1` selects reuse mode for the web tests. Unset or empty runs a fresh acceptance stack. Any other value fails the run before any Compose call. |
 | `E2E_BASE_URL` | `http://localhost:4200` | The web app to target, in reuse mode only |
 | `E2E_API_URL` | `http://localhost:8080/api` | The API base to target, in reuse mode only |
@@ -417,6 +416,10 @@ Supply the secrets through the hosting environment's secret mechanism, never in 
 The local Compose stack runs as `Development` over plain HTTP on loopback-bound ports. Every other environment enforces HTTPS end to end:
 
 - The API turns on HSTS and HTTPS redirection, and Kestrel serves HTTPS with the listener and certificate variables above.
+- A plaintext request the API cannot redirect, because it finds no HTTPS port to redirect to, is answered `403` with an `application/problem+json` body whose `detail` is `This API accepts HTTPS requests only.` It is refused before CORS and authentication, so credentials and tokens sent over plain HTTP are never processed. When Kestrel listens on several HTTPS ports beside an HTTP one, set `ASPNETCORE_HTTPS_PORT` to the port to redirect to; without it ASP.NET Core's redirection fails and every plaintext request gets a generic `500` problem, again before anything else runs.
+- When Kestrel binds no HTTPS address at all, the API logs a critical event that names `ASPNETCORE_HTTPS_PORTS`, `ASPNETCORE_URLS` and the certificate variables, never their values, and stops with exit code 1.
+- Kestrel reads the certificate password only from `Kestrel__Certificates__Default__Password` in the environment, as described under [Outside local development](#outside-local-development).
+- When the host fails to start, for example because Kestrel cannot load the certificate, the API logs one critical event, `5202`, that names the exception types and the listener and certificate variables to check, never an exception message or a value, and exits with code 1.
 - The API refuses to start unless `Cors__AllowedOrigin` is an `https://` origin.
 - The hosting environment's TLS termination must serve the web origin over HTTPS.
 - `API_BASE_URL` must be `https://<api host>/api`. The SPA accepts an `http` API base only for `localhost` or `127.0.0.1`, and only when `WEB_ENVIRONMENT` is `Development`. Any other configuration shows a start-up error instead of the app.

@@ -33,11 +33,6 @@ import { expect, type Page } from '@playwright/test';
 
 import { resolveStackTarget } from './stack-target';
 
-/** Removes exactly one trailing `/`, if present. */
-function withoutTrailingSlash(value: string): string {
-  return value.endsWith('/') ? value.slice(0, -1) : value;
-}
-
 /**
  * Fills one reactive-form input, but only once Angular has bound it to its
  * form control, and then confirms the value held. It waits for no outcome of
@@ -145,17 +140,17 @@ export async function expectSignedInAs(page: Page, email: string): Promise<void>
  * Returns the API base URL the run targets, for requests a spec sends to the
  * API directly rather than through the web app.
  *
- * It reads `E2E_API_URL`, which `playwright.config.ts` writes from
- * `resolveStackTarget()` so the main process and every worker read the same
- * target. When the variable is missing or empty it falls back to
+ * It returns `E2E_API_URL` verbatim: `playwright.config.ts` writes it from
+ * `resolveStackTarget()`, which validates and canonicalizes the URL once, so
+ * the main process, every worker and every consumer read the same target.
+ * When the variable is missing or empty it falls back to
  * `resolveStackTarget().apiUrl` itself.
  *
- * @returns The API base URL, ending in `/api` with no trailing slash. In a
- *   fresh run it is `http://localhost:18080/api`.
+ * @returns The API base URL, whose path ends in `/api`, with no trailing
+ *   slash. In a fresh run it is `http://localhost:18080/api`.
  */
 export function apiUrl(): string {
-  const fromEnvironment = process.env['E2E_API_URL'];
-  return withoutTrailingSlash(fromEnvironment || resolveStackTarget().apiUrl);
+  return process.env['E2E_API_URL'] || resolveStackTarget().apiUrl;
 }
 
 /**

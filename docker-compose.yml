@@ -43,7 +43,7 @@ services:
       - db-data:/var/lib/postgresql/data
       - secrets:/run/smarthotel-secrets
       - ./deploy/db/db-entrypoint.sh:/opt/smarthotel/db-entrypoint.sh:ro
-    # No published port: only the api service reaches the product database.
+    # No published port. Only the api service uses the database.
     networks:
       - default
     healthcheck:
@@ -58,6 +58,10 @@ services:
     build:
       context: .
       dockerfile: src/SmartHotel.Api/Dockerfile
+    # Caps the API's memory. The .NET GC derives its heap hard limit (75% of
+    # the container limit) from it; without a limit Server GC sizes its heaps
+    # to the whole host.
+    mem_limit: 1g
     # DB_PASSWORD and Jwt__SigningKey are deliberately absent: the image's
     # entrypoint exports each from its secret file only when the variable is
     # unset, and keeps a value set here, even an empty one.
@@ -120,6 +124,16 @@ services:
   db-test:
     image: postgres:16.16-alpine3.24
     profiles: ["test"]
+    # Value-free server log, as for db: by default an error record carries
+    # DETAIL, which can hold a guest's email, and the failed statement with its
+    # bind parameters. Clients still receive the SQLSTATE, the constraint name
+    # and DETAIL, which the tests and the API's 23505/23P01 translation need.
+    # The image entrypoint passes these options to its init server as well.
+    command: ["postgres",
+      "-c", "log_error_verbosity=terse",
+      "-c", "log_min_error_statement=panic",
+      "-c", "log_parameter_max_length_on_error=0",
+      "-c", "log_parameter_max_length=0"]
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
     tmpfs:

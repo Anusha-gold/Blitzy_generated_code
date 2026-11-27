@@ -4,19 +4,26 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.Server.Kestrel;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
+using SmartHotel.Api.Infrastructure;
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 
 namespace SmartHotel.Api.IntegrationTests.Http;
 
 /// <summary>
 /// The error contract for responses the framework produces rather than an action: routing's 405 and 404, requests
-/// whose <c>Accept</c> header admits no JSON, an unhandled exception, and the 400 for input that fails model binding.
-/// Each must still be an <c>application/problem+json</c> document that keeps its protocol headers and carries no
-/// exception data. A binding 400 also keys its errors only by contract names and JSON paths, and echoes no request
-/// text.
+/// whose <c>Accept</c> header admits no JSON, an unhandled exception, the 400 for input that fails model binding,
+/// and a plaintext request refused outside Development. Each must still be an <c>application/problem+json</c>
+/// document that keeps its protocol headers and carries no exception data. A binding 400 also keys its errors only
+/// by contract names and JSON paths, and echoes no request text.
 /// </summary>
 public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFactory>
 {
@@ -35,6 +42,13 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
     private const string InvalidDateSearchScenario = "invalid-date-search";
     private const string BookingsWithoutTokenScenario = "bookings-without-token";
     private const string UnknownRouteScenario = "unknown-route";
+
+    private const string LoginScenario = "login";
+    private const string BookingsWithTokenScenario = "bookings-with-token";
+    private const string HealthScenario = "health";
+
+    private const string HttpsOnlyDetail = "This API accepts HTTPS requests only.";
+    private const string HttpsWebOrigin = "https://localhost:4200";
 
     private const string SearchGuestsMarkerScenario = "search-guests-marker";
     private const string LoginEmailNumberScenario = "login-email-number";
@@ -203,6 +217,144 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         {
             // Disarmed before the variant is disposed, so the host's shutdown never meets a throwing clock.
             clock.Disarm();
+        }
+    }
+
+    // The Production variant configures no HTTPS port and the in-process server publishes none, so outside Development
+    // HTTPS redirection cannot redirect a plaintext request and passes it on. It must then be refused before CORS and
+    // authentication: credentials, a bearer token and the readiness probe all get the same 403 problem, and the
+    // bookings request never reaches the challenge.
+    [Theory]
+    [InlineData(LoginScenario)]
+    [InlineData(BookingsWithTokenScenario)]
+    [InlineData(HealthScenario)]
+    public async Task PlaintextRequestOutsideDevelopment_Returns403Problem(string scenario)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        await using WebApplicationFactory<Program> production = await StartProductionVariantAsync(
+            new Dictionary<string, string?>(),
+            cancellationToken);
+        ApiTestClient client = new(production.CreateClient(
+            new WebApplicationFactoryClientOptions { AllowAutoRedirect = false }));
+
+        using HttpResponseMessage response = scenario switch
+        {
+            LoginScenario => await client.LoginAsync(
+                new { email = "guest@example.com", password = "not-checked" },
+                cancellationToken),
+            BookingsWithTokenScenario => await client.ListBookingsAsync("not-a-token", cancellationToken),
+            HealthScenario => await client.Http.GetAsync("/api/health", cancellationToken),
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+
+        JsonElement problem = await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.Forbidden,
+            cancellationToken: cancellationToken);
+        Assert.Equal(HttpsOnlyDetail, problem.GetProperty("detail").GetString());
+        Assert.Empty(response.Headers.WwwAuthenticate);
+        Assert.Null(response.Headers.Location);
+    }
+
+    // The same Production host serves a request that arrives over HTTPS: the guard passes it on to the pipeline.
+    [Fact]
+    public async Task HttpsRequestOutsideDevelopment_IsServed()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        await using WebApplicationFactory<Program> production = await StartProductionVariantAsync(
+            new Dictionary<string, string?>(),
+            cancellationToken);
+        HttpClient https = production.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://localhost"),
+            AllowAutoRedirect = false,
+        });
+
+        using HttpResponseMessage response = await https.GetAsync("/api/health", cancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+    }
+
+    // Kestrel reads its listeners and certificates through the API's view of the Kestrel section, where a certificate
+    // password comes from the environment alone. The in-memory settings stand in for appsettings.json and the command
+    // line: the paths and the URL pass through, and neither password from them is answered. The passwords are a marker
+    // unique to the run, and every check that involves a password is a boolean whose failure message holds no value,
+    // so the outcome does not depend on the password variables of the host running the tests and none is ever printed.
+    [Fact]
+    public async Task KestrelConfiguration_TakesCertificatePasswordsOnlyFromEnvironment()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        const string certificatePath = "/run/tls/api.pfx";
+        const string endpointUrl = "https://+:8443";
+        string marker = "from-configuration-" + Guid.NewGuid().ToString("N");
+        string[] certificateSections = ["Certificates:Default", "Endpoints:Https:Certificate"];
+        await using WebApplicationFactory<Program> production = await StartProductionVariantAsync(
+            new Dictionary<string, string?>
+            {
+                ["Kestrel:Certificates:Default:Path"] = certificatePath,
+                ["Kestrel:Certificates:Default:Password"] = marker,
+                ["Kestrel:Endpoints:Https:Url"] = endpointUrl,
+                ["Kestrel:Endpoints:Https:Certificate:Path"] = certificatePath,
+                ["Kestrel:Endpoints:Https:Certificate:Password"] = marker,
+            },
+            cancellationToken);
+
+        KestrelConfigurationLoader? loader =
+            production.Services.GetRequiredService<IOptions<KestrelServerOptions>>().Value.ConfigurationLoader;
+        Assert.NotNull(loader);
+        IConfiguration kestrel = loader.Configuration;
+
+        Assert.Equal(endpointUrl, kestrel["Endpoints:Https:Url"]);
+        foreach (string section in certificateSections)
+        {
+            Assert.Equal(certificatePath, kestrel[ConfigurationPath.Combine(section, "Path")]);
+            string? password = kestrel[ConfigurationPath.Combine(section, "Password")];
+            Assert.False(
+                string.Equals(marker, password, StringComparison.Ordinal),
+                $"The certificate password under {section} came from configuration rather than the environment.");
+
+            // Only key names reach a failure message: the environment may add a Password child, which must not carry
+            // the configured value.
+            IConfigurationSection[] children = [.. kestrel.GetSection(section).GetChildren()];
+            Assert.Contains("Path", children.Select(static child => child.Key));
+            Assert.False(
+                children.Any(child => string.Equals(marker, child.Value, StringComparison.Ordinal)),
+                $"A child of {section} carries the certificate password from configuration.");
+        }
+    }
+
+    // The class's host in the Production environment, on the same, already migrated and seeded database. Outside
+    // Development the API accepts only an https web origin, so one is added in memory after the factory's own, together
+    // with any further settings; no process environment variable is set or read. HTTPS redirection takes its port from
+    // HTTPS_PORT or ANCM_HTTPS_PORT in the configuration, which the environment of the host running the tests can
+    // supply, ASPNETCORE_HTTPS_PORT among others, before it asks the server. Both are pinned empty in memory, which
+    // names no port, and the in-process server publishes no addresses, so redirection never finds a port. Reading
+    // Server builds and starts the host, and Task.Run keeps that synchronous start off xUnit's synchronization context.
+    private async Task<WebApplicationFactory<Program>> StartProductionVariantAsync(
+        Dictionary<string, string?> settings,
+        CancellationToken cancellationToken)
+    {
+        settings[ConfigurationPath.Combine(ApiCorsOptions.SectionName, nameof(ApiCorsOptions.AllowedOrigin))] =
+            HttpsWebOrigin;
+        settings["HTTPS_PORT"] = "";
+        settings["ANCM_HTTPS_PORT"] = "";
+        WebApplicationFactory<Program> variant = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Production");
+            builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(settings));
+        });
+
+        try
+        {
+            await Task.Run(() => _ = variant.Server, cancellationToken);
+            return variant;
+        }
+        catch
+        {
+            await variant.DisposeAsync();
+            throw;
         }
     }
 

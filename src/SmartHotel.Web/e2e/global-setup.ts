@@ -19,10 +19,30 @@
  * (no `@types/node`; `tsconfig.app.json` excludes `e2e/**`). It uses Node's
  * built-in modules and globals only.
  *
- * Nothing here prints an environment value: the Compose child receives the
- * environment but no message names a variable's value, and the stack's
- * secrets are generated inside the `db` container, so Compose output, which
- * is printed on failure, never holds them.
+ * What it passes and prints:
+ * - It passes Compose no secret of its own. The child environment drops every
+ *   `SMARTHOTEL_*` first-start override and sets only the two acceptance
+ *   ports; every other variable passes through unchanged, so the Docker CLI
+ *   keeps working. The stack's secrets are generated inside the `db`
+ *   container and are never supplied here.
+ * - Its own messages never print a raw `E2E_*` setting or the text of a
+ *   caught error. They hold only fixed text, the project name, the acceptance
+ *   and lock ports, the target URLs in the canonical form
+ *   `./support/stack-target` validated them into (scheme, host, port and
+ *   path, never a user name, password, query or fragment), HTTP statuses,
+ *   validated error codes such as `ECONNREFUSED`, the manual removal command
+ *   with this checkout's paths, and the process id, start time and checkout
+ *   path the run owning the lock reports, with control characters removed.
+ * - When a Compose command fails, its output is printed filtered, limited to
+ *   the last 200 lines of at most 500 characters, and with every line
+ *   prefixed `  compose | ` so it cannot pass for a message of this setup.
+ *   The filter removes control characters and escape sequences and redacts
+ *   what its patterns recognize: credential headers and key-value pairs,
+ *   connection strings, bearer and basic credentials, JWTs, URL user
+ *   information, queries and fragments, email addresses, long mixed-case
+ *   tokens and the values of the child's credential-named environment
+ *   variables. Because it is pattern-based, that output can still contain
+ *   sensitive text it does not recognize.
  */
 import { spawn } from 'node:child_process';
 import * as net from 'node:net';
@@ -72,6 +92,34 @@ const PROBE_REQUEST_TIMEOUT_MS = 10_000;
 /** Upper bound for one TCP connection attempt of the port check. */
 const PORT_CHECK_TIMEOUT_MS = 1_000;
 
+/** The most lines of a failed command's output that are printed: its last ones. */
+const COMPOSE_OUTPUT_MAX_LINES = 200;
+
+/** The most characters of one output line that are printed. */
+const COMPOSE_OUTPUT_MAX_LINE_LENGTH = 500;
+
+/**
+ * Prefix of every printed output line, so text from the child process cannot
+ * pass for a message of this setup.
+ */
+const COMPOSE_OUTPUT_PREFIX = '  compose | ';
+
+/** What a redacted piece of output is replaced with. */
+const REDACTED = '<redacted>';
+
+/**
+ * Names of the Compose child's environment variables whose values are
+ * redacted wherever they appear in printed output, outside the project's own
+ * Compose names.
+ */
+const SENSITIVE_VARIABLE_NAME = /PASS|SECRET|TOKEN|KEY|CRED|AUTH/i;
+
+/**
+ * The shortest environment value redacted by its exact text; a shorter one
+ * would also match ordinary words.
+ */
+const MIN_REDACTED_VALUE_LENGTH = 6;
+
 /** Resolves after `ms` milliseconds. */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -84,68 +132,554 @@ function errorCode(err: unknown): unknown {
     : undefined;
 }
 
+/** Reads the `name` property of an error, such as `TimeoutError`, if it has one. */
+function errorName(err: unknown): unknown {
+  return typeof err === 'object' && err !== null && 'name' in err
+    ? (err as { name: unknown }).name
+    : undefined;
+}
+
+/** Reads the `cause` property of an error, if it has one. */
+function errorCause(err: unknown): unknown {
+  return typeof err === 'object' && err !== null && 'cause' in err
+    ? (err as { cause: unknown }).cause
+    : undefined;
+}
+
+/** The shape of a Node.js error code, such as `ECONNREFUSED` or `UND_ERR_SOCKET`. */
+const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
+
 /**
- * Describes a failure in one line, without headers, bodies or environment
- * values.
+ * Returns the `code` of a Node.js system error when it has the shape of an
+ * error code, so a message can name it without repeating any foreign text.
  */
-function describeFailure(err: unknown): string {
-  if (!(err instanceof Error)) {
-    return String(err);
+function validatedErrorCode(err: unknown): string | undefined {
+  const code = errorCode(err);
+  return typeof code === 'string' && ERROR_CODE_PATTERN.test(code) ? code : undefined;
+}
+
+/**
+ * Formats the validated code of `err` for the end of a fixed message, as
+ * ` (EADDRNOTAVAIL)`, or returns an empty string when it has none.
+ */
+function errorCodeNote(err: unknown): string {
+  const code = validatedErrorCode(err);
+  return code === undefined ? '' : ` (${code})`;
+}
+
+/** Plain-language labels for the network error codes a probe meets most often. */
+const NETWORK_ERROR_LABELS = new Map<string, string>([
+  ['ECONNREFUSED', 'connection refused'],
+  ['ECONNRESET', 'connection reset'],
+  ['ENOTFOUND', 'host not found'],
+  ['EAI_AGAIN', 'host lookup failed'],
+  ['ETIMEDOUT', 'connection timed out'],
+  ['UND_ERR_CONNECT_TIMEOUT', 'connection timed out'],
+  ['EHOSTUNREACH', 'host unreachable'],
+  ['ENETUNREACH', 'network unreachable'],
+]);
+
+/**
+ * Describes a failed probe request as a fixed category: a timeout, a network
+ * error with its validated code, or a plain network error. The error's own
+ * message and its cause's message are never used, because they can quote the
+ * request, the resolved addresses or other foreign text.
+ */
+function describeProbeFailure(err: unknown): string {
+  const cause = errorCause(err);
+  if ([err, cause].some((e) => errorName(e) === 'TimeoutError' || errorName(e) === 'AbortError')) {
+    return `no response within ${PROBE_REQUEST_TIMEOUT_MS / 1_000} s`;
   }
-  // fetch reports every network failure as "fetch failed" and keeps the
-  // socket error, such as ECONNREFUSED, in `cause`. When several addresses
-  // fail, Node can raise an AggregateError with an empty message, so its code
-  // stands in.
-  const cause = (err as { cause?: unknown }).cause;
-  const detail = cause instanceof Error ? cause.message || String(errorCode(cause) ?? '') : '';
-  return detail ? `${err.message}: ${detail}` : err.message;
+  // fetch reports every network failure as a TypeError and keeps the socket
+  // error, such as ECONNREFUSED, in `cause`. When several addresses fail, the
+  // cause can be an AggregateError whose own errors carry the code.
+  const nested = typeof cause === 'object' && cause !== null && 'errors' in cause
+    ? (cause as { errors: unknown }).errors
+    : undefined;
+  const candidates = [cause, ...(Array.isArray(nested) ? nested : []), err];
+  for (const candidate of candidates) {
+    const code = validatedErrorCode(candidate);
+    if (code !== undefined) {
+      return `${NETWORK_ERROR_LABELS.get(code) ?? 'network error'} (${code})`;
+    }
+  }
+  return 'network error';
+}
+
+/** Tells whether a code point is a Unicode bidirectional control, which reorders the text shown. */
+function isBidiControl(code: number): boolean {
+  return (
+    code === 0x061c ||
+    code === 0x200e ||
+    code === 0x200f ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069)
+  );
+}
+
+/**
+ * Splits `text` into display lines with every terminal escape sequence and
+ * control character removed.
+ *
+ * LF, CR, CR LF, U+2028 and U+2029 each end a line, so a carriage return
+ * cannot overwrite a printed line. Tab is kept. ESC and CSI sequences are
+ * dropped whole, and so are OSC, DCS, SOS, PM and APC strings up to their
+ * terminator or the end of the line. Every other C0 or C1 control character,
+ * DEL and the Unicode bidirectional controls are dropped.
+ */
+function splitDisplayLines(text: string): string[] {
+  const lines: string[] = [];
+  let line = '';
+  let state: 'text' | 'escape' | 'csi' | 'string' | 'stringEscape' = 'text';
+  let afterCarriageReturn = false;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    // A line break ends the line in every state, so an unterminated sequence
+    // cannot swallow the rest of the output.
+    if (code === 0x0a || code === 0x0d || code === 0x2028 || code === 0x2029) {
+      if (code !== 0x0a || !afterCarriageReturn) {
+        lines.push(line);
+        line = '';
+      }
+      afterCarriageReturn = code === 0x0d;
+      state = 'text';
+      continue;
+    }
+    afterCarriageReturn = false;
+
+    if (state === 'stringEscape') {
+      // ESC \ ends a string; ESC and any other character ends it and starts
+      // a new escape sequence with that character.
+      state = ch === '\\' ? 'text' : 'escape';
+      if (state === 'text') {
+        continue;
+      }
+    }
+    if (state === 'string') {
+      if (code === 0x1b) {
+        state = 'stringEscape';
+      } else if (code === 0x07 || code === 0x9c) {
+        state = 'text';
+      }
+      continue;
+    }
+    if (state === 'escape') {
+      if (ch === '[') {
+        state = 'csi';
+      } else if (ch === ']' || ch === 'P' || ch === 'X' || ch === '^' || ch === '_') {
+        state = 'string';
+      } else if (code !== 0x1b && (code < 0x20 || code > 0x2f)) {
+        // A final character ends the sequence; intermediates keep it open.
+        state = 'text';
+      }
+      continue;
+    }
+    if (state === 'csi') {
+      if (code >= 0x20 && code <= 0x3f) {
+        continue;
+      }
+      state = 'text';
+      if (code >= 0x40 && code <= 0x7e) {
+        continue;
+      }
+      // Any other character aborts the sequence and is read as text.
+    }
+
+    if (code === 0x1b) {
+      state = 'escape';
+    } else if (code === 0x9b) {
+      state = 'csi';
+    } else if (code === 0x90 || code === 0x98 || code === 0x9d || code === 0x9e || code === 0x9f) {
+      state = 'string';
+    } else if (
+      code === 0x09 ||
+      (code >= 0x20 && code !== 0x7f && (code < 0x80 || code > 0x9f) && !isBidiControl(code))
+    ) {
+      line += ch;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+/** Escapes `text` so a regular expression matches it literally. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Pattern source for the acceptance project name and the names Compose
+ * derives from it: containers `<project>-<service>-<n>`, images
+ * `<project>-<service>`, volumes `<project>_<volume>` and networks such as
+ * `<project>_default`. Compose writes them in lower case.
+ */
+const PROJECT_NAME_SOURCE = String.raw`${escapeRegExp(ACCEPTANCE_PROJECT)}(?:[-_][a-z0-9]+)*(?![A-Za-z0-9_-])`;
+
+/**
+ * The Compose names this setup itself determines: the project name and the
+ * names derived from it ({@link PROJECT_NAME_SOURCE}), and the service names
+ * db, api and web where they stand as words of their own, as in
+ * `service "db"` or `[api build 3/9]`.
+ */
+const COMPOSE_IDENTIFIER_PATTERN = new RegExp(
+  String.raw`(?<![A-Za-z0-9_.-])${PROJECT_NAME_SOURCE}|(?<=^|[\s"'[(])(?:db|api|web)(?=$|[\s"'\]):,])`,
+  'g',
+);
+
+/**
+ * Collects the exact values to redact from printed output: the values of the
+ * credential-named variables ({@link SENSITIVE_VARIABLE_NAME}) in the
+ * environment the Compose child receives, as {@link composeEnvironment}
+ * builds it. A variable this process holds but the child never receives,
+ * such as a dropped `SMARTHOTEL_*` first-start override, cannot appear in the
+ * child's output and is not collected. Each value contributes every one of
+ * its display lines, as {@link splitDisplayLines} prints them, trimmed; a
+ * piece shorter than {@link MIN_REDACTED_VALUE_LENGTH} is left out. The
+ * longest come first, so a value that contains another is replaced whole.
+ */
+function sensitiveEnvironmentValues(): string[] {
+  const values = new Set<string>();
+  for (const [name, value] of Object.entries(composeEnvironment())) {
+    if (!SENSITIVE_VARIABLE_NAME.test(name)) {
+      continue;
+    }
+    for (const piece of splitDisplayLines(value)) {
+      const trimmed = piece.trim();
+      if (trimmed.length >= MIN_REDACTED_VALUE_LENGTH) {
+        values.add(trimmed);
+      }
+    }
+  }
+  return [...values].sort((a, b) => b.length - a.length);
+}
+
+/** Replaces every occurrence of each of `values` in `text`. */
+function redactValues(text: string, values: string[]): string {
+  let result = text;
+  for (const value of values) {
+    result = result.split(value).join(REDACTED);
+  }
+  return result;
+}
+
+/**
+ * Replaces every occurrence of each of `values` in one display line, outside
+ * the {@link COMPOSE_IDENTIFIER_PATTERN} matches: the line is split around
+ * them and only the text between them is searched, so a value that equals
+ * the project name, or part of a container, volume or network name, never
+ * masks that name. A value anywhere else is still replaced.
+ */
+function redactValuesOutsideIdentifiers(line: string, values: string[]): string {
+  if (values.length === 0) {
+    return line;
+  }
+  let result = '';
+  let segmentStart = 0;
+  for (const match of line.matchAll(COMPOSE_IDENTIFIER_PATTERN)) {
+    const start = match.index ?? segmentStart;
+    result += `${redactValues(line.slice(segmentStart, start), values)}${match[0]}`;
+    segmentStart = start + match[0].length;
+  }
+  return `${result}${redactValues(line.slice(segmentStart), values)}`;
+}
+
+/**
+ * Removes the user information, query and fragment of one URL, keeping its
+ * scheme, host, port and path.
+ */
+function redactUrl(url: string): string {
+  const authorityStart = url.indexOf('://') + 3;
+  let rest = url.slice(authorityStart);
+  const authorityEnd = rest.search(/[/?#]/);
+  const authority = authorityEnd === -1 ? rest : rest.slice(0, authorityEnd);
+  const userInfoEnd = authority.lastIndexOf('@');
+  if (userInfoEnd !== -1) {
+    rest = `${REDACTED}${rest.slice(userInfoEnd)}`;
+  }
+  const queryStart = rest.search(/[?#]/);
+  if (queryStart !== -1) {
+    rest = `${rest.slice(0, queryStart + 1)}${REDACTED}`;
+  }
+  return `${url.slice(0, authorityStart)}${rest}`;
+}
+
+/**
+ * Pattern source for a key that marks its value as a credential: it contains
+ * `auth` (as in Authorization, Proxy-Authorization, X-Registry-Auth,
+ * X-Auth-Token or WWW-Authenticate), `token`, `secret`, `passw`, `pwd`,
+ * `credential`, `cookie` or `session`, or names an API, access, private or
+ * signing key, with `-`, `_`, a space or nothing before `key`. One of the
+ * project's own Compose names is never such a key, so the text after a volume
+ * such as `smarthotel-acceptance_secrets:` stays readable.
+ */
+const CREDENTIAL_KEY_SOURCE = String.raw`(?!${PROJECT_NAME_SOURCE}["']?\s*[:=])(?:(?=[A-Za-z0-9_.-]*(?:auth|token|secret|passw|pwd|credential|cookie|session|(?:api|access|private|signing)[-_]?key))[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]*(?:api|access|private|signing) key)`;
+
+/**
+ * Pattern source for the start of a `key: value` or `key=value` pair with a
+ * credential key, which may be quoted (`"key": "value"`, `'key'='value'`).
+ * It starts only where a token starts.
+ */
+const CREDENTIAL_LABEL_SOURCE = String.raw`(?<![A-Za-z0-9_.-])(["']?${CREDENTIAL_KEY_SOURCE}["']?\s*[:=]\s*)`;
+
+/**
+ * An `Authorization` header, or one whose name ends in it such as
+ * `Proxy-Authorization`, with an unquoted value, which is redacted to the end
+ * of the line.
+ */
+const AUTHORIZATION_HEADER = /(?<![A-Za-z0-9_.-])(["']?[A-Za-z0-9_.-]*authorization["']?\s*[:=]\s*)(?!["'\s])\S.*$/gi;
+
+/**
+ * A credential pair whose unquoted value is an authentication scheme followed
+ * by a credential, such as `X-Auth: Bearer …` or `X-Registry-Auth: Token …`,
+ * which is redacted to the end of the line.
+ */
+const SCHEME_CREDENTIAL = new RegExp(
+  String.raw`${CREDENTIAL_LABEL_SOURCE}(?:basic|bearer|digest|negotiate|ntlm|kerberos|oauth|token|dpop|gnap|hoba|mutual|privatetoken|concealed|vapid|scram-sha-\d+|aws4-hmac-sha256)\s+\S.*$`,
+  'gi',
+);
+
+/**
+ * A credential pair and its value: a quoted value to its closing quote, or to
+ * the end of the line when it has none, with backslash escapes; otherwise one
+ * run of non-space characters. Groups: the label, the opening quote, the
+ * quoted text and the closing quote.
+ */
+const CREDENTIAL_PAIR = new RegExp(
+  String.raw`${CREDENTIAL_LABEL_SOURCE}(?:(["'])((?:(?!\2)[^\\]|\\.)*)(\2?)|\S+)`,
+  'gi',
+);
+
+/**
+ * A run of two or more `key=value` pairs separated by `;`, the shape of an
+ * ADO.NET, Npgsql or ODBC connection string. A key after a `;` may hold
+ * spaces; the first one may be `Data Source`, `User Id` or `Initial Catalog`
+ * or a single word, so the words before a connection string stay out of it.
+ * The first value is bounded and holds no `=` but trailing base64 padding,
+ * so text with many `=` and no `;` is scanned in linear time.
+ */
+const KEY_VALUE_RUN = /(?<![A-Za-z0-9_.-])(?:data\s+source|user\s+id|initial\s+catalog|[A-Za-z][\w.-]{0,63})\s*=[^;=]{0,256}=*(?:;\s*[A-Za-z][\w\s.-]{0,63}=[^;]*)+;?/gi;
+
+/**
+ * The keys, lower-cased with single spaces, that make a {@link KEY_VALUE_RUN}
+ * a connection string.
+ */
+const CONNECTION_STRING_KEYS = new Set([
+  'host',
+  'server',
+  'data source',
+  'address',
+  'user id',
+  'user',
+  'username',
+  'uid',
+  'password',
+  'pwd',
+  'database',
+  'initial catalog',
+  'port',
+]);
+
+/** What a recognized connection string is replaced with, whole. */
+const REDACTED_CONNECTION_STRING = '<redacted connection string>';
+
+/**
+ * A run of at least 24 characters of the base64 and base64url alphabets,
+ * delimited by any other character, such as `/`, `.`, `:`, `@` or a space.
+ */
+const TOKEN_RUN = /(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=_-]{24,}(?![A-Za-z0-9+=_-])/g;
+
+/**
+ * Replaces a {@link KEY_VALUE_RUN} whole when any of its keys is in
+ * {@link CONNECTION_STRING_KEYS}, and leaves it unchanged otherwise.
+ */
+function redactConnectionString(run: string): string {
+  const isConnectionString = run.split(';').some((pair) => {
+    const key = pair.split('=', 1)[0].trim().replace(/\s+/g, ' ').toLowerCase();
+    return CONNECTION_STRING_KEYS.has(key);
+  });
+  return isConnectionString ? REDACTED_CONNECTION_STRING : run;
+}
+
+/**
+ * Replaces a {@link TOKEN_RUN} that mixes upper-case letters, lower-case
+ * letters and digits, the shape of a generated key, token or encoded
+ * credential. Lower-case hexadecimal, such as a container id or a `sha256`
+ * digest, and ordinary words are kept.
+ */
+function redactTokenRun(run: string): string {
+  return /[A-Z]/.test(run) && /[a-z]/.test(run) && /[0-9]/.test(run) ? REDACTED : run;
+}
+
+/**
+ * Redacts the credential-shaped parts of one display line, in this order.
+ * Every pattern starts only where a token starts, and a redacted value keeps
+ * the key, scheme or URL part in front of it that shows what was removed:
+ *
+ * - an unquoted `Authorization` or `Proxy-Authorization` value, and an
+ *   unquoted credential-key value that starts with an authentication scheme,
+ *   to the end of the line;
+ * - URL user information, query and fragment;
+ * - connection strings, replaced whole;
+ * - `Bearer` and `Basic` credentials;
+ * - JWT-shaped strings;
+ * - the value of every other `key: value` or `key=value` pair with a
+ *   credential key, quoted or not ({@link CREDENTIAL_KEY_SOURCE});
+ * - email addresses. An image reference such as `postgres:16@sha256:…` has no
+ *   dotted domain after its `@` and is kept;
+ * - runs of 24 or more base64 or base64url characters that mix upper-case
+ *   letters, lower-case letters and digits.
+ *
+ * Every pattern is bounded to run in time linear in the line's length, so an
+ * arbitrarily long line is filtered before it is cut. Text that matches none
+ * of them is kept.
+ */
+function redactLine(line: string): string {
+  return line
+    .replace(AUTHORIZATION_HEADER, `$1${REDACTED}`)
+    .replace(SCHEME_CREDENTIAL, `$1${REDACTED}`)
+    .replace(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/\S*/gi, (url) => redactUrl(url))
+    .replace(KEY_VALUE_RUN, (run) => redactConnectionString(run))
+    .replace(/\b(bearer|basic)(\s+)[A-Za-z0-9._~+/-]+=*/gi, `$1$2${REDACTED}`)
+    .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, REDACTED)
+    .replace(
+      CREDENTIAL_PAIR,
+      (_pair: string, label: string, quote?: string, _text?: string, closing?: string) =>
+        quote === undefined ? `${label}${REDACTED}` : `${label}${quote}${REDACTED}${closing ?? ''}`,
+    )
+    .replace(
+      /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g,
+      REDACTED,
+    )
+    .replace(TOKEN_RUN, (run) => redactTokenRun(run));
+}
+
+/** Shortens a line to {@link COMPOSE_OUTPUT_MAX_LINE_LENGTH} characters, marking the cut. */
+function truncateLine(line: string): string {
+  const characters = Array.from(line);
+  return characters.length > COMPOSE_OUTPUT_MAX_LINE_LENGTH
+    ? `${characters.slice(0, COMPOSE_OUTPUT_MAX_LINE_LENGTH).join('')} [line truncated]`
+    : line;
+}
+
+/**
+ * Renders text another process supplied, such as the lock owner's checkout
+ * path, as one printable line: control characters and escape sequences are
+ * removed as {@link splitDisplayLines} removes them, its lines are joined with
+ * a space, and the result is cut as {@link truncateLine} cuts it.
+ */
+function displayText(text: string): string {
+  return truncateLine(splitDisplayLines(text).join(' '));
+}
+
+/**
+ * Filters a Compose command's output for printing, line by line:
+ * {@link splitDisplayLines} removes control characters and escape sequences;
+ * {@link redactValuesOutsideIdentifiers} replaces the exact values
+ * {@link sensitiveEnvironmentValues} collects from the child's environment,
+ * everywhere but inside the project's own Compose names; {@link redactLine}
+ * redacts credential-shaped text; and only the last
+ * {@link COMPOSE_OUTPUT_MAX_LINES} lines are kept, each cut to
+ * {@link COMPOSE_OUTPUT_MAX_LINE_LENGTH} characters after it is redacted.
+ *
+ * Every line is kept, redacted where a rule matches, because a failed command
+ * is diagnosed from its output. The filter is pattern-based, so that output
+ * can still hold sensitive text no rule recognizes.
+ *
+ * @returns The printable lines and the count of earlier lines left out.
+ */
+function filterComposeOutput(output: string): { lines: string[]; omitted: number } {
+  const values = sensitiveEnvironmentValues();
+  const all = splitDisplayLines(output);
+  while (all.length > 0 && all[all.length - 1].trim() === '') {
+    all.pop();
+  }
+  const kept = all.slice(-COMPOSE_OUTPUT_MAX_LINES);
+  return {
+    lines: kept.map((line) => truncateLine(redactLine(redactValuesOutsideIdentifiers(line, values)))),
+    omitted: all.length - kept.length,
+  };
+}
+
+/**
+ * Prints a failed Compose command: a header naming the operation, exit code
+ * and project, then the command's output as {@link filterComposeOutput}
+ * leaves it, every line prefixed with {@link COMPOSE_OUTPUT_PREFIX}.
+ *
+ * @param operation - The Compose subcommand and its arguments, as run.
+ * @param result - The command's outcome.
+ */
+function printComposeFailure(operation: string, result: ComposeResult): void {
+  const { lines, omitted } = filterComposeOutput(result.output);
+  const report = [
+    `docker compose ${operation} exited with code ${result.code} for project ${ACCEPTANCE_PROJECT}; its output follows, filtered by pattern (recognized credentials, tokens, connection strings, URL queries and email addresses redacted; control characters removed):`,
+  ];
+  if (omitted > 0) {
+    report.push(`${COMPOSE_OUTPUT_PREFIX}[${omitted} earlier line${omitted === 1 ? '' : 's'} omitted]`);
+  }
+  if (lines.length === 0) {
+    report.push(`${COMPOSE_OUTPUT_PREFIX}[no output]`);
+  }
+  for (const line of lines) {
+    report.push(`${COMPOSE_OUTPUT_PREFIX}${line}`);
+  }
+  console.error(report.join('\n'));
+}
+
+/**
+ * Builds the error for a Compose command that could not be started. The
+ * message is fixed text with at most the error's validated code, never the
+ * system's own message, which can quote the arguments or the environment.
+ * The validated code is kept as the error's `code`.
+ */
+function composeStartFailure(args: string[], err: unknown): Error {
+  const code = validatedErrorCode(err);
+  const message =
+    code === 'ENOENT'
+      ? 'The docker CLI was not found on PATH. The acceptance stack needs Docker Engine 28.0 or later with Docker Compose v2.1.1 or later.'
+      : `Could not run "docker compose ${args.join(' ')}" for project ${ACCEPTANCE_PROJECT}${code === undefined ? '' : ` (${code})`}.`;
+  return Object.assign(new Error(message), { code });
 }
 
 /**
  * Runs one Compose command on the acceptance project, from the repository
  * root, with the neutralized Compose environment. Output is collected, not
- * streamed, so it is printed once and only when a command fails.
+ * streamed, so it is printed once, filtered by {@link printComposeFailure},
+ * and only when a command fails.
  *
  * @param root - The repository root.
  * @param args - The Compose subcommand and its arguments.
  * @returns The exit code and the collected output.
- * @throws Error when `docker` cannot be started at all.
+ * @throws Error when `docker` cannot be started at all. Its message is fixed
+ *   text with at most a validated error code, such as `EACCES`, never the
+ *   system's own message.
  */
 function runCompose(root: string, args: string[]): Promise<ComposeResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('docker', composeArgs(root, ...args), {
-      cwd: root,
-      env: composeEnvironment(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const chunks: string[] = [];
-    const collect = (chunk: string) => chunks.push(chunk);
-    // Decoding on the stream keeps a multi-byte character split across two
-    // chunks intact.
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
-    child.on('error', (err: unknown) => {
-      if (errorCode(err) === 'ENOENT') {
-        reject(
-          new Error(
-            'The docker CLI was not found on PATH. The acceptance stack needs Docker Engine 28.0 or later with Docker Compose v2.1.1 or later.',
-          ),
-        );
-        return;
-      }
-      reject(
-        new Error(
-          `Could not run "docker compose ${args.join(' ')}" for project ${ACCEPTANCE_PROJECT}: ${describeFailure(err)}`,
-        ),
-      );
-    });
-    // A promise settles once, so a 'close' that follows a spawn 'error'
-    // changes nothing.
-    child.on('close', (code: number | null) => {
-      resolve({ code: code ?? 1, output: chunks.join('') });
-    });
+    try {
+      const child = spawn('docker', composeArgs(root, ...args), {
+        cwd: root,
+        env: composeEnvironment(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const chunks: string[] = [];
+      const collect = (chunk: string) => chunks.push(chunk);
+      // Decoding on the stream keeps a multi-byte character split across two
+      // chunks intact.
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', collect);
+      child.stderr.on('data', collect);
+      child.on('error', (err: unknown) => reject(composeStartFailure(args, err)));
+      // A promise settles once, so a 'close' that follows a spawn 'error'
+      // changes nothing.
+      child.on('close', (code: number | null) => {
+        resolve({ code: code ?? 1, output: chunks.join('') });
+      });
+    } catch (err) {
+      // spawn throws synchronously on an invalid argument or environment
+      // entry, with a message that can quote it.
+      reject(composeStartFailure(args, err));
+    }
   });
 }
 
@@ -206,26 +740,42 @@ async function isPortInUse(port: number): Promise<boolean> {
   return accepted.includes(true);
 }
 
+/** The statuses fetch treats as redirects. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
 /**
- * Requires `url` to answer `200`, and with `expectBody` as its trimmed body
- * when given, within {@link PROBE_ATTEMPTS} attempts.
+ * Requires `url` itself to answer `200`, and with `expectBody` as its trimmed
+ * body when given, within {@link PROBE_ATTEMPTS} attempts. Redirects are not
+ * followed: a `3xx` answer is a failed attempt, so only the named endpoint can
+ * pass and no other destination is contacted.
  *
- * @param url - The absolute URL to request.
+ * @param stack - The stack's name at the start of the failure message, for
+ *   example `The reused stack (E2E_REUSE_STACK=1)`.
+ * @param url - The absolute URL to request. It is built from a canonical
+ *   {@link StackTarget}, so it holds only a scheme, host, port and path.
  * @param expectBody - The exact trimmed body required, if any.
- * @throws Error naming the URL and the last failure (a status code or an error
- *   message) when every attempt fails.
+ * @throws Error naming the stack, the URL and the last failure as a fixed
+ *   category (an HTTP status, a redirect, a missing body, a timeout or a
+ *   network error with its validated code) when every attempt fails.
  */
-async function probe(url: string, expectBody?: string): Promise<void> {
+async function probe(stack: string, url: string, expectBody?: string): Promise<void> {
   let reason = '';
   for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt += 1) {
     if (attempt > 1) {
       await delay(PROBE_INTERVAL_MS);
     }
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(PROBE_REQUEST_TIMEOUT_MS) });
+      const response = await fetch(url, {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(PROBE_REQUEST_TIMEOUT_MS),
+      });
       // Reading the body on every path releases the connection.
       const body = await response.text();
-      if (response.status !== 200) {
+      if (response.type === 'opaqueredirect' || response.status === 0) {
+        reason = 'redirect, which the probe does not follow';
+      } else if (REDIRECT_STATUSES.has(response.status)) {
+        reason = `HTTP ${response.status} redirect, which the probe does not follow`;
+      } else if (response.status !== 200) {
         reason = `HTTP ${response.status}`;
       } else if (expectBody !== undefined && body.trim() !== expectBody) {
         reason = `HTTP 200 without the expected "${expectBody}" body`;
@@ -233,19 +783,21 @@ async function probe(url: string, expectBody?: string): Promise<void> {
         return;
       }
     } catch (err) {
-      reason = describeFailure(err);
+      reason = describeProbeFailure(err);
     }
   }
-  throw new Error(`The acceptance stack is not reachable at ${url} (${reason}).`);
+  throw new Error(`${stack} is not reachable at ${url} (${reason}).`);
 }
 
 /**
  * Confirms the pair the specs target: the API readiness probe answers
- * `Healthy` and the web root answers `200`.
+ * `Healthy` and the web root answers `200`. A failure names the reused stack
+ * in reuse mode and the acceptance stack otherwise.
  */
 async function probeTarget(target: StackTarget): Promise<void> {
-  await probe(`${target.apiUrl}/health`, 'Healthy');
-  await probe(`${target.baseUrl}/`);
+  const stack = target.reuse ? 'The reused stack (E2E_REUSE_STACK=1)' : 'The acceptance stack';
+  await probe(stack, `${target.apiUrl}/health`, 'Healthy');
+  await probe(stack, `${target.baseUrl}/`);
 }
 
 /**
@@ -339,12 +891,14 @@ async function removeFailedStack(root: string): Promise<void> {
   try {
     const result = await runCompose(root, DOWN_ARGS);
     if (result.code !== 0) {
-      console.error(result.output);
+      printComposeFailure(DOWN_ARGS.join(' '), result);
       console.error(`Removing the failed ${ACCEPTANCE_PROJECT} stack also failed. ${manualRemovalHint(root)}`);
     }
   } catch (err) {
+    // runCompose rejects with fixed text; only its validated code is repeated.
+    const code = validatedErrorCode(err);
     console.error(
-      `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed (${describeFailure(err)}). ${manualRemovalHint(root)}`,
+      `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed (docker compose could not be started${code === undefined ? '' : `, ${code}`}). ${manualRemovalHint(root)}`,
     );
   }
 }
@@ -491,9 +1045,9 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
     socket.end(record);
   });
   // Errors after 'listening', such as a failed accept, leave the port held.
-  // The message names only the address and the failure.
+  // The message names only the address and the failure's validated code.
   const reportServerError = (err: unknown) => {
-    console.error(`The acceptance-run lock on ${lockAddress} reported an error and stays held: ${describeFailure(err)}`);
+    console.error(`The acceptance-run lock on ${lockAddress} reported an error${errorCodeNote(err)} and stays held.`);
   };
 
   try {
@@ -509,13 +1063,13 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
   } catch (err) {
     if (errorCode(err) !== 'EADDRINUSE') {
       throw new Error(
-        `Could not listen on ${lockAddress}, which a fresh acceptance run holds while it owns the ${ACCEPTANCE_PROJECT} stack: ${describeFailure(err)}`,
+        `Could not listen on ${lockAddress}, which a fresh acceptance run holds while it owns the ${ACCEPTANCE_PROJECT} stack${errorCodeNote(err)}.`,
       );
     }
     const holder = parseLockOwner(await readLockReply());
     if (holder !== undefined) {
       throw new Error(
-        `Another fresh acceptance run owns the ${ACCEPTANCE_PROJECT} stack (pid ${holder.pid}, started ${holder.startedAt}, from ${holder.root}). Wait for it to finish and run the tests again.`,
+        `Another fresh acceptance run owns the ${ACCEPTANCE_PROJECT} stack (pid ${holder.pid}, started ${displayText(holder.startedAt)}, from ${displayText(holder.root)}). Wait for it to finish and run the tests again.`,
       );
     }
     throw new Error(
@@ -538,7 +1092,7 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
       clients.clear();
     } catch (err) {
       console.error(
-        `Could not close the acceptance-run lock on ${lockAddress} (${describeFailure(err)}); it is freed when this run ends.`,
+        `Could not close the acceptance-run lock on ${lockAddress}${errorCodeNote(err)}; it is freed when this run ends.`,
       );
     }
   };
@@ -573,7 +1127,9 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * Reuse mode (`E2E_REUSE_STACK=1`) is for local iteration. It takes no lock,
  * makes no Compose call and only probes the stack at `E2E_BASE_URL` and
  * `E2E_API_URL` (defaults `http://localhost:4200` and
- * `http://localhost:8080/api`).
+ * `http://localhost:8080/api`), as {@link resolveStackTarget} validated and
+ * canonicalized them, following no redirect. It then prints the canonical
+ * pair.
  *
  * @returns In fresh mode, the global teardown Playwright runs after the
  *   suite: it releases the lock and leaves the stack running. In reuse mode,
@@ -581,7 +1137,8 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * @throws Error when another fresh run owns the acceptance stack, another
  *   program holds the lock port or it cannot be listened on, Docker or
  *   Compose is unavailable or fails, an acceptance port is taken, or the
- *   target does not answer; the message says which.
+ *   target does not answer; the message says which. A failed Compose
+ *   command's filtered output is printed before the throw.
  */
 export default async function globalSetup(): Promise<(() => Promise<void>) | void> {
   const target = resolveStackTarget();
@@ -624,7 +1181,7 @@ async function buildAcceptanceStack(root: string, target: StackTarget): Promise<
 
   const down = await runCompose(root, DOWN_ARGS);
   if (down.code !== 0) {
-    console.error(down.output);
+    printComposeFailure(DOWN_ARGS.join(' '), down);
     throw new Error(
       `docker compose down failed for project ${ACCEPTANCE_PROJECT}; is the Docker daemon running?`,
     );
@@ -650,7 +1207,7 @@ async function buildAcceptanceStack(root: string, target: StackTarget): Promise<
   console.log('Building images and starting db, api and web; a first build can take several minutes.');
   const up = await runCompose(root, UP_ARGS);
   if (up.code !== 0) {
-    console.error(up.output);
+    printComposeFailure(UP_ARGS.join(' '), up);
     await removeFailedStack(root);
     throw new Error(
       `docker compose up --wait failed for project ${ACCEPTANCE_PROJECT}; see the Compose output above.`,

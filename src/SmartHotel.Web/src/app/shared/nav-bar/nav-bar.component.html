@@ -6,10 +6,17 @@
     <div class="account">
       <ng-container *ngIf="auth.session() as s; else signedOut">
         <span class="email" data-testid="nav-email">{{ s.email }}</span>
-        <button type="button" data-testid="nav-logout" (click)="auth.logout()">Log out</button>
+        <button
+          #logOutButton
+          type="button"
+          data-testid="nav-logout"
+          (click)="auth.logout()"
+          (focus)="logOutFocused()"
+          (blur)="logOutBlurred(logOutButton)"
+        >Log out</button>
       </ng-container>
       <ng-template #signedOut>
-        <a routerLink="/login" data-testid="nav-login">Log in</a>
+        <a #logInLink routerLink="/login" data-testid="nav-login">Log in</a>
         <a routerLink="/register" data-testid="nav-register">Register</a>
       </ng-template>
     </div>

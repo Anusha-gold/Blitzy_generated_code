@@ -22,6 +22,7 @@
        and offers a way back to this URL after logging in again. -->
   <app-error-message [error]="bookError()">
     <a
+      #loginAgain
       *ngIf="bookError()?.status === 401"
       routerLink="/login"
       [queryParams]="{ returnUrl: router.url }"
@@ -36,7 +37,7 @@
        can be disabled, so the wrapper itself is a focusable region named by the
        caption: Tab reaches it and the arrow keys scroll it. -->
   <div
-    *ngIf="hotel.roomTypes.length > 0; else noRoomTypes"
+    *ngIf="hotel.roomTypes.length > 0"
     class="rooms-scroll"
     role="region"
     aria-labelledby="rooms-caption"
@@ -77,8 +78,14 @@
       </tbody>
     </table>
   </div>
-
-  <ng-template #noRoomTypes>
-    <p class="rooms-empty">This hotel has no room types to book.</p>
-  </ng-template>
 </ng-container>
+
+<!-- Always mounted, directly after the hotel content: assistive technology
+     announces a change to an existing live region, not a region inserted with
+     its text. It holds only the load outcome; the room table stays outside it. -->
+<div role="status" aria-live="polite">
+  <ng-container *ngIf="hotel() as hotel">
+    <p *ngIf="hotel.roomTypes.length > 0" class="visually-hidden">{{ hotel.name }}: {{ hotel.roomTypes.length }} {{ hotel.roomTypes.length === 1 ? 'room type' : 'room types' }} for this stay.</p>
+    <p *ngIf="hotel.roomTypes.length === 0" class="rooms-empty"><span class="visually-hidden">{{ hotel.name }}:</span> This hotel has no room types to book.</p>
+  </ng-container>
+</div>

@@ -1,6 +1,6 @@
 import { ChangeDetectionStrategy, Component, Input } from '@angular/core';
 import { NgFor, NgIf } from '@angular/common';
-import type { UiError } from '../../core/http/problem-details';
+import { fieldErrorId, type UiError } from '../../core/http/problem-details';
 
 /**
  * Renders one inline error in a styled wrapper (`data-testid="inline-error"`)
@@ -16,6 +16,11 @@ import type { UiError } from '../../core/http/problem-details';
  *
  * Server-supplied text is rendered by interpolation only, never as HTML. The
  * component maps no status to text: it shows the {@link UiError} it receives.
+ *
+ * Each field error reads `field: message`. With a `fieldErrorIdPrefix`, the
+ * message text carries the id from `fieldErrorId`, so the rejected input can
+ * name it in `aria-describedby` through `fieldErrorIds`; without one, the
+ * messages carry no ids.
  */
 @Component({
   selector: 'app-error-message',
@@ -28,4 +33,20 @@ import type { UiError } from '../../core/http/problem-details';
 export class ErrorMessageComponent {
   /** The error to show; `null` renders nothing. */
   @Input() error: UiError | null = null;
+
+  /**
+   * Prefix for the ids of the field-error messages, so form inputs can
+   * reference them through `aria-describedby`; `null` gives them no ids.
+   */
+  @Input() fieldErrorIdPrefix: string | null = null;
+
+  /**
+   * The id of one field-error message, or `null` when no prefix is set.
+   *
+   * @param fieldIndex - The field's index in `error.fieldErrors`.
+   * @param messageIndex - The message's index in that field's `messages`.
+   */
+  protected messageId(fieldIndex: number, messageIndex: number): string | null {
+    return this.fieldErrorIdPrefix === null ? null : fieldErrorId(this.fieldErrorIdPrefix, fieldIndex, messageIndex);
+  }
 }
