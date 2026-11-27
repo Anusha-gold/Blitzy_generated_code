@@ -9,6 +9,7 @@ using Microsoft.IdentityModel.JsonWebTokens;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.Net.Http.Headers;
 
+using SmartHotel.Api.Common.Security;
 using SmartHotel.Api.Infrastructure;
 using SmartHotel.Api.Modules.Auth;
 using SmartHotel.Api.Modules.Availability;
@@ -76,8 +77,8 @@ builder.Services
             .WithMethods(HttpMethods.Get, HttpMethods.Post, HttpMethods.Delete)
             .WithHeaders(HeaderNames.Authorization, HeaderNames.ContentType)));
 
-// The default challenge is kept: a bodyless 401 with WWW-Authenticate, which status-code pages turn into a problem
-// without touching the header.
+// The default challenge is kept: a bodyless 401 with WWW-Authenticate: Bearer, which status-code pages turn into a
+// problem without touching the header.
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer();
@@ -90,12 +91,21 @@ builder.Services
 
         // Claims keep their JWT names, so the guest id is read from sub.
         bearer.MapInboundClaims = false;
+
+        // The challenge stays a bare WWW-Authenticate: Bearer, so a rejected token's issuer, audience or lifetime
+        // values are never echoed in error or error_description parameters.
+        bearer.IncludeErrorDetails = false;
+
         bearer.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
             ValidIssuer = jwt.Issuer,
             ValidateAudience = true,
             ValidAudience = jwt.Audience,
+
+            // The audience must match the configured value exactly: IdentityModel would otherwise also accept it with
+            // a trailing slash added.
+            IgnoreTrailingSlashWhenValidatingAudience = false,
             ValidateLifetime = true,
             RequireExpirationTime = true,
             RequireSignedTokens = true,
@@ -104,6 +114,22 @@ builder.Services
             ValidAlgorithms = [SecurityAlgorithms.HmacSha256],
             ClockSkew = TimeSpan.Zero,
             NameClaimType = JwtRegisteredClaimNames.Name,
+        };
+
+        // A token that passes every check above but carries no valid guest id in sub fails authentication here, with a
+        // fixed reason that holds no claim value. Authorization then challenges with the standard 401 before MVC binds
+        // the body, so such a token never reaches an action that reads the caller's id.
+        bearer.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = static context =>
+            {
+                if (context.Principal is null || !context.Principal.TryGetGuestId(out _))
+                {
+                    context.Fail("The token carries no valid guest identifier.");
+                }
+
+                return Task.CompletedTask;
+            },
         };
     });
 

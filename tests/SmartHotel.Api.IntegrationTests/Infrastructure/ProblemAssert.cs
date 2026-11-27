@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Numerics;
 using System.Text.Json;
 
@@ -23,6 +24,7 @@ public static class ProblemAssert
 {
     private const string ProblemMediaType = "application/problem+json";
     private const string BearerScheme = "Bearer";
+    private const string WwwAuthenticateHeader = "WWW-Authenticate";
     private const string StatusMember = "status";
     private const string TraceIdMember = "traceId";
     private const string ErrorsMember = "errors";
@@ -205,6 +207,34 @@ public static class ProblemAssert
             hasBearer,
             $"Expected a WWW-Authenticate challenge for the {BearerScheme} scheme on the {(int)response.StatusCode} "
             + $"response but found {challengeCount} challenge(s), none for that scheme.");
+    }
+
+    /// <summary>
+    /// Asserts that <paramref name="response"/> carries at least one <c>WWW-Authenticate</c> challenge and that every
+    /// challenge is a bare <c>Bearer</c>: no other scheme and no parameters such as <c>error</c> or
+    /// <c>error_description</c>. A bare challenge never describes why the token was rejected, so it cannot echo the
+    /// token's issuer, audience or lifetime.
+    /// </summary>
+    /// <param name="response">The 401 response to check. It is not disposed; the caller owns it.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="response"/> is <see langword="null"/>.</exception>
+    public static void AssertBareBearerChallenge(HttpResponseMessage response)
+    {
+        AssertBearerChallenge(response);
+
+        // A value the typed collection cannot parse is left out of it, so the raw count shows that none was skipped.
+        int rawCount = response.Headers.NonValidated.TryGetValues(WwwAuthenticateHeader, out HeaderStringValues raw)
+            ? raw.Count
+            : 0;
+        int challengeCount = response.Headers.WwwAuthenticate.Count;
+        int otherSchemes = response.Headers.WwwAuthenticate.Count(
+            static challenge => !string.Equals(challenge.Scheme, BearerScheme, StringComparison.Ordinal));
+        int withParameters = response.Headers.WwwAuthenticate.Count(
+            static challenge => !string.IsNullOrEmpty(challenge.Parameter));
+        Assert.True(
+            rawCount == challengeCount && otherSchemes == 0 && withParameters == 0,
+            $"Expected only bare {BearerScheme} challenges on the {(int)response.StatusCode} response but of "
+            + $"{rawCount} WWW-Authenticate value(s), {challengeCount} parse as challenges, {otherSchemes} use "
+            + $"another scheme and {withParameters} carry parameters.");
     }
 
     private static JsonElement ParseObject(string body)

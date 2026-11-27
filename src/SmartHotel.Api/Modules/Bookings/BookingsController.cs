@@ -17,9 +17,10 @@ namespace SmartHotel.Api.Modules.Bookings;
 /// <remarks>
 /// <para>
 /// <c>[Authorize]</c> applies the default JwtBearer scheme to every action. Authorization runs before model binding,
-/// so a request whose bearer token is missing, invalid or expired gets the challenge's 401, written as
-/// <c>application/problem+json</c> with its <c>WWW-Authenticate: Bearer</c> header kept, even when its body is
-/// invalid. The caller's guest id always comes from the token's <c>sub</c> claim, never from the request.
+/// so a request whose bearer token is missing, invalid or expired, or carries no valid guest id in <c>sub</c>, gets
+/// the challenge's 401, written as <c>application/problem+json</c> with its <c>WWW-Authenticate: Bearer</c> header
+/// kept, even when its body is invalid. The caller's guest id always comes from the token's <c>sub</c> claim, never
+/// from the request.
 /// </para>
 /// <para>
 /// Each action binds its input, calls one <see cref="BookingService"/> method and maps the outcome through
@@ -46,7 +47,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// Checks run in this order, and the first failure decides the response:
     /// <list type="bullet">
     /// <item><description>
-    /// 401, from JwtBearer before the body is bound, when the bearer token is missing, invalid or expired.
+    /// 401, from JwtBearer before the body is bound, when the bearer token is missing, invalid or expired, or carries
+    /// no valid guest id in <c>sub</c>.
     /// </description></item>
     /// <item><description>
     /// 415, from MVC, when <c>Content-Type</c> is absent or is not JSON, a bodyless request included.
@@ -133,7 +135,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// <c>createdAt</c> and then <c>id</c>, both descending. The list is <c>[]</c> when the guest has no bookings.
     /// </description></item>
     /// <item><description>
-    /// 401, from JwtBearer, when the bearer token is missing, invalid or expired.
+    /// 401, from JwtBearer, when the bearer token is missing, invalid or expired, or carries no valid guest id in
+    /// <c>sub</c>.
     /// </description></item>
     /// </list>
     /// </remarks>
@@ -154,7 +157,8 @@ public sealed class BookingsController(BookingService bookings) : ControllerBase
     /// Checks run in this order, and the first failure decides the response:
     /// <list type="bullet">
     /// <item><description>
-    /// 401, from JwtBearer, when the bearer token is missing, invalid or expired.
+    /// 401, from JwtBearer, when the bearer token is missing, invalid or expired, or carries no valid guest id in
+    /// <c>sub</c>.
     /// </description></item>
     /// <item><description>
     /// 404 when no booking has <paramref name="id"/>. A non-integer id matches no route, and routing answers it with
