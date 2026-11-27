@@ -7,6 +7,8 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
+using Xunit.Sdk;
+
 namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 
 /// <summary>
@@ -26,7 +28,9 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// so concurrent requests with different tokens cannot see each other's headers.
 /// </para>
 /// <para>
-/// No helper writes output, and no failure message contains a token or a password.
+/// No helper writes output. Failure messages carry only the operation, the numeric status codes and the name of the
+/// expected wire type. They never quote a body, a header, a parser message, a token, a password or an email,
+/// because a response can carry any of them and test output is logged.
 /// </para>
 /// </remarks>
 public sealed class ApiTestClient
@@ -38,7 +42,6 @@ public sealed class ApiTestClient
 
     private const string BearerScheme = "Bearer";
     private const string JsonMediaType = "application/json";
-    private const string ProblemMediaType = "application/problem+json";
     private const string IsoDateFormat = "yyyy-MM-dd";
 
     // Fixed, non-secret values for throwaway guests in a per-class test database. The password meets the API's
@@ -77,16 +80,23 @@ public sealed class ApiTestClient
 
     /// <summary>
     /// The current UTC calendar date, the API's definition of "today": a check-in before it is in the past, and a
-    /// booking whose check-in is before it can no longer be cancelled. It is computed on every read, so a run that
-    /// crosses midnight UTC stays consistent with the server.
+    /// booking whose check-in is before it can no longer be cancelled. Every read takes a new reading of the system
+    /// clock, so a scenario reads it once and derives from that one value every date it sends and, through
+    /// <see cref="NextYear(DateOnly)"/>, its format-case year. Separate reads on either side of midnight UTC would
+    /// otherwise build a stay of a different length, or a different year.
     /// </summary>
     public static DateOnly TodayUtc => DateOnly.FromDateTime(TimeProvider.System.GetUtcNow().UtcDateTime);
 
     /// <summary>
-    /// The year after <see cref="TodayUtc"/>'s year. Its dates are always in the future, so date-format cases can
-    /// pair the valid <c>Y-01-05</c> and <c>Y-01-07</c> with broken forms such as <c>Y-1-5</c>.
+    /// The calendar year after <paramref name="today"/>'s year. Its dates are always in the future, so date-format
+    /// cases can pair the valid <c>Y-01-05</c> and <c>Y-01-07</c> with broken forms such as <c>Y-1-5</c>.
     /// </summary>
-    public static int NextYear => TodayUtc.Year + 1;
+    /// <param name="today">The scenario's one <see cref="TodayUtc"/> snapshot.</param>
+    /// <returns>The year that follows the year of <paramref name="today"/>.</returns>
+    public static int NextYear(DateOnly today)
+    {
+        return today.Year + 1;
+    }
 
     /// <summary>
     /// Formats <paramref name="date"/> as exactly <c>yyyy-MM-dd</c>, the only date form the API accepts.
@@ -260,13 +270,37 @@ public sealed class ApiTestClient
     /// <returns>The deserialized body.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="response"/> is <see langword="null"/>.</exception>
     /// <exception cref="InvalidOperationException">The body is the JSON literal <c>null</c>.</exception>
-    /// <exception cref="JsonException">The body is not JSON of the shape <typeparamref name="T"/> declares.</exception>
+    /// <exception cref="FailException">
+    /// The body is not JSON of the shape <typeparamref name="T"/> declares, or its <c>Content-Type</c> declares an
+    /// unsupported character set. The message names only <typeparamref name="T"/>.
+    /// </exception>
     // An instance member although it reads no instance state (CA1822, info): tests call it on the client they send
     // requests with, which a static member would not allow.
     public async Task<T> ReadAsync<T>(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(response);
-        T? value = await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
+
+        T? value;
+        try
+        {
+            value = await response.Content.ReadFromJsonAsync<T>(JsonOptions, cancellationToken);
+        }
+        catch (Exception exception) when (exception is JsonException or NotSupportedException)
+        {
+            // The serializer's messages name the JSON path and quote characters of the body, which can belong to a
+            // token or an email, so neither the message nor the exception is passed on.
+            throw FailException.ForFailure(
+                $"Expected the response body to be JSON of the {typeof(T).Name} shape but it could not be read "
+                + "as one.");
+        }
+        catch (InvalidOperationException exception) when (exception.InnerException is ArgumentException)
+        {
+            // HttpContent rejects an unknown charset this way, and the inner exception quotes the header value.
+            throw FailException.ForFailure(
+                $"Expected the response body to be JSON of the {typeof(T).Name} shape but the Content-Type declares "
+                + "an unsupported character set.");
+        }
+
         return value ?? throw new InvalidOperationException(
             $"The response body deserialized to null instead of a {typeof(T).Name}.");
     }
@@ -286,13 +320,13 @@ public sealed class ApiTestClient
         using HttpResponseMessage registered = await RegisterAsync(
             new { email, password = TestPassword, fullName = TestFullName },
             cancellationToken);
-        await EnsureStatusAsync(registered, HttpStatusCode.Created, $"POST {RegisterRoute}", cancellationToken);
+        EnsureStatus(registered, HttpStatusCode.Created, $"POST {RegisterRoute}");
         RegisterResponse registration = await ReadAsync<RegisterResponse>(registered, cancellationToken);
 
         using HttpResponseMessage loggedIn = await LoginAsync(
             new { email, password = TestPassword },
             cancellationToken);
-        await EnsureStatusAsync(loggedIn, HttpStatusCode.OK, $"POST {LoginRoute}", cancellationToken);
+        EnsureStatus(loggedIn, HttpStatusCode.OK, $"POST {LoginRoute}");
         LoginResponse login = await ReadAsync<LoginResponse>(loggedIn, cancellationToken);
 
         return new GuestSession(registration.GuestId, email, TestPassword, login.Token);
@@ -320,7 +354,7 @@ public sealed class ApiTestClient
             Iso(checkOut),
             guests.ToString(CultureInfo.InvariantCulture),
             cancellationToken);
-        await EnsureStatusAsync(response, HttpStatusCode.OK, $"GET {HotelsRoute}/{{id}}", cancellationToken);
+        EnsureStatus(response, HttpStatusCode.OK, $"GET {HotelsRoute}/{{id}}");
 
         return await ReadAsync<HotelDetail>(response, cancellationToken);
     }
@@ -339,7 +373,7 @@ public sealed class ApiTestClient
     {
         ArgumentNullException.ThrowIfNull(token);
         using HttpResponseMessage response = await CreateBookingAsync(body, token, cancellationToken);
-        await EnsureStatusAsync(response, HttpStatusCode.Created, $"POST {BookingsRoute}", cancellationToken);
+        EnsureStatus(response, HttpStatusCode.Created, $"POST {BookingsRoute}");
 
         return await ReadAsync<Booking>(response, cancellationToken);
     }
@@ -413,25 +447,17 @@ public sealed class ApiTestClient
         return await Http.SendAsync(request, cancellationToken);
     }
 
-    // The failure message quotes the body only when it is a problem document. The API's problem bodies never carry a
-    // token, password or email, while a success body can: a login response holds a bearer token.
-    private static async Task EnsureStatusAsync(
-        HttpResponseMessage response,
-        HttpStatusCode expected,
-        string operation,
-        CancellationToken cancellationToken)
+    // The failure message carries only the fixed operation label and the two numeric status codes. The body and the
+    // headers are never read: any response, a problem document included, can echo a token, a password or an email
+    // when the API regresses, and test output is logged. Tests that expect an error check it through ProblemAssert.
+    private static void EnsureStatus(HttpResponseMessage response, HttpStatusCode expected, string operation)
     {
         if (response.StatusCode == expected)
         {
             return;
         }
 
-        string? mediaType = response.Content.Headers.ContentType?.MediaType;
-        string body = string.Equals(mediaType, ProblemMediaType, StringComparison.OrdinalIgnoreCase)
-            ? await response.Content.ReadAsStringAsync(cancellationToken)
-            : $"(the body is not {ProblemMediaType}, so it is not quoted)";
-
-        Assert.Fail($"Expected {operation} to return {(int)expected} but got {(int)response.StatusCode}: {body}");
+        Assert.Fail($"Expected {operation} to return {(int)expected} but got {(int)response.StatusCode}.");
     }
 
     /// <summary>The 201 body of <c>POST /api/auth/register</c>: <c>{ "guestId": n }</c>.</summary>

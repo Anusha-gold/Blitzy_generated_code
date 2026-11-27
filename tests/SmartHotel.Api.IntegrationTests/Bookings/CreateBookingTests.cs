@@ -71,9 +71,11 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
                 body["checkOut"] = ApiTestClient.Iso(today.AddDays(61));
                 break;
             case "checkIn-not-padded":
-                // Next year's dates are always in the future, so only the non-padded form can fail.
-                body["checkIn"] = string.Create(CultureInfo.InvariantCulture, $"{ApiTestClient.NextYear}-1-5");
-                body["checkOut"] = string.Create(CultureInfo.InvariantCulture, $"{ApiTestClient.NextYear}-01-07");
+                // Next year's dates are always in the future, so only the non-padded form can fail. Both dates use
+                // the one year derived from today, so a run that crosses midnight UTC cannot split them.
+                int year = ApiTestClient.NextYear(today);
+                body["checkIn"] = string.Create(CultureInfo.InvariantCulture, $"{year}-1-5");
+                body["checkOut"] = string.Create(CultureInfo.InvariantCulture, $"{year}-01-07");
                 break;
             default:
                 throw new ArgumentException($"Unknown case label '{caseLabel}'.", nameof(caseLabel));

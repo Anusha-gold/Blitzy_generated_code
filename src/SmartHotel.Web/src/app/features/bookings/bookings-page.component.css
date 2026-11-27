@@ -5,9 +5,8 @@
      Relative, so the absolute .visually-hidden spans stay inside the scroller. */
   position: relative;
   overflow-x: auto;
-  /* On white: success 6.3:1, muted 6.5:1. */
+  /* On white: success 6.3:1. */
   --bookings-success: #1b6e37;
-  --bookings-muted: #52606d;
 }
 
 /* The tint is ~10% success over white (success on it is 5.4:1). */
@@ -36,7 +35,7 @@
 
 .empty {
   margin-block: 1rem 0;
-  color: var(--bookings-muted);
+  color: var(--sh-color-text-muted);
 }
 
 /* Width, collapse, start-aligned headers and row rules are the global table base. */
@@ -68,7 +67,7 @@
 
 .status-cancelled {
   font-style: italic;
-  color: var(--bookings-muted);
+  color: var(--sh-color-text-muted);
 }
 
 /* A 44px target; the focus ring and the disabled state are the global button's. */

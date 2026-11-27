@@ -7,8 +7,19 @@
 #   API. The `db` service's wrapper (deploy/db/db-entrypoint.sh) creates the
 #   secrets on the first start in the shared `secrets` volume, which Compose
 #   mounts here read-only.
+#   Before handing over the secrets, check the host ports that Compose
+#   publishes and derives the CORS origin and the SPA's API base URL from,
+#   and write the origin for web port 80 the way browsers send it.
 #
 # Inputs
+#   SMARTHOTEL_API_PORT, SMARTHOTEL_WEB_PORT
+#                            The host ports Compose publishes the API and the
+#                            web app on. Each one that is set must be one
+#                            port number from 1 to 65535, in decimal without
+#                            leading zeros. Outside Compose both are unset
+#                            and nothing is checked.
+#   Cors__AllowedOrigin      The web app's origin. Compose writes it as
+#                            http://localhost:$SMARTHOTEL_WEB_PORT.
 #   SMARTHOTEL_SECRETS_DIR   Directory holding the secret files; Compose sets
 #                            /run/smarthotel-secrets. Unset or empty skips
 #                            the file lookup: outside local development the
@@ -27,10 +38,18 @@
 #   "$@"                     Arguments passed on to the API.
 #
 # Outputs
+#   Cors__AllowedOrigin, exported as http://localhost when
+#   SMARTHOTEL_WEB_PORT is 80 and the origin is exactly http://localhost:80.
+#   Any other origin is passed on unchanged.
 #   DB_PASSWORD and Jwt__SigningKey, exported from the files when they were
 #   unset. Then `exec dotnet SmartHotel.Api.dll "$@"` from the
 #   image's working directory, /app: exec makes the API the container's main
 #   process, so `docker stop` signals reach it.
+#
+# A port variable that is set to any other value, 0, a range or a leading
+# zero included, stops the script before any secret file is read: one
+# stderr line names the variable, never its value, and the script exits 1,
+# so the API never starts and `docker compose up --wait` fails.
 #
 # When a file is missing, is not a readable regular file, or holds an empty
 # value or any byte outside that set, a trailing newline or a NUL byte
@@ -48,6 +67,47 @@ set -eu
 log() {
     printf 'docker-entrypoint: %s\n' "$*" >&2
 }
+
+# require_port VARIABLE VALUE
+# Exits 1 after one stderr line naming VARIABLE, never VALUE, unless VALUE
+# is one port number from 1 to 65535, written in decimal without leading
+# zeros: the only form that publishes one fixed host port and reads the
+# same in a URL. Compose itself also accepts 0 (a random port), ranges
+# such as 14200-14201 and leading zeros such as 04200. The digits are
+# listed rather than written as a range, which some locales widen, and a
+# value of six or more characters is rejected before the numeric test.
+require_port() {
+    case $2 in
+        '' | 0* | *[!0123456789]* | ??????*) _port_valid=0 ;;
+        *) _port_valid=1 ;;
+    esac
+    if [ "$_port_valid" -eq 1 ] && [ "$2" -gt 65535 ]; then
+        _port_valid=0
+    fi
+    if [ "$_port_valid" -eq 0 ]; then
+        log "$1 must be one port number from 1 to 65535, in decimal" \
+            "without leading zeros"
+        exit 1
+    fi
+}
+
+# Compose passes both host ports in and writes the CORS origin as
+# http://localhost:$SMARTHOTEL_WEB_PORT. Outside Compose neither port is
+# set and nothing is checked. The checks run before any secret file is
+# read.
+if [ -n "${SMARTHOTEL_API_PORT+set}" ]; then
+    require_port SMARTHOTEL_API_PORT "$SMARTHOTEL_API_PORT"
+fi
+if [ -n "${SMARTHOTEL_WEB_PORT+set}" ]; then
+    require_port SMARTHOTEL_WEB_PORT "$SMARTHOTEL_WEB_PORT"
+    # Browsers omit the scheme's default port from the Origin header, and
+    # the API accepts the origin only in that form, but Compose can only
+    # append the port. Any other origin is left to the API's validation.
+    if [ "$SMARTHOTEL_WEB_PORT" = 80 ] &&
+        [ "${Cors__AllowedOrigin-}" = http://localhost:80 ]; then
+        export Cors__AllowedOrigin=http://localhost
+    fi
+fi
 
 # export_secret_file NAME VARIABLE
 # Exports VARIABLE from $SMARTHOTEL_SECRETS_DIR/NAME when that is a readable

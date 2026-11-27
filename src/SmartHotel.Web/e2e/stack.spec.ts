@@ -25,7 +25,7 @@
  */
 import { test, expect, request, type APIRequestContext, type APIResponse } from '@playwright/test';
 
-import { apiUrl, utcDate } from './support/helpers';
+import { apiUrl, utcDates } from './support/helpers';
 
 /** One element of the `GET /api/hotels` array. */
 interface HotelSummary {
@@ -102,7 +102,8 @@ test('stack is healthy and seeded', async ({ page, request: api }) => {
 
   // Far enough ahead that no other spec books on these dates, so every room
   // of the catalogue is still free.
-  const stay = { checkIn: utcDate(180), checkOut: utcDate(181), guests: '1' };
+  const [checkIn, checkOut] = utcDates(180, 181);
+  const stay = { checkIn, checkOut, guests: '1' };
 
   const hotelIds: number[] = [];
   for (const [city, expectedCount] of SEEDED_CITIES) {
@@ -142,10 +143,11 @@ test('stack is healthy and seeded', async ({ page, request: api }) => {
 test('hotel search p95 within 1 second with 20 concurrent users', async () => {
   test.setTimeout(120_000);
 
+  const [checkIn, checkOut] = utcDates(60, 62);
   const url = apiQueryUrl('/hotels', {
     city: 'Seattle',
-    checkIn: utcDate(60),
-    checkOut: utcDate(62),
+    checkIn,
+    checkOut,
     guests: '2',
   });
 

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text;
 
 using Microsoft.Extensions.Options;
@@ -108,6 +109,14 @@ public sealed class ApiCorsOptions
     public const string PolicyName = "web";
 
     /// <summary>
+    /// How long, in seconds, a browser may cache the policy's answer to a preflight for a request URL
+    /// (<c>Access-Control-Max-Age</c>) before it sends another preflight. Ten minutes covers a session's
+    /// repeated calls, while a changed policy still reaches browsers quickly. Without the header, Chromium
+    /// caches a preflight for only 5 seconds, and it caps the value at 7,200 seconds.
+    /// </summary>
+    public const int PreflightMaxAgeSeconds = 600;
+
+    /// <summary>
     /// Gets or sets the only origin allowed to call the API: the web app's serialized origin,
     /// <c>scheme://host[:port]</c> with no trailing <c>/</c>.
     /// </summary>
@@ -130,10 +139,12 @@ public sealed class ApiCorsOptions
 /// or path. A configured value in any other form, such as one with a trailing <c>/</c>, would never match
 /// a request and would silently block the web app, so it is rejected at startup instead.
 /// <para>
-/// An IPv6 address that <see cref="Uri"/> writes with a dotted IPv4 tail (an IPv4-mapped, IPv4-compatible,
-/// IPv4-translated or ISATAP address) is rejected in every spelling. <c>CorsPolicyBuilder.WithOrigins</c>
-/// rebuilds an IPv6 origin through <see cref="Uri"/>, so the policy would hold the dotted form, while a
-/// browser writes every piece in hexadecimal: no configured value for such an address could ever match.
+/// Every IPv6 address is accepted in the form browsers write, with every piece in hexadecimal, including
+/// the pieces of an address that embeds an IPv4 address, such as <c>https://[::ffff:c000:201]</c>. Any
+/// other spelling of the same address, such as <c>https://[::ffff:192.0.2.1]</c>, upper-case or
+/// uncompressed pieces, or a zone identifier, is rejected with a message that shows the browser's form.
+/// The policy holds the validated value as is, because <c>CorsPolicyBuilder.WithOrigins</c> would rebuild
+/// it through <see cref="Uri"/>, which writes such an address with a dotted IPv4 tail that no browser sends.
 /// </para>
 /// </remarks>
 /// <param name="environment">The host environment, which decides whether plain <c>http</c> is allowed.</param>
@@ -200,20 +211,11 @@ public sealed class ApiCorsOptionsValidator(IHostEnvironment environment) : IVal
                 "Cors__AllowedOrigin must write a host that ends in a number as a dotted-decimal IPv4 address.");
         }
 
-        // Uri writes an IPv4-mapped, IPv4-compatible, IPv4-translated or ISATAP address with a dotted IPv4
-        // tail, and CorsPolicyBuilder.WithOrigins stores the origin in that form. Browsers write every piece
-        // in hexadecimal, so the policy could never match such an address, however the value spells it.
-        if (uri.HostNameType == UriHostNameType.IPv6 && uri.Host.Contains('.'))
-        {
-            return ValidateOptionsResult.Fail(
-                "Cors__AllowedOrigin must not use an IPv6 address that embeds an IPv4 address; write the IPv4 address instead.");
-        }
-
         // The serialized origin is rebuilt from the parsed scheme, host and port the way a browser writes the
         // Origin header. A value that differs from it has, for example, a trailing '/', upper-case letters,
         // Unicode host labels, an empty user-information delimiter ('@' with nothing before it), an IPv6
-        // address in other than its shortest form or with a zone identifier, an explicit default port or
-        // surrounding whitespace.
+        // address written other than as browsers write it (with a dotted IPv4 tail, or with uncompressed or
+        // leading-zero pieces) or with a zone identifier, an explicit default port or surrounding whitespace.
         string serializedOrigin = SerializeOrigin(uri, asciiHost);
         if (!string.Equals(value, serializedOrigin, StringComparison.Ordinal))
         {
@@ -284,8 +286,9 @@ public sealed class ApiCorsOptionsValidator(IHostEnvironment environment) : IVal
     /// scheme's default. User information is never part of it.
     /// </summary>
     /// <param name="uri">
-    /// An absolute <c>http</c> or <c>https</c> URI. An IPv6 host must not be one that <see cref="Uri"/> writes
-    /// with a dotted IPv4 tail, which <see cref="Validate"/> rejects before calling this method.
+    /// An absolute <c>http</c> or <c>https</c> URI. An IPv6 host is written in brackets from the address
+    /// itself, as <see cref="SerializeIPv6"/> describes, whatever spelling the URI used, and without a zone
+    /// identifier.
     /// </param>
     /// <param name="asciiHost">The host as <see cref="ReadAsciiHost"/> returned it.</param>
     /// <returns>The serialized origin.</returns>
@@ -294,15 +297,77 @@ public sealed class ApiCorsOptionsValidator(IHostEnvironment environment) : IVal
         string host = asciiHost;
         if (uri.HostNameType == UriHostNameType.IPv6)
         {
-            // IdnHost drops the brackets and keeps the zone identifier. Uri.Host brackets the address, drops
-            // the zone identifier and writes the pieces in lower-case hexadecimal without leading zeros, with
-            // the first longest run of two or more zero pieces as "::": a browser's form for every IPv6
-            // address without a dotted IPv4 tail.
-            host = uri.Host;
+            // IdnHost drops the brackets and keeps the zone identifier. Uri.Host brackets the address and drops
+            // the zone identifier, but writes an address that embeds an IPv4 address with a dotted tail, which
+            // browsers never do. The bracketed text is an address Uri has already parsed, so it parses again
+            // here and is written from its bytes.
+            IPAddress address = IPAddress.Parse(uri.Host.AsSpan(1, uri.Host.Length - 2));
+            host = "[" + SerializeIPv6(address) + "]";
         }
 
         return uri.IsDefaultPort
             ? uri.Scheme + "://" + host
             : uri.Scheme + "://" + host + ":" + uri.Port.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Writes an IPv6 address the way the URL Standard's IPv6 serializer does, which is how browsers write it
+    /// in the <c>Origin</c> header: the eight 16-bit pieces in lower-case hexadecimal without leading zeros,
+    /// separated by <c>:</c>, with the first longest run of two or more zero pieces written as <c>::</c>.
+    /// Every piece is hexadecimal, including those of an address that embeds an IPv4 address.
+    /// </summary>
+    /// <param name="address">An IPv6 address.</param>
+    /// <returns>The address without brackets, for example <c>::ffff:c000:201</c>.</returns>
+    private static string SerializeIPv6(IPAddress address)
+    {
+        byte[] bytes = address.GetAddressBytes();
+        int[] pieces = new int[bytes.Length / 2];
+        for (int index = 0; index < pieces.Length; index++)
+        {
+            pieces[index] = (bytes[2 * index] << 8) | bytes[(2 * index) + 1];
+        }
+
+        // A run replaces the current choice only when strictly longer, so the first of equally long runs wins,
+        // and a single zero piece is never compressed.
+        int compressStart = -1;
+        int compressLength = 1;
+        int runStart = 0;
+        for (int index = 0; index <= pieces.Length; index++)
+        {
+            if (index < pieces.Length && pieces[index] == 0)
+            {
+                continue;
+            }
+
+            if (index - runStart > compressLength)
+            {
+                compressStart = runStart;
+                compressLength = index - runStart;
+            }
+
+            runStart = index + 1;
+        }
+
+        // With no run chosen, compressStart is -1 and compressEnd is 0, so every piece is written.
+        int compressEnd = compressStart + compressLength;
+        StringBuilder output = new();
+        for (int index = 0; index < pieces.Length; index++)
+        {
+            if (index == compressStart)
+            {
+                // A preceding piece already wrote its ':' separator, so only a run at the start needs two.
+                output.Append(index == 0 ? "::" : ":");
+            }
+            else if (index < compressStart || index >= compressEnd)
+            {
+                output.Append(pieces[index].ToString("x", CultureInfo.InvariantCulture));
+                if (index < pieces.Length - 1)
+                {
+                    output.Append(':');
+                }
+            }
+        }
+
+        return output.ToString();
     }
 }

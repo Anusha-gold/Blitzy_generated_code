@@ -11,6 +11,16 @@
  * assertion on the outcome it is for, so a spec can act on the next screen as
  * soon as the helper returns, including straight after a click navigation.
  *
+ * Diagnostics stay value-free: no password, email address or full name may
+ * appear in a Playwright step title, call log, or matcher expected/received
+ * output. Playwright prints the argument of `fill`, `type`,
+ * `pressSequentially` and the keyboard input calls in those places, the
+ * expected and received values of text and value matchers, and a preview of
+ * the element text a locator resolved to. So {@link fillBound} sets a value
+ * inside the page, never through those calls, and every comparison with such
+ * a value runs inside the page and is asserted as a boolean under a fixed
+ * message ({@link expectControlValue}, {@link expectSignedInAs}).
+ *
  * Playwright transpiles this file as CommonJS (the workspace `package.json`
  * declares no `"type": "module"`). The workspace declares no `@types/node`, so
  * `process` is an unchecked global and the type annotations are stripped,
@@ -30,7 +40,9 @@ function withoutTrailingSlash(value: string): string {
 
 /**
  * Fills one reactive-form input, but only once Angular has bound it to its
- * form control, and then confirms the value held.
+ * form control, and then confirms the value held. It waits for no outcome of
+ * the form, so a spec can also use it for a submission that must fail or a
+ * response that is held back.
  *
  * The app coalesces change detection to the next animation frame, so after a
  * click navigation a routed page's inputs are in the DOM before the first
@@ -39,12 +51,94 @@ function withoutTrailingSlash(value: string): string {
  * forms set `ng-pristine` or `ng-dirty` on a bound input in that same pass,
  * after the initial write, so waiting for either class makes the fill land on
  * a bound control rather than one about to be reset.
+ *
+ * The value never passes through a Playwright input call, whose step title
+ * and call log print it. Once the input is visible and editable, the helper
+ * focuses it, assigns the value inside the page and dispatches the bubbling
+ * `input` and `change` events a user's typing ends with, which Angular's
+ * value accessors listen to for text, email, password, date and number
+ * inputs alike. Every wait and check names only the input's test id.
+ *
+ * @param page - The page showing the form.
+ * @param testId - The input's `data-testid`, for example `login-email`.
+ * @param value - The text to enter; a date input takes `yyyy-MM-dd`.
+ * @returns A promise that settles once the input holds `value`.
  */
-async function fillControl(page: Page, testId: string, value: string): Promise<void> {
+export async function fillBound(page: Page, testId: string, value: string): Promise<void> {
   const field = page.getByTestId(testId);
   await expect(field).toHaveClass(/\bng-(?:pristine|dirty)\b/);
-  await field.fill(value);
-  await expect(field).toHaveValue(value);
+  await expect(field).toBeVisible();
+  await expect(field).toBeEditable();
+  await field.focus();
+  await field.evaluate((element, text) => {
+    const input = element as HTMLInputElement;
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }, value);
+  await expectControlValue(page, testId, value);
+}
+
+/**
+ * Asserts that a form input holds an expected value, without the value
+ * appearing in any diagnostic.
+ *
+ * The comparison runs inside the page, and only its boolean result is
+ * polled, so a failure reports the input's test id and `true`/`false`, never
+ * the expected or the actual value. Like a web-first assertion it retries
+ * until the value matches or the expect timeout passes. Resolving the input
+ * itself is value-free too: Playwright previews an `<input>` by its
+ * attributes only, and Angular holds the value as a property, never as an
+ * attribute, so neither the call log nor a strict-mode error can carry it.
+ *
+ * @param page - The page showing the input.
+ * @param testId - The input's `data-testid`, for example `login-email`.
+ * @param expected - The value the input must hold.
+ * @returns A promise that settles once the input holds `expected`.
+ */
+export async function expectControlValue(page: Page, testId: string, expected: string): Promise<void> {
+  const field = page.getByTestId(testId);
+  await expect
+    .poll(() => field.evaluate((element, value) => (element as HTMLInputElement).value === value, expected), {
+      message: `input "${testId}" holds the expected value`,
+    })
+    .toBe(true);
+}
+
+/**
+ * Asserts that the nav bar shows a guest signed in under `email`, without
+ * the email appearing in any diagnostic.
+ *
+ * Playwright previews an element that holds only text with that text, which
+ * here is the email. It prints that preview whenever a locator call resolves
+ * one element (the call log, and `DEBUG=pw:api` output), and for every match
+ * of a strict-mode violation, together with a suggested `getByText` locator.
+ * So this helper never resolves a single `nav-email` element. It first waits
+ * for exactly one visible match by counting, which logs only counts. It then
+ * polls `evaluateAll` on the visibility-filtered locator: `evaluateAll`
+ * applies no strict-mode check and logs no resolved element. Inside the page
+ * it requires exactly one visible match whose whitespace-normalised text
+ * equals `email`, so a hidden duplicate is ignored and two visible ones fail,
+ * and it asserts only the boolean under a fixed message.
+ *
+ * @param page - The page to check, on any screen.
+ * @param email - The email address the nav bar must show.
+ * @returns A promise that settles once the nav bar shows exactly `email`.
+ */
+export async function expectSignedInAs(page: Page, email: string): Promise<void> {
+  const visibleNavEmail = page.getByTestId('nav-email').filter({ visible: true });
+  await expect(visibleNavEmail, 'the nav bar shows a signed-in guest').toHaveCount(1);
+  await expect
+    .poll(
+      () =>
+        visibleNavEmail.evaluateAll(
+          (elements, expected) =>
+            elements.length === 1 && (elements[0].textContent ?? '').replace(/\s+/g, ' ').trim() === expected,
+          email,
+        ),
+      { message: 'the nav bar shows the expected guest email' },
+    )
+    .toBe(true);
 }
 
 /**
@@ -65,20 +159,35 @@ export function apiUrl(): string {
 }
 
 /**
- * Returns the UTC calendar date `offsetDays` days from now.
+ * Returns the UTC calendar dates the given numbers of days from today, all
+ * from one reading of the clock.
  *
  * The API decides "today" by the current UTC date (check-in may not be earlier
- * than it), and it accepts dates only as exactly `yyyy-MM-dd`, so this form
+ * than it), and it accepts dates only as exactly `yyyy-MM-dd`, so each date
  * can go into a query, a body or a date input unchanged.
  *
- * @param offsetDays - Whole days to add to today's UTC date; `0` is today and
- *   a negative value is in the past.
- * @returns The date as `yyyy-MM-dd`, for example `2026-12-07`.
+ * The clock is read once per call, so every date of the call counts from the
+ * same "today". A scenario takes all its dates from one call: separate reads
+ * on either side of midnight UTC could otherwise build a check-in and
+ * check-out of a different stay length.
+ *
+ * @param offsetDays - Whole days to add to today's UTC date, one per date
+ *   wanted; `0` is today and a negative value is in the past.
+ * @returns One date per offset, in the order given, each as `yyyy-MM-dd`; for
+ *   example `utcDates(14, 16)` on 2026-11-23 returns
+ *   `['2026-12-07', '2026-12-09']`.
+ * @throws RangeError when an offset is not a whole number of days.
  */
-export function utcDate(offsetDays: number): string {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+export function utcDates(...offsetDays: number[]): string[] {
+  const now = new Date();
+  return offsetDays.map((offset) => {
+    if (!Number.isInteger(offset)) {
+      throw new RangeError(`utcDates expects whole days, got ${offset}.`);
+    }
+    const d = new Date(now.getTime());
+    d.setUTCDate(d.getUTCDate() + offset);
+    return d.toISOString().slice(0, 10);
+  });
 }
 
 /**
@@ -122,9 +231,9 @@ export async function registerGuest(
   page: Page,
   guest: { email: string; password: string; fullName: string },
 ): Promise<void> {
-  await fillControl(page, 'register-email', guest.email);
-  await fillControl(page, 'register-password', guest.password);
-  await fillControl(page, 'register-full-name', guest.fullName);
+  await fillBound(page, 'register-email', guest.email);
+  await fillBound(page, 'register-password', guest.password);
+  await fillBound(page, 'register-full-name', guest.fullName);
   await page.getByTestId('register-submit').click();
   await expect(page).toHaveURL(/\/login\?registered=1$/);
 }
@@ -144,10 +253,10 @@ export async function registerGuest(
  * @returns A promise that settles once the nav bar shows `email`.
  */
 export async function logIn(page: Page, email: string, password: string): Promise<void> {
-  await fillControl(page, 'login-email', email);
-  await fillControl(page, 'login-password', password);
+  await fillBound(page, 'login-email', email);
+  await fillBound(page, 'login-password', password);
   await page.getByTestId('login-submit').click();
-  await expect(page.getByTestId('nav-email')).toHaveText(email);
+  await expectSignedInAs(page, email);
 }
 
 /**
@@ -170,7 +279,7 @@ export async function logIn(page: Page, email: string, password: string): Promis
  * @param criteria - The search criteria to enter.
  * @param criteria.city - The city, for example `Seattle`.
  * @param criteria.checkIn - The check-in date as `yyyy-MM-dd`, for example
- *   from {@link utcDate}; the date input accepts this form.
+ *   from {@link utcDates}; the date input accepts this form.
  * @param criteria.checkOut - The check-out date as `yyyy-MM-dd`.
  * @param criteria.guests - The party size.
  * @returns A promise that settles once the search outcome is visible.
@@ -179,10 +288,10 @@ export async function searchHotels(
   page: Page,
   criteria: { city: string; checkIn: string; checkOut: string; guests: number },
 ): Promise<void> {
-  await fillControl(page, 'search-city', criteria.city);
-  await fillControl(page, 'search-check-in', criteria.checkIn);
-  await fillControl(page, 'search-check-out', criteria.checkOut);
-  await fillControl(page, 'search-guests', String(criteria.guests));
+  await fillBound(page, 'search-city', criteria.city);
+  await fillBound(page, 'search-check-in', criteria.checkIn);
+  await fillBound(page, 'search-check-out', criteria.checkOut);
+  await fillBound(page, 'search-guests', String(criteria.guests));
   await Promise.all([
     page.waitForResponse(
       (r) => new URL(r.url()).pathname === '/api/hotels' && r.request().method() === 'GET',
@@ -223,13 +332,146 @@ export async function readAvailableCount(page: Page, roomTypeId: number): Promis
  * Asserts that the current page shows no inline error.
  *
  * The shared error-message component renders its `inline-error` element only
- * while an error is set, so a count of zero means no error is on screen. The
- * booking journey calls this after each step to show that no inline error
- * appeared at any step.
+ * while an error is set, so a count of zero means no error is on screen. It is
+ * a snapshot of the screen on view at that moment only: it cannot see an
+ * error that was shown and then removed, for example by the navigation that
+ * ended a step. Evidence that no inline error appeared at any point of a flow
+ * comes from {@link watchInlineErrors}.
  *
  * @param page - The page to check, on any screen.
  * @returns A promise that settles once the page holds no inline error.
  */
 export async function expectNoInlineError(page: Page): Promise<void> {
   await expect(page.getByTestId('inline-error')).toHaveCount(0);
+}
+
+/**
+ * The record of inline errors that {@link watchInlineErrors} keeps for one
+ * page.
+ */
+export interface InlineErrorWatch {
+  /**
+   * Returns where an inline error has appeared on the page since the watch
+   * was installed, including errors that are no longer on screen.
+   *
+   * It first has the current document hand over every report it has raised,
+   * so an error rendered just before the call is included.
+   *
+   * @returns One `location.pathname` per inline error element, in the order
+   *   they appeared, for example `['/search']`; empty when none has appeared.
+   * @throws Error when the current document carries no watch, which happens
+   *   when the watch was installed after the page's first navigation.
+   */
+  appearances(): Promise<string[]>;
+}
+
+/** Numbers the page bindings of the watches, so no two names collide. */
+let inlineErrorWatchCount = 0;
+
+/**
+ * Starts recording every inline error the app renders on `page`, including
+ * one that a later navigation removes before a snapshot check such as
+ * {@link expectNoInlineError} could see it.
+ *
+ * Call it before the page's first `page.goto`. It installs, in every document
+ * the page loads from then on, a `MutationObserver` that reports each
+ * `inline-error` element once, when it is inserted or gains that test id, to
+ * a page binding. A report carries only the screen's path, never the error's
+ * text or the URL's query, so the record and any failure that prints it stay
+ * value-free. A report raised while the binding is not yet reachable waits in
+ * the page until the next report or the next
+ * {@link InlineErrorWatch.appearances} call delivers it.
+ *
+ * @param page - A page that has not navigated yet.
+ * @returns The watch whose {@link InlineErrorWatch.appearances} reads the
+ *   record.
+ */
+export async function watchInlineErrors(page: Page): Promise<InlineErrorWatch> {
+  inlineErrorWatchCount += 1;
+  const binding = `__smartHotelInlineErrors${inlineErrorWatchCount}`;
+  const seen: string[] = [];
+
+  await page.exposeBinding(binding, (_source, path?: unknown) => {
+    if (typeof path === 'string') {
+      seen.push(path);
+    }
+  });
+
+  await page.addInitScript((name: string) => {
+    const scope = window as unknown as Record<string, unknown>;
+    const selector = '[data-testid="inline-error"]';
+    const reported = new WeakSet<Element>();
+    const pending: string[] = [];
+
+    const deliver = (): void => {
+      const report = scope[name];
+      if (typeof report !== 'function') {
+        return;
+      }
+      for (const path of pending.splice(0)) {
+        void (report as (path: string) => Promise<void>)(path);
+      }
+    };
+
+    const record = (element: Element): void => {
+      if (reported.has(element)) {
+        return;
+      }
+      reported.add(element);
+      pending.push(location.pathname);
+      deliver();
+    };
+
+    const visit = (node: Node): void => {
+      if (!(node instanceof Element)) {
+        return;
+      }
+      if (node.matches(selector)) {
+        record(node);
+      }
+      node.querySelectorAll(selector).forEach(record);
+    };
+
+    scope[`${name}Deliver`] = deliver;
+    new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes') {
+          if (mutation.target instanceof Element && mutation.target.matches(selector)) {
+            record(mutation.target);
+          }
+        } else {
+          mutation.addedNodes.forEach(visit);
+        }
+      }
+    }).observe(document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-testid'],
+    });
+  }, binding);
+
+  return {
+    async appearances(): Promise<string[]> {
+      // Calling the binding once more, and awaiting it, returns only after
+      // every report the document raised before has been delivered in order.
+      const installed = await page.evaluate(async (name: string) => {
+        const scope = window as unknown as Record<string, unknown>;
+        const deliver = scope[`${name}Deliver`];
+        const report = scope[name];
+        if (typeof deliver !== 'function' || typeof report !== 'function') {
+          return false;
+        }
+        (deliver as () => void)();
+        await (report as () => Promise<void>)();
+        return true;
+      }, binding);
+      if (!installed) {
+        throw new Error(
+          'The inline-error watch is not installed in the current document; call watchInlineErrors before the first page.goto.',
+        );
+      }
+      return [...seen];
+    },
+  };
 }

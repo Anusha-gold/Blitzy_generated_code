@@ -45,15 +45,32 @@ server {
   access_log off;
   error_log stderr emerg;
 
+  # Compresses text responses for clients that accept gzip, because the image's
+  # base configuration leaves compression off and the bundles make up most of
+  # a first load. text/html is always compressed once gzip is on, so it is not
+  # listed. Vary tells caches that the body depends on Accept-Encoding, and
+  # requests forwarded by a TLS-terminating proxy, which adds a Via header,
+  # are compressed too. Bodies under 256 bytes gain nothing and are sent as
+  # they are.
+  gzip on;
+  gzip_vary on;
+  gzip_comp_level 6;
+  gzip_min_length 256;
+  gzip_proxied any;
+  gzip_types text/css application/javascript application/json image/svg+xml text/plain;
+
   # Runtime configuration fetched by the SPA before bootstrap.
   location = /config.json {
     # The renderer leaves an undefined input as its literal placeholder, which
     # nginx reads as the same-named nginx variable (names are case-insensitive)
     # and would refuse to start on. These declarations give such an input the
-    # value "", which the maps above serve as an empty API base URL and as
-    # Production; no default value is supplied. Their lower-case names stay out
-    # of the renderer only because envsubst matches names case-sensitively and
-    # the image limits substitution to the two upper-case inputs.
+    # value "". An undefined API_BASE_URL is then served as an empty API base
+    # URL, for which the SPA shows its boot-error state: no default URL is
+    # supplied. An undefined WEB_ENVIRONMENT falls back to Production, the
+    # SPA's strict mode, through the environment map's default. The declared
+    # names are lower-case and stay out of the renderer only because envsubst
+    # matches names case-sensitively and the image limits substitution to the
+    # two upper-case inputs.
     set $api_base_url "";
     set $web_environment "";
     default_type application/json;
@@ -61,8 +78,23 @@ server {
     return 200 '{"apiBaseUrl":"$smarthotel_api_base_url","environment":"$smarthotel_environment"}';
   }
 
-  # SPA fallback so deep links load index.html.
+  # Hashed build output: the main, polyfills, styles and chunk bundles. Every
+  # build names a changed file afresh, so a name never changes content and
+  # browsers keep it for a year without revalidating. A missing hashed file,
+  # such as one an earlier build's index.html still names, is a 404, never the
+  # HTML shell. The header is left off error responses, so a 404 is never
+  # cached as immutable.
+  location ~* "^/[a-z]+-[A-Z0-9]{8}\.(js|css)$" {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    try_files $uri =404;
+  }
+
+  # SPA fallback so deep links load index.html. index.html names the current
+  # build's hashed files, so browsers revalidate it on every load and pick up a
+  # redeploy at once. Requests for / and for deep links reach index.html
+  # through this location as well.
   location / {
+    add_header Cache-Control "no-cache";
     try_files $uri $uri/ /index.html;
   }
 }

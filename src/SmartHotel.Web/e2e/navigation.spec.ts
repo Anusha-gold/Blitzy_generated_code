@@ -4,7 +4,7 @@
 // is then reached by clicks alone after one initial load of /search.
 import { test, expect } from '@playwright/test';
 
-import { logIn, registerGuest, searchHotels, TEST_PASSWORD, uniqueEmail, utcDate } from './support/helpers';
+import { expectSignedInAs, logIn, registerGuest, searchHotels, TEST_PASSWORD, uniqueEmail, utcDates } from './support/helpers';
 
 test('entry and unknown URLs redirect to search', async ({ page }) => {
   const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
@@ -26,8 +26,7 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
   test.setTimeout(90_000);
 
   const email = uniqueEmail();
-  const checkIn = utcDate(20);
-  const checkOut = utcDate(22);
+  const [checkIn, checkOut] = utcDates(20, 22);
   const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
 
   // The only direct load: the in-memory session must survive every later step,
@@ -75,7 +74,7 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
     await expect(h1('Log in')).toBeVisible();
 
     await logIn(page, email, TEST_PASSWORD);
-    await expect(page.getByTestId('nav-email')).toHaveText(email);
+    await expectSignedInAs(page, email);
     await expect(page.getByTestId('nav-logout')).toHaveText('Log out');
     await expect(page).toHaveURL(/\/search$/);
     await expect(h1('Find a hotel')).toBeVisible();

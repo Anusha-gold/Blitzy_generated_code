@@ -9,7 +9,13 @@
 #
 # Host ports are bound to 127.0.0.1 only. SMARTHOTEL_API_PORT and
 # SMARTHOTEL_WEB_PORT set the published ports and the origins derived from
-# them, so the SPA, CORS and the tests always agree.
+# them, so the SPA, CORS and the tests always agree. Each must be one port
+# number from 1 to 65535, written in decimal without leading zeros. Compose
+# also accepts 0, ranges and leading zeros, which give the derived URLs no
+# fixed port written as browsers write it, so the api entrypoint rejects
+# them, naming the variable, and the stack does not start. For web port 80
+# it writes the CORS origin as http://localhost, without the default port,
+# as browsers send it.
 #
 # Secrets: none is written here. On the first start the db wrapper writes the
 # database password and the JWT signing key into the `secrets` volume, from
@@ -66,6 +72,10 @@ services:
       SMARTHOTEL_SECRETS_DIR: /run/smarthotel-secrets
       # A bare origin, with no path or trailing slash, as the API requires.
       Cors__AllowedOrigin: http://localhost:${SMARTHOTEL_WEB_PORT:-4200}
+      # Passed on so the image's entrypoint checks both host ports before the
+      # API starts; api starts before web, so a bad port stops the stack.
+      SMARTHOTEL_API_PORT: ${SMARTHOTEL_API_PORT:-8080}
+      SMARTHOTEL_WEB_PORT: ${SMARTHOTEL_WEB_PORT:-4200}
     volumes:
       - secrets:/run/smarthotel-secrets:ro
     ports:

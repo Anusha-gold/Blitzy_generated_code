@@ -116,8 +116,9 @@ public sealed class HotelDetailTests : IClassFixture<SmartHotelApiFactory>
         string checkOut = ApiTestClient.Iso(today.AddDays(32));
 
         // The next year's dates are always in the future, so the unpadded check-out is the only broken input of its
-        // row: written padded, Y-01-05 to Y-01-07 is a valid 2-night stay.
-        int year = ApiTestClient.NextYear;
+        // row: written padded, Y-01-05 to Y-01-07 is a valid 2-night stay. The year comes from the same today as the
+        // baseline dates, so a run that crosses midnight UTC cannot split them.
+        int year = ApiTestClient.NextYear(today);
 
         return caseLabel switch
         {

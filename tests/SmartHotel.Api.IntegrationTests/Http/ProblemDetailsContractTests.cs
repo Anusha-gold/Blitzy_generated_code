@@ -120,7 +120,12 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         using HttpResponseMessage response = await client.Http.SendAsync(request, cancellationToken);
 
         await ProblemAssert.AssertProblemAsync(response, expected, errorKey, cancellationToken);
-        Assert.Equal(ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
+
+        // The exact spelling is checked as a boolean with a fixed message, because Assert.Equal would print the
+        // response's media type.
+        Assert.True(
+            string.Equals(ProblemMediaType, response.Content.Headers.ContentType?.MediaType, StringComparison.Ordinal),
+            $"Expected the media type to be exactly {ProblemMediaType}.");
 
         if (scenario == BookingsWithoutTokenScenario)
         {
@@ -150,9 +155,11 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         await variant.InitializeAsync();
         ApiTestClient client = variant.CreateApiClient();
 
-        // The dates come from the real clock, so the query is valid and only the controller's clock read fails.
-        string checkIn = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(30));
-        string checkOut = ApiTestClient.Iso(ApiTestClient.TodayUtc.AddDays(32));
+        // The dates come from one read of the real clock, so the query is a valid 2-night stay even across midnight
+        // UTC, and only the controller's clock read fails.
+        DateOnly today = ApiTestClient.TodayUtc;
+        string checkIn = ApiTestClient.Iso(today.AddDays(30));
+        string checkOut = ApiTestClient.Iso(today.AddDays(32));
 
         clock.Arm();
         try
@@ -163,18 +170,34 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
                 checkOut,
                 "2",
                 cancellationToken);
-            string body = await response.Content.ReadAsStringAsync(cancellationToken);
 
             await ProblemAssert.AssertProblemAsync(
                 response,
                 HttpStatusCode.InternalServerError,
                 cancellationToken: cancellationToken);
 
-            Assert.DoesNotContain(SecretMarker, body, StringComparison.Ordinal);
-            Assert.DoesNotContain("InvalidOperationException", body, StringComparison.Ordinal);
-            Assert.DoesNotContain("   at ", body, StringComparison.Ordinal);
-            Assert.DoesNotContain(nameof(ThrowingTimeProvider), body, StringComparison.Ordinal);
-            Assert.DoesNotContain("GetUtcNow", body, StringComparison.Ordinal);
+            // Read only after ProblemAssert has decoded the buffered body. Reading first would let an unsupported
+            // charset raise an exception whose message quotes the Content-Type value, where ProblemAssert reports a
+            // fixed message instead.
+            string body = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            // Each check is a boolean with a fixed message, because Assert.DoesNotContain quotes the body around a
+            // match, and that would write the leaked exception text to the test output.
+            Assert.False(
+                body.Contains(SecretMarker, StringComparison.Ordinal),
+                "Expected the 500 problem body not to contain the exception message.");
+            Assert.False(
+                body.Contains("InvalidOperationException", StringComparison.Ordinal),
+                "Expected the 500 problem body not to contain the exception type name.");
+            Assert.False(
+                body.Contains("   at ", StringComparison.Ordinal),
+                "Expected the 500 problem body not to contain a stack frame.");
+            Assert.False(
+                body.Contains(nameof(ThrowingTimeProvider), StringComparison.Ordinal),
+                "Expected the 500 problem body not to contain the throwing clock's type name.");
+            Assert.False(
+                body.Contains("GetUtcNow", StringComparison.Ordinal),
+                "Expected the 500 problem body not to contain the clock member name.");
         }
         finally
         {
@@ -202,13 +225,16 @@ public sealed class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFac
         ApiTestClient client = _factory.CreateApiClient();
 
         using HttpResponseMessage response = await SendBindingFailureAsync(client, scenario, cancellationToken);
-        string body = await response.Content.ReadAsStringAsync(cancellationToken);
 
         JsonElement problem = await ProblemAssert.AssertProblemAsync(
             response,
             HttpStatusCode.BadRequest,
             expectedErrorKey,
             cancellationToken);
+
+        // Read only after ProblemAssert has decoded the buffered body, so an unsupported charset yields its fixed
+        // message rather than an exception whose message quotes the Content-Type value.
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
 
         // AssertProblemAsync has checked that errors is one object holding the case's key, so only the count of
         // keys, never a key from the response, can reach this failure message.

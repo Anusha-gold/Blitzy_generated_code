@@ -6,6 +6,14 @@
  * all through the web app. After the first `page.goto('/')` every transition
  * is a click.
  *
+ * Criterion 1 also requires that no inline error appeared at any step. Each
+ * step's `expectNoInlineError` sees only the screen on view when it runs, so
+ * it cannot see an error shown during registration, login or booking and
+ * then removed by the navigation that ends the step. The journey therefore
+ * installs `watchInlineErrors` before its first `page.goto`, and every step
+ * ends, like the journey itself, by asserting that the watch has recorded no
+ * inline error anywhere so far.
+ *
  * Criterion 2: the same search then shows one fewer available room of the
  * booked type, and after cancelling the count returns to its original value.
  * Search results carry only each hotel's lowest price, so the count is read on
@@ -21,13 +29,16 @@ import { test, expect, type APIRequestContext } from '@playwright/test';
 import {
   TEST_PASSWORD,
   apiUrl,
+  expectControlValue,
   expectNoInlineError,
+  expectSignedInAs,
   logIn,
   readAvailableCount,
   registerGuest,
   searchHotels,
   uniqueEmail,
-  utcDate,
+  utcDates,
+  watchInlineErrors,
 } from './support/helpers';
 
 /** What the cleanup hook needs to know about the run in progress. */
@@ -140,8 +151,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
   test.setTimeout(120_000);
 
   const city = 'Seattle';
-  const checkIn = utcDate(14);
-  const checkOut = utcDate(16);
+  const [checkIn, checkOut] = utcDates(14, 16);
   const guests = 2;
   const criteria = { city, checkIn, checkOut, guests };
   const email = uniqueEmail();
@@ -159,6 +169,19 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     expect(query.get('guests')).toBe(String(guests));
   };
 
+  // Installed before the first page.goto, so it records every inline error
+  // of the journey, including one a navigation removes before a step's
+  // expectNoInlineError runs.
+  const inlineErrors = await watchInlineErrors(page);
+
+  /** Asserts that no inline error has appeared anywhere in the journey so far. */
+  const expectNoInlineErrorSoFar = async (): Promise<void> => {
+    expect(
+      await inlineErrors.appearances(),
+      'paths where an inline error appeared during the journey',
+    ).toEqual([]);
+  };
+
   await test.step('register', async () => {
     await page.goto('/');
     await expect(page).toHaveURL(/\/search$/);
@@ -166,21 +189,24 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     await expect(page).toHaveURL(/\/register$/);
     await registerGuest(page, { email, password: TEST_PASSWORD, fullName });
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
   });
 
   await test.step('log in', async () => {
     await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
-    await expect(page.getByTestId('login-email')).toHaveValue(email);
+    await expectControlValue(page, 'login-email', email);
     await logIn(page, email, TEST_PASSWORD);
     await expect(page).toHaveURL(/\/search$/);
-    await expect(page.getByTestId('nav-email')).toHaveText(email);
+    await expectSignedInAs(page, email);
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
   });
 
   await test.step('search', async () => {
     await searchHotels(page, criteria);
     await expect(page.locator('[data-testid^="hotel-result-"]').first()).toBeVisible();
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
   });
 
   const { hotelId, hotelName } = await test.step('open a hotel', async () => {
@@ -193,6 +219,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     const name = (await heading.innerText()).trim();
     expect(name, 'hotel name').not.toBe('');
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
     return { hotelId: id, hotelName: name };
   });
 
@@ -205,12 +232,14 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
       const id = idFromTestId(await row.getAttribute('data-testid'), 'room-type-row-');
       const available = await readAvailableCount(page, id);
       if (available > 0 && (await page.getByTestId(`book-${id}`).isEnabled())) {
-        return {
+        const picked = {
           id,
           available,
           name: (await row.locator('td').first().innerText()).trim(),
           stayTotal: (await page.getByTestId(`stay-total-${id}`).innerText()).trim(),
         };
+        await expectNoInlineErrorSoFar();
+        return picked;
       }
     }
     throw new Error(
@@ -228,6 +257,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     await expect(confirmation).toContainText(roomType.name);
     await expect(confirmation).toContainText('No payment is taken online in this version.');
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
   });
 
   const bookingId = await test.step('verify the booking in My bookings', async () => {
@@ -243,6 +273,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     // detail page showed for the same stay.
     await expect(page.getByTestId(`booking-total-${id}`)).toHaveText(roomType.stayTotal);
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
     return id;
   });
 
@@ -263,6 +294,7 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
       })
       .toBe(expected);
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
   };
 
   await test.step('recount after booking', async () => {
@@ -278,9 +310,13 @@ test('guest books a room, sees it, and cancels it', async ({ page }) => {
     state.cancelled = true;
     await expect(cancel).toHaveCount(0);
     await expectNoInlineError(page);
+    await expectNoInlineErrorSoFar();
   });
 
   await test.step('recount after cancelling', async () => {
     await expectCountAfterRepeatedSearch(roomType.available);
   });
+
+  // Criterion 1: no inline error appeared at any step of the journey.
+  await expectNoInlineErrorSoFar();
 });

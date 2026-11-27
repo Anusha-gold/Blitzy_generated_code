@@ -22,10 +22,10 @@
   margin-block: 0;
 }
 
-/* #52606d on white is 6.4:1. */
+/* Muted text on white is 6.4:1. */
 .hotel-meta,
 .rooms-empty {
-  color: #52606d;
+  color: var(--sh-color-text-muted);
 }
 
 .hotel-stay {

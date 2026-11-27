@@ -128,6 +128,8 @@ To use other host ports, set `SMARTHOTEL_API_PORT` (default `8080`) and `SMARTHO
 SMARTHOTEL_API_PORT=9080 SMARTHOTEL_WEB_PORT=5200 docker compose up -d --wait
 ```
 
+Each port must be one port number from `1` to `65535`, written in decimal without leading zeros. Compose itself also accepts `0` (a random port), ranges such as `14200-14201` and leading zeros such as `04200`, but none of them gives the CORS origin and the web app's API address one fixed port, written as browsers write it. The `api` container therefore exits at start with a message that names the variable, shown by `docker compose logs api`, and `docker compose up --wait` fails. Port `80` works as browsers write it: `SMARTHOTEL_WEB_PORT=80` gives the CORS origin `http://localhost`, and `SMARTHOTEL_API_PORT=80` makes the web app call `http://localhost/api`.
+
 ### Seed data
 
 On the first start the API seeds five hotels in three cities:
@@ -375,12 +377,12 @@ The API reads secrets only from process environment variables, never from `appse
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SMARTHOTEL_API_PORT` | `8080` | Host port of the API. Also sets the web app's `API_BASE_URL`. |
-| `SMARTHOTEL_WEB_PORT` | `4200` | Host port of the web app. Also sets the API's `Cors__AllowedOrigin`. |
+| `SMARTHOTEL_API_PORT` | `8080` | Host port of the API: one port number from `1` to `65535`, in decimal without leading zeros. `0`, a range or a leading zero makes the `api` container exit at start with a message naming the variable, so `docker compose up --wait` fails ([port rules](#run-the-product)). Also sets the web app's `API_BASE_URL`. |
+| `SMARTHOTEL_WEB_PORT` | `4200` | Host port of the web app, in the same format and with the same check. Also sets the API's `Cors__AllowedOrigin`; port `80` gives the origin `http://localhost`. |
 | `SMARTHOTEL_DB_PASSWORD` | Blank, so generated | First-start override of the database password, in the [secret format](#secrets) |
 | `SMARTHOTEL_JWT_SIGNING_KEY` | Blank, so generated | First-start override of the JWT signing key, in the [secret format](#secrets) |
 
-[`docker-compose.yml`](docker-compose.yml) sets everything else for the local stack. The API gets `ASPNETCORE_ENVIRONMENT=Development`, `ASPNETCORE_HTTP_PORTS=8080`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `SMARTHOTEL_SECRETS_DIR` and `Cors__AllowedOrigin=http://localhost:<web port>`. The web container gets `API_BASE_URL=http://localhost:<api port>/api` and `WEB_ENVIRONMENT=Development`, which it renders into `/config.json`.
+[`docker-compose.yml`](docker-compose.yml) sets everything else for the local stack. The API gets `ASPNETCORE_ENVIRONMENT=Development`, `ASPNETCORE_HTTP_PORTS=8080`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `SMARTHOTEL_SECRETS_DIR`, `Cors__AllowedOrigin=http://localhost:<web port>`, and `SMARTHOTEL_API_PORT` and `SMARTHOTEL_WEB_PORT` themselves, which its entrypoint checks before the API starts; for web port `80` the entrypoint writes the origin as `http://localhost`. The web container gets `API_BASE_URL=http://localhost:<api port>/api` and `WEB_ENVIRONMENT=Development`, which it renders into `/config.json`.
 
 ### Outside local development
 

@@ -8,6 +8,8 @@ using Microsoft.EntityFrameworkCore;
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 using SmartHotel.Data.Entities;
 
+using Xunit.Sdk;
+
 namespace SmartHotel.Api.IntegrationTests.Auth;
 
 public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<SmartHotelApiFactory>
@@ -77,7 +79,12 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             ct);
 
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-        Assert.Null(response.Headers.Location);
+
+        // A boolean with a fixed message rather than Assert.Null, which would print a regressed Location URI, and a
+        // URI that identifies a guest could carry the email.
+        Assert.True(
+            response.Headers.Location is null,
+            "Expected the registration response to have no Location header.");
 
         int guestId = await ReadGuestIdAsync(response, ct);
 
@@ -85,11 +92,16 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             (db, token) => db.Guests.AsNoTracking().SingleAsync(g => g.Id == guestId, token),
             ct);
 
-        Assert.Equal(expectedEmail, guest.Email);
-        Assert.Equal(ValidFullName, guest.FullName);
+        // The stored strings are checked with fixed messages rather than Assert.Equal/NotEqual, so a failure never
+        // prints the email, the full name, the password or the hash. Ordinal equality is as exact as Assert.Equal.
+        Assert.True(
+            string.Equals(expectedEmail, guest.Email, StringComparison.Ordinal),
+            "Expected the stored email to be the submitted email trimmed and in lower case.");
+        Assert.True(
+            string.Equals(ValidFullName, guest.FullName, StringComparison.Ordinal),
+            "Expected the stored full name to equal the submitted full name.");
         Assert.Equal(DateTimeKind.Utc, guest.CreatedAt.Kind);
 
-        // Fixed messages rather than Assert.Equal/NotEqual, so a failure never prints the password or the hash.
         Assert.False(string.IsNullOrEmpty(guest.PasswordHash), "Expected a stored password hash.");
         Assert.False(
             string.Equals(guest.PasswordHash, ValidPassword, StringComparison.Ordinal),
@@ -151,16 +163,35 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     }
 
     // Reads the 201 body as raw JSON rather than a typed record, so any member beyond guestId, such as a password
-    // hash, fails the test. Only member names reach a failure message, never their values.
+    // hash, fails the test. A regression could name a member after the guest's email or put it in a value, so no
+    // member name, value or parser message from the response reaches a failure message; at most the member count does.
     private static async Task<int> ReadGuestIdAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
-        await using Stream body = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using JsonDocument document = await JsonDocument.ParseAsync(body, cancellationToken: cancellationToken);
-        JsonElement root = document.RootElement;
+        JsonElement root;
+        await using (Stream body = await response.Content.ReadAsStreamAsync(cancellationToken))
+        {
+            try
+            {
+                using JsonDocument document = await JsonDocument.ParseAsync(body, cancellationToken: cancellationToken);
+                root = document.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                // The parser's message quotes characters of the offending input.
+                throw FailException.ForFailure(
+                    "Expected the registration response to be a JSON document but it could not be parsed.");
+            }
+        }
 
         Assert.Equal(JsonValueKind.Object, root.ValueKind);
         string[] memberNames = [.. root.EnumerateObject().Select(static member => member.Name)];
-        Assert.Equal("guestId", Assert.Single(memberNames));
+        Assert.True(
+            memberNames.Length == 1 && string.Equals("guestId", memberNames[0], StringComparison.Ordinal),
+            memberNames.Length == 1
+                ? "Expected the registration response to have exactly one member, guestId, but its one member has "
+                    + "a different name."
+                : "Expected the registration response to have exactly one member, guestId, but it has "
+                    + $"{memberNames.Length} members.");
 
         JsonElement guestIdValue = root.GetProperty("guestId");
         Assert.Equal(JsonValueKind.Number, guestIdValue.ValueKind);

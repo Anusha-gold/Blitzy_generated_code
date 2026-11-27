@@ -7,6 +7,8 @@ using Microsoft.IdentityModel.JsonWebTokens;
 
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 
+using Xunit.Sdk;
+
 namespace SmartHotel.Api.IntegrationTests.Auth;
 
 public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
@@ -63,8 +65,15 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         ProblemAssert.AssertSameProblem(wrongPassword, blankFields);
         ProblemAssert.AssertSameProblem(wrongPassword, nullFields);
 
-        Assert.Equal(InvalidCredentialsTitle, wrongPassword.GetProperty("title").GetString());
-        Assert.Equal(InvalidCredentialsDetail, wrongPassword.GetProperty("detail").GetString());
+        // Compared in memory with fixed messages, so a regressed title or detail never reaches the test output.
+        string? title = wrongPassword.GetProperty("title").GetString();
+        string? detail = wrongPassword.GetProperty("detail").GetString();
+        Assert.True(
+            string.Equals(InvalidCredentialsTitle, title, StringComparison.Ordinal),
+            "Expected the 401 problem's title to be the fixed credential-failure title.");
+        Assert.True(
+            string.Equals(InvalidCredentialsDetail, detail, StringComparison.Ordinal),
+            "Expected the 401 problem's detail to be the fixed credential-failure detail.");
     }
 
     [Theory]
@@ -135,22 +144,47 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
 
         using HttpResponseMessage response = await client.LoginAsync(new { email, password = ValidPassword }, ct);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal(JsonMediaType, response.Content.Headers.ContentType?.MediaType);
+
+        // Compared in memory with a fixed message, so the response's own media type never reaches the test output.
+        string? mediaType = response.Content.Headers.ContentType?.MediaType;
+        Assert.True(
+            string.Equals(JsonMediaType, mediaType, StringComparison.Ordinal),
+            mediaType is null
+                ? $"Expected the login response's media type to be {JsonMediaType} but it has no valid Content-Type."
+                : $"Expected the login response's media type to be {JsonMediaType} but it has a different one.");
 
         JsonElement body;
         await using (Stream stream = await response.Content.ReadAsStreamAsync(ct))
         {
-            using JsonDocument document = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
-            body = document.RootElement.Clone();
+            try
+            {
+                using JsonDocument document = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+                body = document.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                // The parser's message quotes the offending input, and this body carries a live token.
+                throw FailException.ForFailure(
+                    "Expected the login response to be a JSON document but it could not be parsed.");
+            }
         }
 
         Assert.Equal(JsonValueKind.Object, body.ValueKind);
+
+        // The sorted names are compared in memory and only their count is reported, because a regression could name
+        // a member after the guest's email or the token.
         string[] expectedMembers = ["expiresAt", "token"];
         string[] members =
         [
             .. body.EnumerateObject().Select(static member => member.Name).Order(StringComparer.Ordinal),
         ];
-        Assert.Equal(expectedMembers, members);
+        Assert.True(
+            members.SequenceEqual(expectedMembers, StringComparer.Ordinal),
+            members.Length == expectedMembers.Length
+                ? "Expected the login response to have exactly the expiresAt and token members but its "
+                    + $"{members.Length} member names differ from them."
+                : "Expected the login response to have exactly the expiresAt and token members but it has "
+                    + $"{members.Length} member(s).");
 
         // The token is a live credential, so it is never passed to an assertion that would print it.
         JsonElement tokenElement = body.GetProperty("token");
@@ -164,7 +198,17 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         string? expiresAt = expiresAtElement.GetString();
 
         // Reads the token without validating it; the API's own validation is covered by the protected endpoints.
-        JsonWebToken jwt = new JsonWebTokenHandler().ReadJsonWebToken(token);
+        JsonWebToken jwt;
+        try
+        {
+            jwt = new JsonWebTokenHandler().ReadJsonWebToken(token);
+        }
+        catch (ArgumentException)
+        {
+            // Every rejection of a malformed token, SecurityTokenMalformedException included, is an
+            // ArgumentException whose message or inner exception can describe the token, so neither is passed on.
+            throw FailException.ForFailure("Expected the login token to be a well-formed JWT.");
+        }
 
         Assert.True(jwt.TryGetPayloadValue("iat", out long issuedAt), "Expected an integer iat claim.");
         Assert.True(jwt.TryGetPayloadValue("nbf", out long notBefore), "Expected an integer nbf claim.");
@@ -177,20 +221,36 @@ public sealed class LoginTests : IClassFixture<SmartHotelApiFactory>
         string expectedExpiresAt = DateTimeOffset.FromUnixTimeSeconds(expires)
             .UtcDateTime
             .ToString(ExpiresAtFormat, CultureInfo.InvariantCulture);
-        Assert.Equal(expectedExpiresAt, expiresAt);
+        Assert.True(
+            string.Equals(expectedExpiresAt, expiresAt, StringComparison.Ordinal),
+            $"Expected expiresAt to equal the token's exp claim written as {ExpiresAtFormat}.");
 
         long now = TimeProvider.System.GetUtcNow().ToUnixTimeSeconds();
         Assert.InRange(issuedAt, now - ClockToleranceSeconds, now + ClockToleranceSeconds);
 
-        Assert.Equal("HS256", jwt.Alg);
-        Assert.Equal(_factory.JwtIssuer, jwt.Issuer);
-        Assert.Contains(_factory.JwtAudience, jwt.Audiences);
-        Assert.Equal(guestId.ToString(CultureInfo.InvariantCulture), jwt.Subject);
+        // Header and claim values are compared in memory with fixed messages, because a regression could put the
+        // guest's email or name into any of them.
+        Assert.True(
+            string.Equals("HS256", jwt.Alg, StringComparison.Ordinal),
+            "Expected the token's alg header to be HS256.");
+        Assert.True(
+            string.Equals(_factory.JwtIssuer, jwt.Issuer, StringComparison.Ordinal),
+            "Expected the token's iss claim to be the configured issuer.");
+        Assert.True(
+            jwt.Audiences.Contains(_factory.JwtAudience, StringComparer.Ordinal),
+            "Expected the token's aud claim to include the configured audience.");
+        Assert.True(
+            string.Equals(guestId.ToString(CultureInfo.InvariantCulture), jwt.Subject, StringComparison.Ordinal),
+            "Expected the token's sub claim to be the registered guest id.");
 
         Assert.True(jwt.TryGetPayloadValue("email", out string? emailClaim), "Expected an email claim.");
-        Assert.Equal(email, emailClaim);
+        Assert.True(
+            string.Equals(email, emailClaim, StringComparison.Ordinal),
+            "Expected the email claim to equal the registered email.");
         Assert.True(jwt.TryGetPayloadValue("name", out string? nameClaim), "Expected a name claim.");
-        Assert.Equal(FullName, nameClaim);
+        Assert.True(
+            string.Equals(FullName, nameClaim, StringComparison.Ordinal),
+            "Expected the name claim to equal the registered full name.");
         Assert.False(string.IsNullOrEmpty(jwt.Id), "Expected a non-empty jti claim.");
     }
 

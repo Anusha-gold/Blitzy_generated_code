@@ -25,7 +25,7 @@ label {
   margin-block-end: 0.125rem;
 }
 
-/* One 44px height for every control; date inputs are otherwise 2px taller. */
+/* Shared minimum touch target: every control is at least 2.75rem tall (44px at a 16px root). */
 input,
 button {
   min-block-size: 2.75rem;
@@ -69,10 +69,10 @@ button {
   text-underline-offset: 0.2em;
 }
 
-/* #52606d on white is 6.4:1. */
+/* Muted text on white is 6.4:1. */
 .empty {
   margin-block: 1rem 0;
-  color: #52606d;
+  color: var(--sh-color-text-muted);
 }
 
 /* Chrome's date-picker button takes focus inside the input, where the

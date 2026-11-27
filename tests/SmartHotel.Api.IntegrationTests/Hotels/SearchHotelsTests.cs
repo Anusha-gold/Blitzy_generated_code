@@ -32,12 +32,6 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         _client = factory.CreateApiClient();
     }
 
-    // The valid baseline stay, today+30 to today+32. Computed on every read, like ApiTestClient.TodayUtc, so a run
-    // that crosses midnight UTC still agrees with the server's "today".
-    private static DateOnly CheckIn => ApiTestClient.TodayUtc.AddDays(30);
-
-    private static DateOnly CheckOut => ApiTestClient.TodayUtc.AddDays(32);
-
     [Theory]
     [InlineData("checkIn-missing", "checkIn")]
     [InlineData("checkOut-missing", "checkOut")]
@@ -75,8 +69,9 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
     public async Task Search_SeededCity_ReturnsHotelsWithLowestPrice()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
-        DateOnly checkIn = CheckIn;
-        DateOnly checkOut = CheckOut;
+        DateOnly today = ApiTestClient.TodayUtc;
+        DateOnly checkIn = today.AddDays(30);
+        DateOnly checkOut = today.AddDays(32);
         int downtownId = await _factory.GetHotelIdAsync(SeattleDowntown, cancellationToken);
         int waterfrontId = await _factory.GetHotelIdAsync(SeattleWaterfront, cancellationToken);
 
@@ -101,7 +96,8 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
     public async Task Search_NoAvailability_ReturnsEmptyList()
     {
         CancellationToken cancellationToken = TestContext.Current.CancellationToken;
-        DateOnly soldOutCheckIn = ApiTestClient.TodayUtc.AddDays(90);
+        DateOnly today = ApiTestClient.TodayUtc;
+        DateOnly soldOutCheckIn = today.AddDays(90);
         DateOnly soldOutCheckOut = soldOutCheckIn.AddDays(1);
         int hotelId = await _factory.GetHotelIdAsync(ChicagoLoop, cancellationToken);
 
@@ -159,21 +155,22 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         Assert.Equal(hotelId, Assert.Single(backToBack).Id);
 
         IReadOnlyList<ApiTestClient.HotelSummary> unknownCity =
-            await SearchOkAsync("Atlantis", CheckIn, CheckOut, 2, cancellationToken);
+            await SearchOkAsync("Atlantis", today.AddDays(30), today.AddDays(32), 2, cancellationToken);
         Assert.Empty(unknownCity);
     }
 
     // DateOnly values cannot be attribute arguments, so each theory row names its case and the query is built here.
     // Every case breaks exactly one input and keeps the others at the valid baseline, so it fails only for its stated
     // reason. The format cases pair their broken check-in with Y-01-07, the check-out of the valid stay Y-01-05 to
-    // Y-01-07 in the following year Y.
+    // Y-01-07 in the following year Y. Every date and the year come from one read of today, so a run that crosses
+    // midnight UTC cannot build a stay of another length or another year.
     private static (string? City, string? CheckIn, string? CheckOut, string? Guests) InvalidQuery(string caseLabel)
     {
         DateOnly today = ApiTestClient.TodayUtc;
-        DateOnly baselineCheckIn = CheckIn;
+        DateOnly baselineCheckIn = today.AddDays(30);
         string checkIn = ApiTestClient.Iso(baselineCheckIn);
-        string checkOut = ApiTestClient.Iso(CheckOut);
-        int year = ApiTestClient.NextYear;
+        string checkOut = ApiTestClient.Iso(today.AddDays(32));
+        int year = ApiTestClient.NextYear(today);
         string formatCaseCheckOut = string.Create(CultureInfo.InvariantCulture, $"{year}-01-07");
 
         return caseLabel switch

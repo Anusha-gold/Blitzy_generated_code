@@ -81,16 +81,24 @@ builder.Services
         options.InvalidModelStateResponseFactory = ProblemDetailsSetup.CreateInvalidModelStateResponse);
 
 // The single-origin policy is built from the validated options when the policy provider first reads them, after
-// Build(). It allows no credentials.
+// Build(). It allows no credentials, and browsers may reuse a preflight for ApiCorsOptions.PreflightMaxAgeSeconds.
 builder.Services.AddCors();
 builder.Services
     .AddOptions<CorsOptions>()
-    .Configure<IOptions<ApiCorsOptions>>(static (cors, api) => cors.AddPolicy(
-        ApiCorsOptions.PolicyName,
-        policy => policy
-            .WithOrigins(api.Value.AllowedOrigin!)
+    .Configure<IOptions<ApiCorsOptions>>(static (cors, api) =>
+    {
+        CorsPolicy policy = new CorsPolicyBuilder()
             .WithMethods(HttpMethods.Get, HttpMethods.Post, HttpMethods.Delete)
-            .WithHeaders(HeaderNames.Authorization, HeaderNames.ContentType)));
+            .WithHeaders(HeaderNames.Authorization, HeaderNames.ContentType)
+            .SetPreflightMaxAge(TimeSpan.FromSeconds(ApiCorsOptions.PreflightMaxAgeSeconds))
+            .Build();
+
+        // WithOrigins is not used: it rebuilds an IPv6 origin through Uri, which writes an address that embeds an
+        // IPv4 address with a dotted tail no browser sends. The validated value is already the browser's serialized
+        // origin, so it is added as is and matched ordinally against the Origin header.
+        policy.Origins.Add(api.Value.AllowedOrigin!);
+        cors.AddPolicy(ApiCorsOptions.PolicyName, policy);
+    });
 
 // The default challenge is kept: a bodyless 401 with WWW-Authenticate: Bearer, which status-code pages turn into a
 // problem without touching the header.

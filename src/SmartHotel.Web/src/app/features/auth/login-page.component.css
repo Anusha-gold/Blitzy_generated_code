@@ -1,4 +1,4 @@
-/* Login page: a narrow centred column; the notice tint is ~8% accent over white. */
+/* Login page: a narrow centred column. */
 :host {
   display: block;
   max-inline-size: 24rem;
@@ -25,7 +25,7 @@ p {
   border-inline-start: 4px solid var(--sh-color-accent);
   border-radius: var(--sh-radius);
   color: var(--sh-color-text);
-  background-color: #ebf2fb;
+  background-color: var(--sh-color-accent-tint);
 }
 
 .field {

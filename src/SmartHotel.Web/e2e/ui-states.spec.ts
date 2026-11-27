@@ -23,11 +23,15 @@ import { expect, test, type Page } from '@playwright/test';
 import {
   TEST_PASSWORD,
   expectNoInlineError,
+  // Some tests fill forms field by field: the form helpers also wait for
+  // their success outcome, which these tests must not wait for (a delayed
+  // search) or expect never to happen (a rejected registration or login).
+  fillBound,
   logIn,
   registerGuest,
   searchHotels,
   uniqueEmail,
-  utcDate,
+  utcDates,
 } from './support/helpers';
 
 /**
@@ -52,22 +56,6 @@ const isLoginApi = (url: URL): boolean => url.pathname === '/api/auth/login';
 
 /** Every hotel card on the search page. */
 const HOTEL_RESULTS = '[data-testid^="hotel-result-"]';
-
-/**
- * Fills a reactive-form input once Angular has bound it, then confirms the
- * value held. A fill that lands before the first change-detection pass is
- * overwritten by the control's initial value, so it waits for the
- * `ng-pristine` or `ng-dirty` class that pass sets. The shared helpers apply
- * the same rule, but each of them also waits for its success outcome, which
- * these tests either must not wait for (a delayed search) or expect never to
- * happen (a rejected registration or login).
- */
-async function fillBound(page: Page, testId: string, value: string): Promise<void> {
-  const field = page.getByTestId(testId);
-  await expect(field).toHaveClass(/\bng-(?:pristine|dirty)\b/);
-  await field.fill(value);
-  await expect(field).toHaveValue(value);
-}
 
 /**
  * Opens the register page, registers a fresh guest and returns the email.
@@ -112,10 +100,11 @@ test('loading indicator is visible while a request is pending', async ({ page })
     await route.continue();
   });
 
+  const [checkIn, checkOut] = utcDates(30, 32);
   await page.goto('/search');
   await fillBound(page, 'search-city', 'Seattle');
-  await fillBound(page, 'search-check-in', utcDate(30));
-  await fillBound(page, 'search-check-out', utcDate(32));
+  await fillBound(page, 'search-check-in', checkIn);
+  await fillBound(page, 'search-check-out', checkOut);
   await fillBound(page, 'search-guests', '2');
 
   const indicator = page.getByTestId('loading-indicator');
@@ -134,7 +123,8 @@ test('search with check-out equal to check-in shows an inline 400', async ({ pag
   const response = page.waitForResponse(
     (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
   );
-  await searchHotels(page, { city: 'Seattle', checkIn: utcDate(30), checkOut: utcDate(30), guests: 1 });
+  const [day] = utcDates(30);
+  await searchHotels(page, { city: 'Seattle', checkIn: day, checkOut: day, guests: 1 });
   expect((await response).status()).toBe(400);
 
   const error = page.getByTestId('inline-error');
@@ -145,8 +135,9 @@ test('search with check-out equal to check-in shows an inline 400', async ({ pag
 });
 
 test('search with no availability shows the empty message', async ({ page }) => {
+  const [checkIn, checkOut] = utcDates(30, 32);
   await page.goto('/search');
-  await searchHotels(page, { city: 'Atlantis', checkIn: utcDate(30), checkOut: utcDate(32), guests: 1 });
+  await searchHotels(page, { city: 'Atlantis', checkIn, checkOut, guests: 1 });
 
   await expect(page.getByTestId('search-empty')).toHaveText(
     'No hotels with available rooms in Atlantis for these dates.',
@@ -239,7 +230,8 @@ test('server 401 on Book stays on the page with an inline error', async ({ page 
   await test.step('register and log in', () => registerAndLogIn(page));
 
   const hotelUrl = await test.step('open a Seattle hotel', async () => {
-    await searchHotels(page, { city: 'Seattle', checkIn: utcDate(25), checkOut: utcDate(27), guests: 2 });
+    const [checkIn, checkOut] = utcDates(25, 27);
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
     await page.locator('[data-testid^="view-rooms-"]').first().click();
     await expect(page.getByTestId('hotel-name')).toBeVisible();
     await expect(page).toHaveURL(/\/hotels\/\d+\?/);
