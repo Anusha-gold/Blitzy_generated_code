@@ -1,4 +1,4 @@
-<div *ngIf="error as e" class="inline-error" data-testid="inline-error">
+<div *ngIf="shownError() as e" class="inline-error" data-testid="inline-error">
   <div class="inline-error__message" role="alert">
     <strong>{{ e.title }}</strong>
     <p *ngIf="e.detail !== null">{{ e.detail }}</p>

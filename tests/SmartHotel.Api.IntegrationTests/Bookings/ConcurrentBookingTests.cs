@@ -49,8 +49,10 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan ObservationLimit = TimeSpan.FromSeconds(15);
-    // The whole drain, from the release: the wait for the client tasks, the factory's drain of the server's requests,
-    // its abort and grace included, and the last wait for the client tasks still pending.
+    // The whole drain's wait budget, from the release: the wait for the client tasks, the factory's drain of the
+    // server's requests, its abort and grace included, and the last wait for the client tasks still pending. The
+    // factory's abort can run the aborted requests' cancellation callbacks on the drain's thread; nothing bounds their
+    // time, so the drain can outlast DrainLimit.
     private static readonly TimeSpan DrainLimit = TimeSpan.FromSeconds(30);
 
     // The least of DrainLimit left for the factory's drain once the wait for the client tasks ends: time to wait, to
@@ -396,18 +398,20 @@ public sealed class ConcurrentBookingTests : IClassFixture<SmartHotelApiFactory>
         }
     }
 
-    // Waits for every request, on the client and on the server, for at most DrainLimit from here, the release, in all,
-    // whatever the test's token says, so a cancelled test still waits for its requests. The client tasks are waited
-    // for first, until ServerDrainReserve and ClientSettleLimit are all that is left of DrainLimit at the latest, and
-    // the requests still running CancellationGrace before that are cancelled, which leaves them that long to stop. A
-    // client task can complete while its server handler and database commands go on, once the response has started
-    // or the request is aborted. So the factory's drain then waits for the server's own requests until only
-    // ClientSettleLimit is left, aborting those still running when only its grace is left of that. The client tasks
-    // still pending after it are given what is left of DrainLimit. Then each response is collected for the caller to
-    // dispose, whatever happened to the others, and each failed or cancelled request, each request whose server work
-    // did not stop and each client task still pending is recorded. A request whose client task is still pending can
-    // still reach the server, but it can start work only until the factory's dispose begins, which refuses it without
-    // passing it to the API. Failures are recorded for the caller, never thrown.
+    // Waits for every request, on the client and on the server, with DrainLimit from here, the release, as its wait
+    // budget, whatever the test's token says, so a cancelled test still waits for its requests. The client tasks are
+    // waited for first, until ServerDrainReserve and ClientSettleLimit are all that is left of DrainLimit at the
+    // latest, and the requests still running CancellationGrace before that are cancelled, which leaves them that long
+    // to stop. A client task can complete while its server handler and database commands go on, once the response has
+    // started or the request is aborted. So the factory's drain then waits for the server's own requests until only
+    // ClientSettleLimit is left, aborting those still running when only its grace is left of that. The factory's abort
+    // can run the aborted requests' cancellation callbacks on this thread; nothing bounds their time, so the drain can
+    // outlast DrainLimit. The client tasks still pending after it are given what is left of DrainLimit. Then each
+    // response is collected for the caller to dispose, whatever happened to the others, and each failed or cancelled
+    // request, each request whose server work did not stop and each client task still pending is recorded. A request
+    // whose client task is still pending can still reach the server, but it can start work only until the factory's
+    // dispose begins, which refuses it without passing it to the API. Failures are recorded for the caller, never
+    // thrown.
     private static async Task DrainAsync(
         SmartHotelApiFactory factory,
         List<Task<HttpResponseMessage>> requests,

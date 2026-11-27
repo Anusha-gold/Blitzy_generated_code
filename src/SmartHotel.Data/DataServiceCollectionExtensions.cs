@@ -19,9 +19,8 @@ public static class DataServiceCollectionExtensions
     private const string DisableDateTimeInfinityConversionsSwitch = "Npgsql.DisableDateTimeInfinityConversions";
 
     // A failure Npgsql classes as transient, such as a pooled connection that a database restart ended (SqlState
-    // 57P01) or a refused connection, is retried at most this many times. EF Core retries the first time at once and
-    // the second after about 1 s, and every later delay is capped, so a request that meets a database that stays down
-    // still receives its 500 after about 3 s of waiting.
+    // 57P01) or a refused connection, is retried at most this many times, so an operation makes at most four attempts.
+    // The count and the delay cap below bound the retries, not how long an operation takes; see AddSmartHotelData.
     private const int TransientFailureMaxRetryCount = 3;
 
     private static readonly TimeSpan TransientFailureMaxRetryDelay = TimeSpan.FromSeconds(2);
@@ -41,9 +40,20 @@ public static class DataServiceCollectionExtensions
     /// <para>
     /// Npgsql's retrying execution strategy is enabled. An operation that fails with an error Npgsql classes as
     /// transient, such as a pooled connection that a database restart ended (SqlState <c>57P01</c>) or a refused or
-    /// dropped connection, runs again up to three times, at once and then after delays capped at two seconds, so a
-    /// request that meets a restarted database succeeds and one that meets a database that stays down fails within a
-    /// few seconds. A session failure that Npgsql reports through its disposed-transaction exception is judged by that
+    /// dropped connection, runs again up to three times, so it makes at most four attempts. EF Core starts the first
+    /// retry at once, the second after about one second and the third after two seconds, the cap on every delay. The
+    /// retry count and the delay cap bound only the waiting between attempts, about three seconds in all, not how long
+    /// an operation takes. Each attempt adds the time its own work takes. The connection string's <c>Timeout</c> and
+    /// <c>Command Timeout</c>, which these options do not override, are factors in that time, not caps on it: Npgsql
+    /// applies the first to opening a connection and the second to each wait for the server rather than to a command as
+    /// a whole, and an attempt can run several commands. Cancelling the caller's token stops a pending delay and,
+    /// because EF Core checks the token before each attempt, keeps a new attempt from starting. EF Core also passes the
+    /// token to each attempt, whose work stops only where that work observes it, so an attempt already running can
+    /// still complete. A retry therefore overcomes a database restart only when an attempt the strategy still allows
+    /// can connect and complete. Otherwise the operation fails: after a fourth transient failure with
+    /// <see cref="RetryLimitExceededException"/>, whose inner exception is that failure; with the first failure that is
+    /// not transient, rethrown unchanged; or with <see cref="OperationCanceledException"/> when cancellation stops the
+    /// strategy. A session failure that Npgsql reports through its disposed-transaction exception is judged by that
     /// exception's inner failure and checked and retried the same way. That happens when a session ends while EF Core
     /// releases the savepoint around a save inside a transaction: EF Core does not report the failure, and the commit
     /// that follows throws <see cref="ObjectDisposedException"/> with the session's failure as its inner exception.

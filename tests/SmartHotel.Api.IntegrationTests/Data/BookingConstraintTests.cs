@@ -98,8 +98,8 @@ public sealed class BookingConstraintTests : IClassFixture<SmartHotelApiFactory>
         int guestId = await InsertGuestAsync(ct);
         int roomId = await GetRoomIdAsync("103", ct);
 
-        // The middle stay first, then one starting on its check-out day and one ending on its check-in day: the
-        // half-open '[)' range leaves both boundary days free.
+        // The middle stay first, then one starting on its check-out day and one ending on its check-in day. Adjacent
+        // stays can share an endpoint because the earlier stay does not occupy its check-out date.
         await InsertBookingAsync(
             NewBooking(guestId, roomId, BaseDate, BaseDate.AddDays(2), BookingStatus.Confirmed),
             ct);

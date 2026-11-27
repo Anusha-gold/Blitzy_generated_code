@@ -29,15 +29,30 @@ public static class StayRules
     /// Determines whether an existing stay and a requested stay share at least one night.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Both stays are half-open ranges [checkIn, checkOut), and two such ranges overlap exactly when each starts
     /// before the other ends. The check-out day is free: when one stay's check-out day is the other's check-in day,
     /// the stays do not overlap. Only dates are compared; whether a booking counts at all is decided by its status,
     /// which <see cref="ConfirmedOverlap"/> adds.
+    /// </para>
+    /// <para>
+    /// The rule holds only for stays whose check-out day is after their check-in day. The comparison does not reject
+    /// an empty or reversed range, and for such a range its result does not say whether nights are shared: an empty
+    /// range strictly inside the other stay yields <see langword="true"/>, though it occupies no night. A requested
+    /// stay that <see cref="StayPeriod.TryCreate"/> produced meets that condition, and so does a stored booking, whose
+    /// check-out day the database check constraint <c>CK_Bookings_Dates</c> keeps after its check-in day.
+    /// </para>
     /// </remarks>
     /// <param name="existingCheckIn">The existing stay's check-in day, its first occupied night.</param>
-    /// <param name="existingCheckOut">The existing stay's check-out day, the exclusive end of that stay.</param>
+    /// <param name="existingCheckOut">
+    /// The existing stay's check-out day, the exclusive end of that stay. It must be after
+    /// <paramref name="existingCheckIn"/>.
+    /// </param>
     /// <param name="requestedCheckIn">The requested stay's check-in day, its first occupied night.</param>
-    /// <param name="requestedCheckOut">The requested stay's check-out day, the exclusive end of that stay.</param>
+    /// <param name="requestedCheckOut">
+    /// The requested stay's check-out day, the exclusive end of that stay. It must be after
+    /// <paramref name="requestedCheckIn"/>.
+    /// </param>
     /// <returns>
     /// <see langword="true"/> when the two stays share at least one night; otherwise <see langword="false"/>.
     /// </returns>
@@ -82,7 +97,12 @@ public static class StayRules
     ///     WHERE ("Status" = 'Confirmed')
     /// </code>
     /// </remarks>
-    /// <param name="period">The requested stay; its <see cref="StayPeriod.CheckOut"/> is exclusive.</param>
+    /// <param name="period">
+    /// The requested stay; its <see cref="StayPeriod.CheckOut"/> is exclusive and must be after its
+    /// <see cref="StayPeriod.CheckIn"/>, as it is in a period <see cref="StayPeriod.TryCreate"/> produced. The
+    /// <see cref="StayPeriod"/> positional constructor does not validate, and for an empty or reversed period the
+    /// predicate does not say whether a booking shares a night with it.
+    /// </param>
     /// <returns>
     /// An expression that is <see langword="true"/> for a booking that is confirmed and overlaps
     /// <paramref name="period"/>; otherwise <see langword="false"/>.

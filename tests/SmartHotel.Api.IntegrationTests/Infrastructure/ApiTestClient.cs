@@ -433,7 +433,7 @@ public sealed partial class ApiTestClient
     /// </summary>
     /// <param name="cancellationToken">Cancels both requests.</param>
     /// <returns>The guest's id, credentials and bearer token.</returns>
-    public async Task<GuestSession> RegisterGuestAsync(CancellationToken cancellationToken)
+    internal async Task<GuestSession> RegisterGuestAsync(CancellationToken cancellationToken)
     {
         // A fresh GUID keeps the email unique within a class's shared database. It is already in the normalized
         // form the API stores: trimmed, lower case and printable ASCII.
@@ -463,7 +463,7 @@ public sealed partial class ApiTestClient
     /// <param name="guests">The party size.</param>
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The hotel with every room type's availability and stay total.</returns>
-    public async Task<HotelDetail> GetHotelDetailAsync(
+    internal async Task<HotelDetail> GetHotelDetailAsync(
         int hotelId,
         DateOnly checkIn,
         DateOnly checkOut,
@@ -491,7 +491,10 @@ public sealed partial class ApiTestClient
     /// <exception cref="ArgumentNullException">
     /// <paramref name="body"/> or <paramref name="token"/> is <see langword="null"/>.
     /// </exception>
-    public async Task<Booking> CreateBookingOkAsync(JsonObject body, string token, CancellationToken cancellationToken)
+    internal async Task<Booking> CreateBookingOkAsync(
+        JsonObject body,
+        string token,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(token);
         using HttpResponseMessage response = await CreateBookingAsync(body, token, cancellationToken);
@@ -512,7 +515,7 @@ public sealed partial class ApiTestClient
     /// <param name="cancellationToken">Cancels the request.</param>
     /// <returns>The created booking.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="token"/> is <see langword="null"/>.</exception>
-    public async Task<Booking> CreateBookingOkAsync(
+    internal async Task<Booking> CreateBookingOkAsync(
         string token,
         int hotelId,
         int roomTypeId,
@@ -839,7 +842,7 @@ public sealed partial class ApiTestClient
 
     /// <summary>The 201 body of <c>POST /api/auth/register</c>: <c>{ "guestId": n }</c>.</summary>
     /// <param name="GuestId">The new guest's id.</param>
-    public sealed record RegisterResponse(int GuestId);
+    internal sealed record RegisterResponse(int GuestId);
 
     /// <summary>
     /// The 200 body of <c>POST /api/auth/login</c>:
@@ -847,7 +850,7 @@ public sealed partial class ApiTestClient
     /// </summary>
     /// <param name="Token">The signed bearer token.</param>
     /// <param name="ExpiresAt">The token's expiry instant, read as a UTC <see cref="DateTime"/>.</param>
-    public sealed record LoginResponse(string Token, DateTime ExpiresAt)
+    internal sealed record LoginResponse(string Token, DateTime ExpiresAt)
     {
         /// <summary>Returns the expiry with the token redacted.</summary>
         /// <returns>A description that carries no token.</returns>
@@ -869,7 +872,7 @@ public sealed partial class ApiTestClient
     /// <param name="LowestNightlyPrice">
     /// The lowest nightly price in USD among the room types that can host the party and have a free room.
     /// </param>
-    public sealed record HotelSummary(int Id, string Name, string City, string Address, decimal LowestNightlyPrice);
+    internal sealed record HotelSummary(int Id, string Name, string City, string Address, decimal LowestNightlyPrice);
 
     /// <summary>
     /// The 200 body of <c>GET /api/hotels/{id}</c>:
@@ -885,7 +888,7 @@ public sealed partial class ApiTestClient
     /// <param name="Nights">The number of nights in the stay.</param>
     /// <param name="Guests">The echoed party size, 1 when the query omitted it.</param>
     /// <param name="RoomTypes">Every room type of the hotel, ordered by nightly price.</param>
-    public sealed record HotelDetail(
+    internal sealed record HotelDetail(
         int Id,
         string Name,
         string City,
@@ -909,7 +912,7 @@ public sealed partial class ApiTestClient
     /// The rooms of this type with no confirmed booking overlapping the stay, whatever the party size.
     /// </param>
     /// <param name="StayTotal">The price of the whole stay in USD.</param>
-    public sealed record RoomTypeAvailability(
+    internal sealed record RoomTypeAvailability(
         int Id,
         string Name,
         int MaxGuests,
@@ -937,7 +940,7 @@ public sealed partial class ApiTestClient
     /// the API's string-enum serialization is what the tests compare.
     /// </param>
     /// <param name="CreatedAt">When the booking was created, read as a UTC <see cref="DateTime"/>.</param>
-    public sealed record Booking(
+    internal sealed record Booking(
         int Id,
         int HotelId,
         string HotelName,
@@ -957,7 +960,7 @@ public sealed partial class ApiTestClient
     /// <param name="Email">The registered email, already in normalized form.</param>
     /// <param name="Password">The password the guest registered with.</param>
     /// <param name="Token">A bearer token for the guest, valid for 60 minutes.</param>
-    public sealed record GuestSession(int GuestId, string Email, string Password, string Token)
+    internal sealed record GuestSession(int GuestId, string Email, string Password, string Token)
     {
         /// <summary>Returns the guest id with the email, password and token redacted.</summary>
         /// <returns>A description that carries no credential.</returns>

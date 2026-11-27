@@ -374,10 +374,20 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             HttpStatusCode.InternalServerError,
             cancellationToken: cancellationToken);
 
-        Assert.DoesNotContain(SecretMarker, body, StringComparison.Ordinal);
-        Assert.DoesNotContain("InvalidOperationException", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("   at ", body, StringComparison.Ordinal);
-        Assert.DoesNotContain(nameof(ThrowingMatcherPolicy), body, StringComparison.Ordinal);
+        // Each check is a boolean with a fixed message, because Assert.DoesNotContain quotes the body around a match,
+        // and that would write the leaked exception text to the test output.
+        Assert.False(
+            body.Contains(SecretMarker, StringComparison.Ordinal),
+            "Expected the 500 problem body not to contain the exception message.");
+        Assert.False(
+            body.Contains("InvalidOperationException", StringComparison.Ordinal),
+            "Expected the 500 problem body not to contain the exception type name.");
+        Assert.False(
+            body.Contains("   at ", StringComparison.Ordinal),
+            "Expected the 500 problem body not to contain a stack frame.");
+        Assert.False(
+            body.Contains(nameof(ThrowingMatcherPolicy), StringComparison.Ordinal),
+            "Expected the 500 problem body not to contain the throwing matcher policy's type name.");
 
         Type handled = Assert.Single(recorder.ExceptionTypes);
         Assert.Equal(typeof(InvalidOperationException), handled);
@@ -786,7 +796,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         Assert.Equal(UnhandledExceptionEventId, sanitized.EventId);
         Assert.Equal(LogLevel.Error, sanitized.Level);
         Assert.False(sanitized.HasException, "The sanitized event must not carry the exception.");
-        Assert.DoesNotContain(_marker, sanitized.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.False(
+            sanitized.Text.Contains(_marker, StringComparison.OrdinalIgnoreCase),
+            "Expected the sanitized event's text not to carry the marker.");
 
         // A scope opened around a record never reaches the provider.
         mark = capture.Count;
@@ -799,7 +811,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         SmartHotelApiFactory.CapturedLog scoped = Assert.Single(
             capture.Since(mark),
             static record => record.Category == EndpointMiddlewareCategory && record.EventId == ProbeEvent.Id);
-        Assert.DoesNotContain(_marker, scoped.Scopes, StringComparison.OrdinalIgnoreCase);
+        Assert.False(
+            scoped.Scopes.Contains(_marker, StringComparison.OrdinalIgnoreCase),
+            "Expected the record's scopes not to carry the scope opened around it.");
 
         void CheckLevels(string category, Func<LogLevel, bool> delivered)
         {
@@ -843,7 +857,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(
             async () => await variant.InitializeAsync());
         Assert.True(startup.Started, "The failing hosted service was never started.");
-        Assert.StartsWith("Starting the API host failed.", failure.Message, StringComparison.Ordinal);
+        Assert.True(
+            failure.Message.StartsWith("Starting the API host failed.", StringComparison.Ordinal),
+            "Expected the factory's failure message to begin 'Starting the API host failed.'");
         Assert.False(
             failure.Message.Contains(_marker, StringComparison.Ordinal),
             "Expected the factory's failure message not to carry the hosted service's exception text.");
@@ -904,7 +920,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         Assert.Equal(LogLevel.Error, error.Level);
         Assert.Equal(ExceptionHandlerCategory, error.Category);
         Assert.Equal(UnhandledExceptionEventId, error.EventId);
-        Assert.Contains("SqlState=" + PostgresErrorCodes.InvalidCatalogName, error.Message, StringComparison.Ordinal);
+        Assert.True(
+            error.Message.Contains("SqlState=" + PostgresErrorCodes.InvalidCatalogName, StringComparison.Ordinal),
+            $"Expected the sanitized event to report SqlState={PostgresErrorCodes.InvalidCatalogName}.");
 
         // No record, at any level, names the database or the server it was reached on.
         AssertNoRecordNamesTheDatabaseOrServer(records, absentDatabase);
@@ -1071,7 +1089,12 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             // Kestrel's connection ids are 13 characters of its base-32 alphabet, and the request number is eight
             // upper-case hex digits.
             string requestNumber = rejectedRequestNumber.ToString("X8", CultureInfo.InvariantCulture);
-            Assert.Matches($"^[0-9A-V]{{13}}:{requestNumber}$", problem.GetProperty("traceId").GetString());
+            string? traceId = problem.GetProperty("traceId").GetString();
+            Match traceIdParts = KestrelTraceId().Match(traceId ?? string.Empty);
+            Assert.True(
+                traceIdParts.Success
+                    && string.Equals(requestNumber, traceIdParts.Groups["request"].Value, StringComparison.Ordinal),
+                $"Expected the problem's traceId to be a connection id, a colon and request number {requestNumber}.");
         }
 
         Assert.Equal("close", rejection.GetHeader("Connection"));
@@ -1093,7 +1116,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         using HttpResponseMessage servedResponse = served.ToResponseMessage();
         Assert.Equal(HttpStatusCode.OK, servedResponse.StatusCode);
         Assert.Equal("text/plain", servedResponse.Content.Headers.ContentType?.MediaType);
-        Assert.Equal("Healthy", await servedResponse.Content.ReadAsStringAsync(cancellationToken));
+        string servedBody = await servedResponse.Content.ReadAsStringAsync(cancellationToken);
+        Assert.True(
+            string.Equals("Healthy", servedBody, StringComparison.Ordinal),
+            "Expected the readiness body to be exactly Healthy.");
 
         await connection.SendAsync(MalformedHeaderLineRequest());
         RawResponse rejection = await connection.ReadResponseAsync(headRequest: false);
@@ -1117,7 +1143,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
-        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        Assert.True(
+            string.Equals("Healthy", body, StringComparison.Ordinal),
+            "Expected the readiness body to be exactly Healthy.");
     }
 
     // A variant derived through WithWebHostBuilder builds its host through its parent factory's CreateHost. A Production
@@ -1149,7 +1178,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
-        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        Assert.True(
+            string.Equals("Healthy", body, StringComparison.Ordinal),
+            "Expected the readiness body to be exactly Healthy.");
         Assert.Equal(exitCode, Environment.ExitCode);
     }
 
@@ -1196,10 +1228,20 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
 
         // Kestrel's message reads "Request body too large. The max request body size is 30000000 bytes."
         string body = Encoding.UTF8.GetString(rejection.Body);
-        Assert.DoesNotContain("too large", body, StringComparison.Ordinal);
-        Assert.DoesNotContain(MaxRequestBodySize.ToString(CultureInfo.InvariantCulture), body, StringComparison.Ordinal);
-        Assert.DoesNotContain("BadHttpRequestException", body, StringComparison.Ordinal);
-        Assert.DoesNotContain("   at ", body, StringComparison.Ordinal);
+
+        // Each check is a boolean with a fixed message, because Assert.DoesNotContain quotes the body around a match.
+        Assert.False(
+            body.Contains("too large", StringComparison.Ordinal),
+            "Expected the 413 problem body not to contain the exception message.");
+        Assert.False(
+            body.Contains(MaxRequestBodySize.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal),
+            "Expected the 413 problem body not to contain the request body size limit.");
+        Assert.False(
+            body.Contains("BadHttpRequestException", StringComparison.Ordinal),
+            "Expected the 413 problem body not to contain the exception type name.");
+        Assert.False(
+            body.Contains("   at ", StringComparison.Ordinal),
+            "Expected the 413 problem body not to contain a stack frame.");
     }
 
     // One header field larger than the 32 KB Kestrel accepts for all of them.
@@ -1271,7 +1313,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             response,
             HttpStatusCode.Forbidden,
             cancellationToken: cancellationToken);
-        Assert.Equal(HttpsOnlyDetail, problem.GetProperty("detail").GetString());
+        Assert.True(
+            string.Equals(HttpsOnlyDetail, problem.GetProperty("detail").GetString(), StringComparison.Ordinal),
+            $"Expected the 403 detail to be exactly '{HttpsOnlyDetail}'.");
         Assert.Empty(response.Headers.WwwAuthenticate);
         Assert.Null(response.Headers.Location);
     }
@@ -1324,7 +1368,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         Assert.True(presented, "The API's TLS listener did not present the certificate the environment named.");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
-        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        Assert.True(
+            string.Equals("Healthy", body, StringComparison.Ordinal),
+            "Expected the readiness body to be exactly Healthy.");
         AssertOutputCarriesNoSecret(api.Output, certificate.Password);
     }
 
@@ -1863,6 +1910,11 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     [GeneratedRegex("^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$", RegexOptions.CultureInvariant)]
     private static partial Regex W3CTraceId();
 
+    // Kestrel's identifier for a request it rejects: its connection id, 13 characters of its base-32 alphabet, a colon,
+    // and the request's number on the connection as eight upper-case hex digits.
+    [GeneratedRegex("^[0-9A-V]{13}:(?<request>[0-9A-F]{8})$", RegexOptions.CultureInvariant)]
+    private static partial Regex KestrelTraceId();
+
     // Reads a comma-separated response header as its trimmed items; the list is empty when the header is absent.
     private static List<string> ReadHeaderItems(HttpResponseMessage response, string name)
     {
@@ -2295,9 +2347,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     // The process's environment is that of the process running the tests, less every variable that would configure
     // the API or its host in any key form, plus the variables a test supplies. Standard output and error are read line
     // by line as they arrive, so a full pipe never stalls the API, and kept for checks only: they can quote settings,
-    // so a failure message names event ids and exit codes, never the output. Disposing kills the process and any
-    // process it started, then waits for them to exit, so nothing outlives the test or still uses the class's
-    // database when the fixture drops it.
+    // so a failure message names event ids and exit codes, never the output. Disposing asks for the process and all
+    // its descendants to be killed, then waits up to KillTimeout, 30 seconds, for the API process itself to exit, and
+    // throws a TimeoutException when it has not. That exit ends the API's use of the class's database before the
+    // fixture drops it. The wait observes the API process alone, not any process it started.
     private sealed partial class ApiProcess : IAsyncDisposable
     {
         private const string ApiAssemblyFileName = "SmartHotel.Api.dll";
@@ -2469,7 +2522,7 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
                 }
                 catch (InvalidOperationException) when (_process.HasExited)
                 {
-                    // The process has exited on its own, so nothing is left to stop.
+                    // The API process has exited on its own, so it needs no stopping.
                 }
 
                 // Deliberately not the test's token: the process must be gone even when the test was cancelled, so the

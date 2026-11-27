@@ -24,9 +24,10 @@ namespace SmartHotel.Data.Configurations;
 /// an empty range, which overlaps nothing and would evade the exclusion constraint.
 /// </para>
 /// <para>
-/// <c>Status</c> is stored as the <see cref="BookingStatus"/> member name. The exclusion constraint's filter,
-/// <c>CK_Bookings_Status</c> and the API's availability and cancellation queries all compare it with the literals
-/// <c>'Confirmed'</c> and <c>'Cancelled'</c>.
+/// <c>Status</c> is stored as the <see cref="BookingStatus"/> member name, because the schema and the API's queries
+/// use those names as literals. <c>CK_Bookings_Status</c> allows exactly <c>'Confirmed'</c> and <c>'Cancelled'</c>.
+/// The exclusion constraint's filter and the API's availability queries match only <c>'Confirmed'</c> rows, and
+/// cancellation changes a matching <c>'Confirmed'</c> row to <c>'Cancelled'</c>.
 /// </para>
 /// <para>
 /// <c>CheckIn</c> and <c>CheckOut</c> are stored and compared as the exact calendar dates, because the hosts disable

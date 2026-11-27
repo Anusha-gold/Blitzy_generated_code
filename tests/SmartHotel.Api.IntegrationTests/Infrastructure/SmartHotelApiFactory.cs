@@ -79,13 +79,13 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
     private static readonly TimeSpan ListenerStartTimeout = TimeSpan.FromMinutes(1);
 
-    // How long DisposeAsync's drain lasts, its abort grace included: ten seconds of waiting for the requests still
-    // running, then five for those it aborted to stop. A test drains its own requests, so any still running here
-    // outlived the test that started them.
+    // How long DisposeAsync's drain waits, its abort grace included: ten seconds for the requests still running, then
+    // what the abort's callbacks leave of five for those it aborted to stop. A test drains its own requests, so any
+    // still running here outlived the test that started them.
     private static readonly TimeSpan DisposeDrainLimit = TimeSpan.FromSeconds(15);
 
-    // How long a drain waits for the requests it aborted to stop, taken out of its limit: half of a limit shorter than
-    // twice this.
+    // How much of a drain's limit is kept for the abort and for the requests it aborted to stop: half of a limit
+    // shorter than twice this.
     private static readonly TimeSpan AbortGrace = TimeSpan.FromSeconds(5);
 
     // How long DisposeAsync may take to end the database access of the requests its drain left running: to open its
@@ -329,10 +329,12 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
     /// <summary>
     /// Refuses every request that reaches a host of this factory from now on, waits for the requests still running on
-    /// any of them, aborting those still running after ten seconds, ends the database access of those still running
-    /// five seconds after their abort, then stops and disposes the loopback listener, if one was started, then the
-    /// in-process host and its clients, and finally drops <see cref="DatabaseName"/> and its login role, even when a
-    /// step before throws or <see cref="InitializeAsync"/> never created them. Calls after the first do nothing.
+    /// any of them, aborting those still running after ten seconds and then waiting for what is left of fifteen
+    /// seconds: five seconds less the time the abort's cancellation callbacks took, which is not bounded and can leave
+    /// nothing. It then ends the database access of the requests still running, stops and disposes the loopback
+    /// listener, if one was started, then the in-process host and its clients, and finally drops
+    /// <see cref="DatabaseName"/> and its login role, even when a step before throws or <see cref="InitializeAsync"/>
+    /// never created them. Calls after the first do nothing.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -474,7 +476,8 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// <summary>
     /// Waits until no request is running on any host built from this factory, aborting the requests still running
     /// once all but the abort's grace of <paramref name="limit"/> has passed, and returns when they have stopped or
-    /// <paramref name="limit"/> has passed in all.
+    /// <paramref name="limit"/> has passed since the call began. The abort's cancellation callbacks can make the call
+    /// outlast <paramref name="limit"/>, by the time they take beyond what was left of it.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -485,11 +488,13 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// for as well.
     /// </para>
     /// <para>
-    /// <paramref name="limit"/> bounds the whole call, the abort's grace included: the grace is five seconds, or half
-    /// of a limit shorter than ten seconds, and the requests are aborted when only the grace is left. Aborting a
-    /// request cancels its <see cref="HttpContext.RequestAborted"/> token, which the API passes to every database
-    /// command. A request whose abort runs a cancellation callback that throws is still aborted, and so are the
-    /// requests after it.
+    /// <paramref name="limit"/> is the call's wait budget, the abort's grace included: the grace is five seconds, or
+    /// half of a limit shorter than ten seconds, and the requests are aborted once all but the grace has passed.
+    /// Aborting a request cancels its <see cref="HttpContext.RequestAborted"/> token, which the API passes to every
+    /// database command. The abort runs synchronously, and the token's cancellation callbacks can run on the caller's
+    /// thread. Their time comes out of the grace, but nothing bounds it, so slow callbacks shorten the wait that
+    /// follows, down to none, and can make the call outlast <paramref name="limit"/>. A request whose abort runs a
+    /// cancellation callback that throws is still aborted, and so are the requests after it.
     /// </para>
     /// <para>
     /// It leaves the hosts admitting requests, so a test can go on using the factory afterwards, and a request whose
@@ -498,26 +503,29 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// </para>
     /// <para>
     /// It takes no cancellation token by design: it is cleanup that must run in full while the test, or the run, is
-    /// being cancelled, so <paramref name="limit"/> alone bounds it. It reads only this factory's own count, never
-    /// <see cref="WebApplicationFactory{TEntryPoint}.Services"/>, so it builds no host and returns at once when no
-    /// host has started.
+    /// being cancelled, so <paramref name="limit"/> alone bounds its waiting. It reads only this factory's own count,
+    /// never <see cref="WebApplicationFactory{TEntryPoint}.Services"/>, so it builds no host and returns at once when
+    /// no host has started.
     /// </para>
     /// </remarks>
     /// <param name="limit">
-    /// How long the whole call may take, its wait, the abort and the abort's grace included; zero aborts the requests
-    /// still running at once and gives them no grace.
+    /// The call's wait budget, measured from its start: how long it waits for the requests to stop, before their abort
+    /// and after it, the abort's grace included. The abort's cancellation callbacks take their time out of it but are
+    /// not bounded by it. Zero aborts the requests still running at once and gives them no grace.
     /// </param>
     /// <returns>
-    /// The number of requests still running when <paramref name="limit"/> has passed after their abort: zero once
-    /// every request has stopped.
+    /// The number of requests still running when the wait after their abort ends: once <paramref name="limit"/> has
+    /// passed since the call began, or at once after the abort when its cancellation callbacks used up what was left
+    /// of <paramref name="limit"/>. Zero once every request has stopped.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="limit"/> is negative or longer than <see cref="int.MaxValue"/> milliseconds.
     /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// A cancellation callback threw while the requests were aborted. It is thrown once the grace has passed, and its
-    /// message carries only the number of requests still running, the exception types, any SQLSTATE and the server
-    /// note naming <c>SMARTHOTEL_TEST_POSTGRES</c>, and no inner exception.
+    /// A cancellation callback threw while the requests were aborted. It is thrown once the wait after the abort has
+    /// ended, when the count the return value describes is taken, and its message carries only the number of requests
+    /// still running then, the exception types, any SQLSTATE and the server note naming
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c>, and no inner exception.
     /// </exception>
     public async Task<int> DrainRequestsAsync(TimeSpan limit)
     {
@@ -732,7 +740,7 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// <paramref name="hotelName"/> or <paramref name="roomTypeName"/> is <see langword="null"/> or empty.
     /// </exception>
     /// <exception cref="InvalidOperationException">No room type, or more than one, matches both names.</exception>
-    public async Task<SeededRoomType> GetRoomTypeAsync(
+    internal async Task<SeededRoomType> GetRoomTypeAsync(
         string hotelName,
         string roomTypeName,
         CancellationToken cancellationToken)
@@ -761,7 +769,7 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// The rooms in ordinal room-number order, which for the seeded three-digit numbers is <c>x01</c> to <c>x10</c>;
     /// empty when no room has that type.
     /// </returns>
-    public async Task<IReadOnlyList<SeededRoom>> GetRoomsAsync(int roomTypeId, CancellationToken cancellationToken)
+    internal async Task<IReadOnlyList<SeededRoom>> GetRoomsAsync(int roomTypeId, CancellationToken cancellationToken)
     {
         List<SeededRoom> rooms = await ExecuteDbAsync(
             (db, ct) => db.Rooms
@@ -797,7 +805,7 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// <exception cref="ArgumentNullException">
     /// <paramref name="capture"/> or <paramref name="captureRules"/> is <see langword="null"/>.
     /// </exception>
-    public SmartHotelApiFactory CreateLogCaptureVariant(
+    internal SmartHotelApiFactory CreateLogCaptureVariant(
         LogCapture capture,
         IReadOnlyList<(string Category, LogLevel Level)> captureRules,
         Action<IServiceCollection>? additionalOverrides)
@@ -1031,14 +1039,14 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// <param name="HotelId">The owning hotel's id.</param>
     /// <param name="NightlyPrice">The price per night in USD.</param>
     /// <param name="MaxGuests">The largest party one room of this type can host.</param>
-    public sealed record SeededRoomType(int Id, int HotelId, decimal NightlyPrice, int MaxGuests);
+    internal sealed record SeededRoomType(int Id, int HotelId, decimal NightlyPrice, int MaxGuests);
 
     /// <summary>
     /// A seeded room, as <see cref="GetRoomsAsync"/> returns it.
     /// </summary>
     /// <param name="Id">The room's id, the <c>RoomId</c> of its bookings.</param>
     /// <param name="RoomNumber">The room's number, unique within its hotel, such as <c>101</c>.</param>
-    public sealed record SeededRoom(int Id, string RoomNumber);
+    internal sealed record SeededRoom(int Id, string RoomNumber);
 
     /// <summary>
     /// One record as <see cref="LogCapture"/> received it, rendered when it was written.
@@ -1050,7 +1058,7 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// <param name="Text">The formatted message followed by every state value, the exception and the scopes.</param>
     /// <param name="Scopes">The scopes the provider saw around the record.</param>
     /// <param name="HasException">Whether the record carried an exception.</param>
-    public sealed record CapturedLog(
+    internal sealed record CapturedLog(
         string Category,
         LogLevel Level,
         int EventId,
@@ -1083,7 +1091,7 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// member is safe to call concurrently.
     /// </remarks>
     [ProviderAlias(Alias)]
-    public sealed class LogCapture : ILoggerProvider, ISupportExternalScope
+    internal sealed class LogCapture : ILoggerProvider, ISupportExternalScope
     {
         /// <summary>
         /// The name configuration addresses this provider by, as in <c>LogCapture:LogLevel:Default</c>.

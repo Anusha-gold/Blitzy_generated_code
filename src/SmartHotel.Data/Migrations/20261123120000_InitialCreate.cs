@@ -185,7 +185,6 @@ namespace SmartHotel.Data.Migrations
         /// <inheritdoc />
         protected override void Down(MigrationBuilder migrationBuilder)
         {
-            // Reverse the hand-written objects first.
             migrationBuilder.Sql("""ALTER TABLE "Bookings" DROP CONSTRAINT "EX_Bookings_Room_NoOverlap";""");
 
             migrationBuilder.Sql("""DROP INDEX "IX_Hotels_City_Lower";""");

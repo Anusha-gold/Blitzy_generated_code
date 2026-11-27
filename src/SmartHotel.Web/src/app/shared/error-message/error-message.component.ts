@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, Input } from '@angular/core';
+import { ChangeDetectionStrategy, Component, Input, signal } from '@angular/core';
 import { NgFor, NgIf } from '@angular/common';
 import { fieldErrorId, fieldLabel, type UiError } from '../../core/http/problem-details';
 
@@ -36,13 +36,26 @@ import { fieldErrorId, fieldLabel, type UiError } from '../../core/http/problem-
 })
 export class ErrorMessageComponent {
   /** The error to show; `null` renders nothing. */
-  @Input() error: UiError | null = null;
+  @Input() set error(value: UiError | null) {
+    this.shownError.set(value);
+  }
 
   /**
    * Prefix for the ids of the field-error messages, so form inputs can
    * reference them through `aria-describedby`; `null` gives them no ids.
    */
-  @Input() fieldErrorIdPrefix: string | null = null;
+  @Input() set fieldErrorIdPrefix(value: string | null) {
+    this.idPrefix.set(value);
+  }
+
+  /**
+   * The error last bound to `error`, which the template shows; `null` until
+   * one is bound.
+   */
+  protected readonly shownError = signal<UiError | null>(null);
+
+  /** The prefix last bound to `fieldErrorIdPrefix`; `null` until one is bound. */
+  private readonly idPrefix = signal<string | null>(null);
 
   /** The visible label for a field-error key, or `null` when it has none. */
   protected readonly fieldLabel = fieldLabel;
@@ -54,6 +67,7 @@ export class ErrorMessageComponent {
    * @param messageIndex - The message's index in that field's `messages`.
    */
   protected messageId(fieldIndex: number, messageIndex: number): string | null {
-    return this.fieldErrorIdPrefix === null ? null : fieldErrorId(this.fieldErrorIdPrefix, fieldIndex, messageIndex);
+    const prefix = this.idPrefix();
+    return prefix === null ? null : fieldErrorId(prefix, fieldIndex, messageIndex);
   }
 }
