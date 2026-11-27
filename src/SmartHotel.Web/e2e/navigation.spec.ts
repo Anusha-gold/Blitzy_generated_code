@@ -260,9 +260,11 @@ test('reloading My bookings signs the guest out and returns there after logging 
       await expect(h1('Log in')).toBeVisible();
       await expect(page.getByTestId('nav-login')).toBeVisible();
       await expect(page.getByTestId('nav-email')).toHaveCount(0);
-      // The notice region is always mounted; the guard's redirect leaves it
-      // empty, because only a server 401 adds the session-expired reason.
-      await expect(page.getByTestId('login-notice')).toHaveText('');
+      // The guard's redirect shows no notice, because only a server 401 adds
+      // the session-expired reason, and leaves the always-mounted live region
+      // that announces a notice empty.
+      await expect(page.getByTestId('login-notice')).toHaveCount(0);
+      await expect(page.getByTestId('login-announcement')).toHaveText('');
       expect(recorder.requests, 'API requests between the reload and logging in again').toEqual([]);
     });
 

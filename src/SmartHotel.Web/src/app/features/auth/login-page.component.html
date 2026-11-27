@@ -1,22 +1,24 @@
-<section class="auth-page">
-  <h1>Log in</h1>
+<!-- A guest who is already signed in, as after Back to an earlier login
+     entry, is sent on at once, so the form never shows; only the register
+     page's fresh hand-off shows it to them, for the account just created. -->
+<section *ngIf="!redirecting" class="auth-page">
+  <h1 tabindex="-1">Log in</h1>
 
-  <!-- Always mounted: a live region inserted with its text already in it may go
-       unannounced. The static class keeps the empty region out of the layout
-       from its first frame, before the class bindings first apply. -->
-  <p
-    class="visually-hidden"
-    role="status"
-    aria-live="polite"
-    data-testid="login-notice"
-    [class.notice]="notice() !== null"
-    [class.visually-hidden]="notice() === null"
-  >{{ notice() }}</p>
+  <!-- The visible notice is in the page's first frame, so it never pushes the
+       form down. Assistive technology skips it and hears the same text once,
+       from the live region below. -->
+  <p *ngIf="notice() as text" class="notice" aria-hidden="true" data-testid="login-notice">{{ text }}</p>
+
+  <!-- Always mounted and visually hidden: a live region inserted with its text
+       already in it may go unannounced, so the text is written into it after
+       it has rendered empty. -->
+  <p class="visually-hidden" role="status" aria-live="polite" data-testid="login-announcement">{{ announcement() }}</p>
 
   <form [formGroup]="form" (ngSubmit)="submit()">
     <div class="field">
       <label for="login-email">Email</label>
       <input
+        #emailInput
         id="login-email"
         data-testid="login-email"
         type="email"
@@ -31,6 +33,7 @@
     <div class="field">
       <label for="login-password">Password</label>
       <input
+        #passwordInput
         id="login-password"
         data-testid="login-password"
         type="password"
@@ -44,8 +47,8 @@
 
     <app-error-message [error]="error()" [fieldErrorIdPrefix]="errorIdPrefix"></app-error-message>
 
-    <button type="submit" data-testid="login-submit" [disabled]="pending()">Log in</button>
+    <button #submitButton type="submit" data-testid="login-submit" [disabled]="pending()">Log in</button>
   </form>
 
-  <p><a routerLink="/register" data-testid="register-link">Create an account</a></p>
+  <p><a routerLink="/register" [state]="registerLinkState()" data-testid="register-link">Create an account</a></p>
 </section>

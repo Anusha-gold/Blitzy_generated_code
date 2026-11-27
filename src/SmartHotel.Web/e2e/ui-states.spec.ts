@@ -72,6 +72,24 @@
  * gets the API's real 409, shown above the room table on the same URL, and
  * the revalidation shows no room left and "Book" disabled.
  *
+ * Auth pages: after a failed login or registration, focus returns to the
+ * submit button that the pending state disabled, or moves to the field the
+ * error marks; a resubmit keeps the error on screen until its own answer
+ * shows it in a new alert; and editing a field the server rejected ends that
+ * field's error. After a registration or a login, focus moves to the next
+ * page's heading. A guest sent to log in by "Book" returns to the hotel even
+ * after creating an account first, with the register and
+ * `/login?registered=1` URLs unchanged, and Back after that login never shows
+ * the login form again; a guest still signed in who goes Back to the register
+ * page and creates another account gets the notice and the pre-filled email,
+ * while Back to a `/login?registered=1` entry whose email was already used
+ * moves a signed-in guest on without the form. A return URL that leads to
+ * the login page itself, however it is written, sends the guest to `/search`
+ * after logging in and when Back reaches its entry. A reload of My bookings
+ * while signed out leads to the login page, logging in there returns to My
+ * bookings without adding a history entry, and Back from it never shows the
+ * login form and reaches the page before the reload within two steps.
+ *
  * "Cancel" conflict: a booking the guest has cancelled elsewhere, through the
  * API, still shows `Confirmed` with "Cancel" on the open My bookings page.
  * Clicking it gets the API's real 409, shown above the list; the list is
@@ -374,6 +392,13 @@ const GUESTS_INTEGER_MESSAGE = 'The value must be a whole number of at least 1.'
 const BARE_SEARCH_LINKS: readonly string[] = ['nav-brand', 'nav-search'];
 
 /**
+ * Return URLs whose primary route is the login page itself, each written a
+ * different way, one test each. A login must land on `/search` for every one,
+ * never on the login page again.
+ */
+const LOGIN_RETURN_URLS: readonly string[] = ['/login', '/login?reason=session-expired', '/login;a=1', '/%6Cogin'];
+
+/**
  * Records, from now on, every request the page sends to a hotel detail path,
  * `/api/hotels/{id}`, on any origin and whatever its method, and returns the
  * list it fills. It is for asserting that no such request was sent, so it is
@@ -460,6 +485,27 @@ async function registerAndLogIn(page: Page): Promise<GuestCredentials> {
   await logIn(page, guest.email, guest.password);
   await expect(page).toHaveURL(/\/search$/);
   return guest;
+}
+
+/**
+ * Opens the first Seattle hotel from a search while signed out and clicks
+ * "Book" on its first bookable room type, which sends the guest to log in.
+ * Returns the hotel page's path and query, which the login URL must carry,
+ * encoded, as its `returnUrl`.
+ */
+async function bookSignedOut(page: Page): Promise<string> {
+  const [checkIn, checkOut] = utcDates(35, 37);
+  await page.goto('/search');
+  await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+  await openHotel(page, page.locator(VIEW_ROOMS).first());
+
+  const hotel = new URL(page.url());
+  const hotelPath = `${hotel.pathname}${hotel.search}`;
+  const book = page.locator('[data-testid^="book-"]:enabled').first();
+  await expect(book).toBeVisible();
+  await book.click();
+  await expect(page).toHaveURL(`/login?returnUrl=${encodeURIComponent(hotelPath)}`);
+  return hotelPath;
 }
 
 /**
@@ -1667,6 +1713,8 @@ test('duplicate registration shows an inline 409', async ({ page }) => {
       'An account with this email already exists.',
     );
     await expect(page).toHaveURL(/\/register$/);
+    // The pending state disabled the focused button; focus returns to it.
+    await expect(page.getByTestId('register-submit')).toBeFocused();
   });
 });
 
@@ -1691,6 +1739,300 @@ test('wrong password shows an inline 401', async ({ page }) => {
     await expect(page).toHaveURL(/\/login(?:\?|$)/);
     await expect(page.getByTestId('nav-login')).toBeVisible();
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    // The pending state disabled the focused button; focus returns to it.
+    await expect(page.getByTestId('login-submit')).toBeFocused();
+  });
+
+  await test.step('a resubmit keeps the error until its own 401 shows it in a new alert', async () => {
+    const shown = await page.getByRole('alert').elementHandle();
+    expect(shown).not.toBeNull();
+    // Records every layout shift from here on, including any frame painted
+    // between the old alert's removal and the new one's insertion.
+    await page.evaluate(() => {
+      const shifts: number[] = [];
+      const observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          shifts.push((entry as unknown as { value: number }).value);
+        }
+      });
+      observer.observe({ type: 'layout-shift' });
+      (window as unknown as Record<string, unknown>)['__resubmitShifts'] = (): number[] => {
+        for (const entry of observer.takeRecords()) {
+          shifts.push((entry as unknown as { value: number }).value);
+        }
+        return shifts;
+      };
+    });
+
+    // Holding the answer back keeps the second attempt pending.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(isLoginApi, async (route) => {
+      await held;
+      await route.continue();
+    });
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('login-submit').click();
+    await expect(page.getByTestId('login-submit')).toBeDisabled();
+    await expect(page.getByTestId('inline-error')).toContainText('Email or password is incorrect.');
+
+    release();
+    expect((await login).status()).toBe(401);
+    await expect(page.getByTestId('login-submit')).toBeFocused();
+    await expect(page.getByRole('alert')).toContainText('Email or password is incorrect.');
+    // A new alert region, so assistive technology announces the repeated error.
+    expect(await shown?.evaluate((element) => element.isConnected)).toBe(false);
+    // Two more frames, so the frames around the answer have been painted.
+    const shifts = await page.evaluate(
+      () =>
+        new Promise<number[]>((resolve) => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() =>
+              resolve(((window as unknown as Record<string, unknown>)['__resubmitShifts'] as () => number[])()),
+            ),
+          );
+        }),
+    );
+    expect(shifts, 'layout shifts from the pending resubmit to its answer').toEqual([]);
+  });
+});
+
+test('a register field error ends once the guest edits that field', async ({ page }) => {
+  await page.goto('/register');
+
+  await test.step('register with a password the server rejects', async () => {
+    await fillBound(page, 'register-email', uniqueEmail());
+    // Seven characters: the server's rule is 8 to 128.
+    await fillBound(page, 'register-password', 'short12');
+    await fillBound(page, 'register-full-name', 'States Guest');
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('register-submit').click();
+    expect((await registration).status()).toBe(400);
+  });
+
+  const password = page.getByTestId('register-password');
+  await test.step('the password is marked invalid and takes focus', async () => {
+    // The field error names its field by the visible label, never by the API's key.
+    await expect(page.getByTestId('inline-error')).toContainText('Password: The value must be 8 to 128 characters long.');
+    await expect(password).toHaveAttribute('aria-invalid', 'true');
+    await expect(password).toHaveAttribute('aria-describedby', /\S/);
+    // Focus moves from the disabled submit button to the field the error marks.
+    await expect(password).toBeFocused();
+  });
+
+  await test.step('editing the password ends its error', async () => {
+    await fillBound(page, 'register-password', uniquePassword());
+    await expect(password).not.toHaveAttribute('aria-invalid');
+    await expect(password).not.toHaveAttribute('aria-describedby');
+    // It was the only field the server rejected, so the whole error is gone.
+    await expect(page.getByTestId('inline-error')).toHaveCount(0);
+    await expect(page).toHaveURL('/register');
+  });
+});
+
+test('registering and logging in move focus to the next page heading', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('the login page heading takes focus', async () => {
+    await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
+  });
+
+  await test.step('after logging in, the search page heading takes focus', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeFocused();
+  });
+});
+
+test('a guest sent from Book to log in who registers first returns to the hotel', async ({ page }) => {
+  const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  const email = uniqueEmail();
+  const password = uniquePassword();
+  await test.step('create an account from the login page', async () => {
+    await page.getByTestId('register-link').click();
+    // The return URL travels in router state, never in the register URL.
+    await expect(page).toHaveURL('/register');
+    await registerGuest(page, { email, password, fullName: 'States Guest' });
+    await expect(page).toHaveURL('/login?registered=1');
+  });
+
+  await test.step('log in and land on the hotel', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    // The heading renders only once the hotel's details load, and takes focus then.
+    await expect(page.getByTestId('hotel-name')).toBeFocused();
+  });
+
+  await test.step('Back to the earlier login entry moves on to the hotel without the form', async () => {
+    // The history ends …, hotel, login with returnUrl, register, hotel: the
+    // login made the last entry replace /login?registered=1.
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await page.goBack();
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+test('a signed-in guest who registers again from Back gets the new account hand-off', async ({ page }) => {
+  const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  const first: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
+  await test.step('create an account from the login page and log in', async () => {
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await registerGuest(page, { ...first, fullName: 'States Guest' });
+    await logIn(page, first.email, first.password);
+    await expect(page).toHaveURL(hotelPath);
+  });
+
+  const second: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
+  await test.step('go Back to the register page and create a second account', async () => {
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await registerGuest(page, { ...second, fullName: 'Second Guest' });
+  });
+
+  await test.step('the login page shows the notice and the new email, not a redirect', async () => {
+    await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
+    await expectControlValue(page, 'login-email', second.email);
+    await expect(page).toHaveURL('/login?registered=1');
+  });
+
+  await test.step('logging in as the new account still returns to the hotel', async () => {
+    await logIn(page, second.email, second.password);
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+  });
+});
+
+test('Back to a used /login?registered=1 entry while signed in moves on without the form', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('leave the hand-off unused, then log in from the plain login page', async () => {
+    await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await page.getByTestId('login-link').click();
+    await expect(page).toHaveURL('/login');
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+  });
+
+  await test.step('Back twice reaches /login?registered=1, which has no email waiting and moves on', async () => {
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await page.goBack();
+    await expect(page).toHaveURL('/search');
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+test('Back after logging in from a Book redirect does not show the login form', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+  const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  await test.step('log in and land on the hotel', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    // The heading renders only once the hotel's details load, and takes focus then.
+    await expect(page.getByTestId('hotel-name')).toBeFocused();
+  });
+
+  await test.step('Back returns to the hotel entry before the login', async () => {
+    // The login replaced its own entry, so one step back is the hotel page
+    // that sent the guest to log in.
+    await page.goBack();
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+for (const returnUrl of LOGIN_RETURN_URLS) {
+  test(`logging in with the return URL ${returnUrl} lands on the search page`, async ({ page }) => {
+    const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+    await test.step('log in from a login URL whose return URL is the login page', async () => {
+      await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+      await logIn(page, email, password);
+      await expect(page).toHaveURL('/search');
+      await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeVisible();
+      await expect(page.getByTestId('login-submit')).toHaveCount(0);
+    });
+  });
+}
+
+test('Back to a login entry whose return URL is the login page moves on to search', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('open a login URL returning to login, then log in from the nav link', async () => {
+    await page.goto(`/login?returnUrl=${encodeURIComponent('/login')}`);
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await page.getByTestId('nav-login').click();
+    await expect(page).toHaveURL('/login');
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+  });
+
+  await test.step('Back twice reaches the old login entry, which shows search, not a blank page', async () => {
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await page.goBack();
+    await expect(page).toHaveURL('/search');
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+test('after a signed-out reload of My bookings, logging in returns there and Back never shows the login form', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('log in and open My bookings', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+    await page.getByTestId('nav-bookings').click();
+    await expect(page).toHaveURL('/bookings');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+  });
+
+  const entries = await test.step('the reload starts signed out and the guard sends it to log in', async () => {
+    await page.reload();
+    await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
+    await expect(page.getByTestId('login-submit')).toBeVisible();
+    return page.evaluate(() => history.length);
+  });
+
+  await test.step('logging in returns to My bookings in place of the login entry', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/bookings');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+    expect(await page.evaluate(() => history.length), 'history entries after the login').toBe(entries);
+  });
+
+  await test.step('Back reaches the search page before the reload within two steps, never the login form', async () => {
+    // The guard's redirect after the reload adds the login entry after the
+    // reloaded /bookings entry, so the first Back can land on that /bookings
+    // entry, where the router may skip a navigation to the URL it shows.
+    for (let step = 1; step <= 2 && new URL(page.url()).pathname !== '/search'; step++) {
+      await page.goBack();
+      const heading = new URL(page.url()).pathname === '/search' ? 'Find a hotel' : 'My bookings';
+      await expect(page.getByRole('heading', { level: 1 }), `the heading after Back ${step}`).toHaveText(heading);
+      await expect(page.getByTestId('login-submit'), `the login form after Back ${step}`).toHaveCount(0);
+    }
+    await expect(page).toHaveURL('/search');
   });
 });
 

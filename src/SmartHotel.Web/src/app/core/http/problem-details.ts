@@ -324,3 +324,32 @@ function toFieldErrors(errors: unknown): UiError['fieldErrors'] {
   }
   return fieldErrors;
 }
+
+/**
+ * Returns the error a form shows once the guest has edited one of its fields:
+ * `error` without the {@link UiError.fieldErrors} entries that name `field`.
+ * Keys are matched as {@link fieldErrorIds} matches them, so a top-level JSON
+ * path key such as `$.email` names `email`, and every other key must equal
+ * `field` exactly, with case.
+ *
+ * - When no entry names `field`, `error` itself is returned, so an error that
+ *   carries no field errors, such as a 401 or 409, stays as it is.
+ * - When the entries removed were its last field errors, the result is
+ *   `null`: every field the server rejected has been edited, so the whole
+ *   error, title and detail included, is cleared.
+ * - Otherwise the result is a copy holding the remaining entries in their
+ *   order.
+ *
+ * The function is pure.
+ *
+ * @param error - The error being shown.
+ * @param field - The name of the edited form field, for example `email`.
+ * @returns The error to show from now on, or `null` to show none.
+ */
+export function withoutFieldErrors(error: UiError, field: string): UiError | null {
+  const remaining = error.fieldErrors.filter((fe) => fieldNameOf(fe.field) !== field);
+  if (remaining.length === error.fieldErrors.length) {
+    return error;
+  }
+  return remaining.length === 0 ? null : { ...error, fieldErrors: remaining };
+}

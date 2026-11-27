@@ -63,7 +63,7 @@
      browser's own style sheet applies. -->
 <div *ngIf="hotel() as hotel" [hidden]="loadPending()">
   <header class="hotel-header">
-    <h1 data-testid="hotel-name">{{ hotel.name }}</h1>
+    <h1 tabindex="-1" data-testid="hotel-name">{{ hotel.name }}</h1>
     <p class="hotel-meta">{{ hotel.city }}</p>
     <p class="hotel-meta">{{ hotel.address }}</p>
     <p class="hotel-description">{{ hotel.description }}</p>

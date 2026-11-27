@@ -1,10 +1,11 @@
 <section class="auth-page">
-  <h1>Register</h1>
+  <h1 tabindex="-1">Register</h1>
 
   <form [formGroup]="form" (ngSubmit)="submit()">
     <div class="field">
       <label for="register-email">Email</label>
       <input
+        #emailInput
         id="register-email"
         data-testid="register-email"
         type="email"
@@ -19,6 +20,7 @@
     <div class="field">
       <label for="register-password">Password</label>
       <input
+        #passwordInput
         id="register-password"
         data-testid="register-password"
         type="password"
@@ -33,6 +35,7 @@
     <div class="field">
       <label for="register-full-name">Full name</label>
       <input
+        #fullNameInput
         id="register-full-name"
         data-testid="register-full-name"
         type="text"
@@ -46,8 +49,8 @@
 
     <app-error-message [error]="error()" [fieldErrorIdPrefix]="errorIdPrefix"></app-error-message>
 
-    <button type="submit" data-testid="register-submit" [disabled]="pending()">Create account</button>
+    <button #submitButton type="submit" data-testid="register-submit" [disabled]="pending()">Create account</button>
   </form>
 
-  <p><a routerLink="/login" data-testid="login-link">Already registered? Log in</a></p>
+  <p><a routerLink="/login" [queryParams]="loginLinkQuery" data-testid="login-link">Already registered? Log in</a></p>
 </section>
