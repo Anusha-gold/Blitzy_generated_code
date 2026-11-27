@@ -74,6 +74,12 @@
   color: var(--sh-color-text-muted);
 }
 
+/* Focus lands on this cell after a cancel; an inset ring stays inside the
+   sideways-scrolling table region. */
+.bookings .status:focus-visible {
+  outline-offset: -2px;
+}
+
 /* A 44px target. The focus ring is the global button's, as is Cancel's
    disabled state; the pager's aria-disabled state is drawn below. The scroll
    margin makes scrollIntoView and focus scrolling, which stop at the border

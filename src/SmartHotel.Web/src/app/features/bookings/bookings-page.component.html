@@ -1,4 +1,6 @@
-<h1>My bookings</h1>
+<h1 tabindex="-1">My bookings</h1>
+
+<p class="visually-hidden" role="status" aria-live="polite" data-testid="bookings-announcement">{{ announcement() }}</p>
 
 <section
   *ngIf="confirmation() as c"
@@ -68,6 +70,7 @@
               [class.status-confirmed]="b.status === 'Confirmed'"
               [class.status-cancelled]="b.status === 'Cancelled'"
               [attr.data-testid]="'booking-status-' + b.id"
+              tabindex="-1"
             >{{ b.status }}</td>
             <td>
               <!-- The visible label "Cancel" starts the accessible name, and the
@@ -76,11 +79,12 @@
                    is unique within its hotel and a room never has two
                    overlapping Confirmed bookings, so no two buttons share a name. -->
               <button
-                *ngIf="canCancel(b)"
+                *ngIf="cancellableIds().has(b.id)"
                 type="button"
                 [attr.data-testid]="'cancel-' + b.id"
                 [disabled]="cancelPending()"
-                (click)="cancel(b)"
+                #cancelButton
+                (click)="cancel(b, cancelButton)"
               >Cancel<span class="visually-hidden"> booking at {{ b.hotelName }}, {{ b.roomTypeName }} room {{ b.roomNumber }}, {{ b.checkIn }} to {{ b.checkOut }}</span></button>
             </td>
           </tr>

@@ -1,11 +1,58 @@
-<!-- While the hotel loads both signals are null and the page renders nothing of
-     its own: the app-wide loading indicator shows progress. -->
+<!-- The answer to a booking made for another hotel or stay than the one on
+     screen. It sits outside the hotel content, so it shows in every state of
+     the current view, and it never navigates or puts an error above the
+     current room table; when it is a 201 or a 409 for rooms that table counts
+     (same hotel, overlapping dates), the page revalidates them. The link hands
+     over the created booking in memory, so My bookings shows the same
+     confirmation as after a booking on the current view. -->
+<div *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
+  <p role="status" data-testid="late-booking-message">
+    Your booking of {{ late.attempt.roomType.name }} at {{ late.attempt.hotel.name }}
+    from {{ late.attempt.hotel.checkIn }} to {{ late.attempt.hotel.checkOut }}
+    {{ late.error === null ? 'is confirmed. No payment is taken online in this version.' : 'could not be confirmed.' }}
+  </p>
+  <a
+    *ngIf="late.confirmation as confirmation"
+    routerLink="/bookings"
+    [state]="confirmation"
+    data-testid="late-booking-bookings"
+  >View it in My bookings</a>
+  <app-error-message [error]="late.error">
+    <a
+      *ngIf="late.error?.status === 401"
+      routerLink="/login"
+      [queryParams]="{ returnUrl: router.url }"
+      data-testid="late-booking-login-again"
+    >Log in again</a>
+  </app-error-message>
+</div>
+
+<!-- While a load runs, loadError is null and the previous hotel, if any, is
+     hidden below: the app-wide loading indicator shows progress. A load
+     clears the booking error when it starts, so the two show together only
+     when the hotel's GET that answered after a booking error failed, such as
+     the revalidation after a 409: the conflict stays visible beside the
+     reason the fresh counts are missing. Only one of this block and the hotel
+     content below renders at a time, so both can carry the booking error's
+     "Log in again" link under one test hook. -->
 <ng-container *ngIf="loadError() as e">
   <h1>Hotel</h1>
   <app-error-message [error]="e"></app-error-message>
+  <app-error-message [error]="bookError()">
+    <a
+      *ngIf="bookError()?.status === 401"
+      routerLink="/login"
+      [queryParams]="{ returnUrl: router.url }"
+      data-testid="login-again"
+    >Log in again</a>
+  </app-error-message>
 </ng-container>
 
-<ng-container *ngIf="hotel() as hotel">
+<!-- A newer load keeps the previous hotel here but hidden, so none of it can be
+     seen, focused or clicked, and the new detail then reuses its room rows by
+     id. A plain div, whose display no style sets, so the [hidden] rule of the
+     browser's own style sheet applies. -->
+<div *ngIf="hotel() as hotel" [hidden]="loadPending()">
   <header class="hotel-header">
     <h1 data-testid="hotel-name">{{ hotel.name }}</h1>
     <p class="hotel-meta">{{ hotel.city }}</p>
@@ -19,7 +66,9 @@
   </header>
 
   <!-- A 401 here is the inline branch of the app's 401 rule: the page stays put
-       and offers a way back to this URL after logging in again. -->
+       and offers a way back to this URL after logging in again. A 409 stays
+       here while the page revalidates the stay, and the table below then
+       shows the fresh counts. -->
   <app-error-message [error]="bookError()">
     <a
       #loginAgain
@@ -78,13 +127,15 @@
       </tbody>
     </table>
   </div>
-</ng-container>
+</div>
 
 <!-- Always mounted, directly after the hotel content: assistive technology
      announces a change to an existing live region, not a region inserted with
-     its text. It holds only the load outcome; the room table stays outside it. -->
+     its text. It holds only the load outcome; the room table stays outside it.
+     It is empty while a load runs, as the hidden content above is, so it
+     never shows the previous stay and every completed load is announced. -->
 <div role="status" aria-live="polite">
-  <ng-container *ngIf="hotel() as hotel">
+  <ng-container *ngIf="!loadPending() && hotel() as hotel">
     <p *ngIf="hotel.roomTypes.length > 0" class="visually-hidden">{{ hotel.name }}: {{ hotel.roomTypes.length }} {{ hotel.roomTypes.length === 1 ? 'room type' : 'room types' }} for this stay.</p>
     <p *ngIf="hotel.roomTypes.length === 0" class="rooms-empty"><span class="visually-hidden">{{ hotel.name }}:</span> This hotel has no room types to book.</p>
   </ng-container>

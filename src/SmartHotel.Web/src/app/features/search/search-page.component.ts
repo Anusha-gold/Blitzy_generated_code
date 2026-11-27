@@ -43,6 +43,9 @@ function guestsForDisplay(text: string): number | null {
  *   redirects): the form only, with no results, message or error;
  * - loading: the app-wide indicator, driven by the loading interceptor, while
  *   the submit button is disabled through {@link SearchPageComponent.pending};
+ *   the previous results stay rendered but hidden, so none can be seen,
+ *   focused or clicked, and the new list then reuses the rows whose hotel ids
+ *   recur;
  * - results in server order (lowest nightly price, then name), or the
  *   empty-result message naming the city that was actually searched; both
  *   read the completed search's criteria, never the live form;
@@ -110,7 +113,11 @@ export class SearchPageComponent {
    */
   protected readonly fieldErrors = computed(() => fieldErrorIds(this.error(), this.errorIdPrefix));
 
-  /** The completed search's hotels in server order; `null` until one completes. */
+  /**
+   * The completed search's hotels in server order; `null` until one completes,
+   * after a failed one and on the idle page. A newer search keeps them, hidden,
+   * until it completes.
+   */
   protected readonly results = signal<HotelSummary[] | null>(null);
 
   /** The criteria of the last search that completed, which the results belong to. */
@@ -215,7 +222,6 @@ export class SearchPageComponent {
 
     this.form.patchValue({ city, checkIn, checkOut, guests: guestsForDisplay(guests) });
     this.error.set(null);
-    this.results.set(null);
     this.pending.set(true);
 
     return this.hotels.search(q).pipe(

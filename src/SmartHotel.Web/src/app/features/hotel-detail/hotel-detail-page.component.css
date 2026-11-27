@@ -54,8 +54,20 @@
   min-block-size: 2.75rem;
 }
 
-/* "Log in again", projected into the inline error: block padding gives it a
-   44px-tall target. */
+/* The notice for a booking answered after the page moved to another view. */
+.late-booking {
+  margin-block-end: 1.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--sh-color-rule);
+  border-radius: var(--sh-radius);
+}
+
+.late-booking p {
+  margin-block: 0;
+}
+
+/* The page's links ("Log in again" in an inline error, and the late-booking
+   notice's links): block padding gives each a 44px-tall target. */
 a {
   display: inline-block;
   padding-block: 0.625rem;

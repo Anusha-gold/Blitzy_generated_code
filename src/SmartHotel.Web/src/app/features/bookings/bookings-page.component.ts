@@ -1,10 +1,12 @@
 import {
+  type AfterViewInit,
   ChangeDetectionStrategy,
   ChangeDetectorRef,
   Component,
   DestroyRef,
   ElementRef,
   Injector,
+  NgZone,
   ViewChild,
   afterNextRender,
   computed,
@@ -107,8 +109,10 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
  *
  * Cancel boundary: "Cancel" is offered on `Confirmed` bookings whose check-in
  * is not earlier than the current UTC calendar date, the boundary the API
- * applies (a check-in before today, UTC, gives 409). The check is display-only;
- * the server stays the authority and its 409 still shows inline.
+ * applies (a check-in before today, UTC, gives 409). The date is kept current
+ * while the page stays open, so a stay whose check-in has passed stops offering
+ * "Cancel" without a reload. The check is display-only; the server stays the
+ * authority and its 409 still shows inline.
  */
 @Component({
   selector: 'app-bookings-page',
@@ -118,7 +122,7 @@ export function bookingConfirmationState(booking: Booking): BookingConfirmationS
   styleUrl: './bookings-page.component.css',
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
-export class BookingsPageComponent {
+export class BookingsPageComponent implements AfterViewInit {
   private readonly api = inject(BookingsApiService);
   private readonly router = inject(Router);
   private readonly location = inject(Location);
@@ -126,11 +130,20 @@ export class BookingsPageComponent {
   private readonly destroyRef = inject(DestroyRef);
   private readonly changeDetector = inject(ChangeDetectorRef);
 
-  /** Tells whether focus is on nothing when the confirmation banner renders. */
+  /**
+   * The page's document: the resume listeners of the UTC date, and the focused
+   * element the confirmation banner and the cancel focus handoff check.
+   */
   private readonly document = inject(DOCUMENT);
 
   /** Registers the banner focus after the next render, outside an injection context. */
   private readonly injector = inject(Injector);
+
+  /** Runs the UTC-date timer and listeners outside change detection. */
+  private readonly zone = inject(NgZone);
+
+  /** This page's host element, the scope of every focus-target lookup. */
+  private readonly host = inject<ElementRef<HTMLElement>>(ElementRef);
 
   /**
    * The rendered confirmation banner, the focus destination after a booking;
@@ -191,11 +204,54 @@ export class BookingsPageComponent {
   protected readonly cancelPending = signal(false);
 
   /**
-   * The current UTC calendar date as `yyyy-MM-dd`. It is derived from the ISO
-   * string, never from local-time date methods, so it matches the API's UTC
-   * boundary in every time zone.
+   * The text of the page's polite live region (`role="status"`). It starts
+   * empty, and the entry message waits until the region has been in the page
+   * for {@link LIVE_REGION_DELAY_MS} (see {@link ngAfterViewInit}): the
+   * confirmation, once the caller's list confirms the handed-over booking as
+   * the banner does, or "You have no bookings yet." when the entry load finds
+   * no bookings. Each 204 announces the cancelled booking. A cancel clears it
+   * first, so a repeated message is announced again. Errors are announced by
+   * the inline alert instead.
    */
-  protected readonly today = new Date().toISOString().slice(0, 10);
+  protected readonly announcement = signal('');
+
+  /**
+   * Whether the live region has been in the page for
+   * {@link LIVE_REGION_DELAY_MS}, so that text written into it is announced.
+   * Until then the entry load leaves its message to the live-region timer.
+   */
+  private readonly liveRegionReady = signal(false);
+
+  /**
+   * The timer that marks the live region ready and publishes the entry
+   * message into {@link announcement}; `undefined` when none is pending.
+   */
+  private liveRegionTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * The current UTC calendar date as `yyyy-MM-dd`, from {@link utcToday}.
+   * {@link keepTodayCurrent} refreshes it at each UTC midnight and whenever the
+   * tab is shown or focused again, so an open page never keeps a past date.
+   */
+  protected readonly today = signal(utcToday());
+
+  /**
+   * The ids of the bookings that offer "Cancel": `Confirmed`, with a check-in
+   * of {@link today} or later. Exact `yyyy-MM-dd` strings order correctly as
+   * text. Recomputed only when the list or the UTC date changes, never per
+   * change-detection pass; empty while no list is loaded. Display-only: the
+   * server stays the authority and its 409 still shows inline.
+   */
+  protected readonly cancellableIds = computed<ReadonlySet<number>>(() => {
+    const today = this.today();
+    const ids = new Set<number>();
+    for (const b of this.bookings() ?? []) {
+      if (b.status === 'Confirmed' && b.checkIn >= today) {
+        ids.add(b.id);
+      }
+    }
+    return ids;
+  });
 
   /**
    * The id of the booking whose confirmation handoff this page accepted at
@@ -230,57 +286,170 @@ export class BookingsPageComponent {
       .pipe(skip(1), takeUntilDestroyed())
       .subscribe(() => this.handoff.set(null));
 
+    this.keepTodayCurrent();
     this.loadOnEntry();
   }
 
   /**
-   * Cancels a booking. A 204 reloads the list, so the row's new status comes
-   * from the server. Every error of the cancel or of that reload, 401
-   * included, is shown inline and the page stays where it is.
-   *
-   * The reload runs inside the pending window: "Cancel" stays disabled until
-   * the row shows the server's new status, so a second click can never send a
-   * DELETE for a booking that is already cancelled. While a cancel, or its
-   * reload, is in flight the method returns without a request, because the
-   * disabled binding reaches the DOM only on the next change-detection pass
-   * and a click landing before it still calls here. The subscription is bound
-   * to the stored `DestroyRef`, because this runs from an event callback,
-   * outside an injection context.
+   * Publishes the entry message once the live region is in the page. Screen
+   * readers miss text written into a live region in the same frame the region
+   * is inserted, and the entry load can settle before the first render, so a
+   * timer marks the region ready {@link LIVE_REGION_DELAY_MS} after the view
+   * is initialised, the interval Angular CDK's `LiveAnnouncer` uses, and then
+   * writes {@link entryAnnouncement} for the list loaded so far; when the list
+   * loads later, {@link loadOnEntry} writes it. The timer is cleared when the
+   * page is destroyed and when a cancel starts, so it never overwrites a
+   * cancellation message.
    */
-  protected cancel(b: Booking): void {
+  ngAfterViewInit(): void {
+    this.destroyRef.onDestroy(() => this.clearLiveRegionTimer());
+    this.liveRegionTimer = setTimeout(() => {
+      this.liveRegionTimer = undefined;
+      this.liveRegionReady.set(true);
+      this.publishEntryAnnouncement();
+    }, LIVE_REGION_DELAY_MS);
+  }
+
+  /**
+   * Cancels a booking. The 204 marks that row `Cancelled` at once, ends the
+   * confirmation handoff when it is the handed-over booking, so its banner
+   * goes even if the reload fails, and announces the cancellation through
+   * {@link announcement}; the list is then reloaded and, when the reload
+   * succeeds, replaced from the server. Every error of the cancel or of that
+   * reload, 401 included, is shown inline and the page stays where it is.
+   * After a reload error the row keeps the `Cancelled` status the 204
+   * confirmed, so it no longer offers "Cancel". An entry message still waiting
+   * to be published (see {@link ngAfterViewInit}) is dropped when the cancel
+   * starts, so it never overwrites the cancellation's message.
+   *
+   * The pending flag blocks concurrent DELETEs: it is set before the request
+   * and released only once the cancel and its reload have both settled. While
+   * it is set every "Cancel" is disabled and this method returns without a
+   * request, because the disabled binding reaches the DOM only on the next
+   * change-detection pass and a click landing before it still calls here. The
+   * flag does not track the server: a booking cancelled elsewhere offers
+   * "Cancel" until the next load, and the server's 409 then shows inline. The
+   * subscription is bound to the stored `DestroyRef`, because this runs from
+   * an event callback, outside an injection context.
+   *
+   * Focus: the button is disabled at once and removed when the 204 marks the
+   * row `Cancelled`, so when `trigger` holds focus as the guest activates it,
+   * focus moves synchronously, before the disabled binding renders, to the
+   * booking's status cell, and the cancel owns that focus. When `trigger` does
+   * not hold focus (some browsers do not focus a clicked button) the cancel
+   * owns nothing and never moves focus. Once the cancel and its reload have
+   * settled, {@link settleCancel} moves focus on only while the cancel still
+   * owns it.
+   *
+   * @param b - The booking to cancel.
+   * @param trigger - The "Cancel" button the guest activated; focus is handed
+   *   off from it only when it holds focus.
+   */
+  protected cancel(b: Booking, trigger: HTMLButtonElement): void {
     if (this.cancelPending()) {
       return;
     }
 
+    this.clearLiveRegionTimer();
     this.error.set(null);
+    this.announcement.set('');
     this.cancelPending.set(true);
+
+    const owned = this.document.activeElement === trigger ? this.statusCell(b.id) : null;
+    owned?.focus();
 
     this.api
       .cancel(b.id)
       .pipe(
-        // The 204 already proves the handed-over booking cancelled, so its
-        // banner goes now, even if the reload below fails.
+        // The 204 already proves the booking cancelled, so its row stops
+        // offering "Cancel" and its banner goes now, even if the reload below
+        // fails.
         tap(() => {
           if (this.handoff() === b.id) {
             this.handoff.set(null);
           }
+          this.bookings.update((list) =>
+            list === null
+              ? null
+              : list.map((row): Booking => (row.id === b.id ? { ...row, status: 'Cancelled' } : row)),
+          );
+          this.announcement.set(
+            `Booking cancelled: ${b.hotelName}, room ${b.roomNumber}, ${b.checkIn} to ${b.checkOut}.`,
+          );
         }),
         switchMap(() => this.api.list()),
         finalize(() => this.cancelPending.set(false)),
         takeUntilDestroyed(this.destroyRef),
       )
       .subscribe({
-        next: (list) => this.bookings.set(list),
-        error: (err: HttpErrorResponse) => this.error.set(toUiError(err)),
+        next: (list) => {
+          this.bookings.set(list);
+          this.settleCancel(b.id, owned, false);
+        },
+        error: (err: HttpErrorResponse) => {
+          const uiError = toUiError(err);
+          this.error.set(uiError);
+          this.settleCancel(b.id, owned, uiError.status === 401);
+        },
       });
   }
 
   /**
-   * Whether "Cancel" is offered: the booking is `Confirmed` and its check-in is
-   * today (UTC) or later. Exact `yyyy-MM-dd` strings order correctly as text.
+   * Ends a cancel whose request and reload have settled, successfully or not.
+   * It releases the pending flag and renders the outcome at once. It then
+   * moves focus only while the cancel still owns it: `owned`, the status cell
+   * {@link cancel} focused, still has focus, or `owned` left the document with
+   * its row and focus fell to the body or to nothing. Focus on the body alone
+   * is never enough, because a guest who moved on and clicked blank space also
+   * leaves it there; and with `owned` `null` focus is never moved.
+   *
+   * The target is "Log in again" after a 401, as on the hotel page, because
+   * the session is gone and that link is the way on; otherwise the booking's
+   * "Cancel" when it is shown and enabled again, so a failed cancel restores
+   * focus to it; otherwise the booking's status cell, which keeps focus and
+   * reads `Cancelled` after a 204; and the page heading when the row is no
+   * longer shown. Targets are looked up inside this page only.
+   *
+   * It runs from the `next` and `error` callbacks, never on teardown: when the
+   * page is destroyed mid-request, `takeUntilDestroyed` only completes the
+   * stream, so nothing renders or moves focus on a destroyed view.
+   *
+   * @param id - The booking the cancel was for.
+   * @param owned - The element the cancel moved focus to, or `null` when it
+   *   took no focus.
+   * @param unauthorized - Whether the cancel or its reload failed with 401.
    */
-  protected canCancel(b: Booking): boolean {
-    return b.status === 'Confirmed' && b.checkIn >= this.today;
+  private settleCancel(id: number, owned: HTMLElement | null, unauthorized: boolean): void {
+    this.cancelPending.set(false);
+    this.changeDetector.detectChanges();
+
+    if (owned === null) {
+      return;
+    }
+    const active = this.document.activeElement;
+    const stillOwned =
+      active === owned || (!owned.isConnected && (active === null || active === this.document.body));
+    if (!stillOwned) {
+      return;
+    }
+    const host = this.host.nativeElement;
+    const loginAgain = unauthorized ? host.querySelector<HTMLElement>('[data-testid="login-again"]') : null;
+    const target =
+      loginAgain ??
+      host.querySelector<HTMLElement>(`[data-testid="cancel-${id}"]:enabled`) ??
+      this.statusCell(id) ??
+      host.querySelector<HTMLElement>('h1');
+    target?.focus();
+  }
+
+  /**
+   * The status cell (`booking-status-{id}`, `tabindex="-1"`) of a booking on
+   * this page, or `null` when its row is not shown.
+   *
+   * @param id - The booking whose status cell to find.
+   */
+  private statusCell(id: number): HTMLElement | null {
+    return this.host.nativeElement.querySelector<HTMLElement>(`[data-testid="booking-status-${id}"]`);
   }
 
   /** Identifies a booking row by its id for `NgFor`. */
@@ -367,6 +536,11 @@ export class BookingsPageComponent {
    * Loads the caller's bookings when the page opens. This protected-page
    * request is the only one whose 401 redirects to the login page; any other
    * error is shown inline.
+   *
+   * Once the live region is ready, the loaded list publishes the entry message
+   * (see {@link publishEntryAnnouncement}); before that, the live-region timer
+   * publishes it when it fires (see {@link ngAfterViewInit}). An error leaves
+   * the announcement unchanged.
    */
   private loadOnEntry(): void {
     this.api
@@ -375,6 +549,9 @@ export class BookingsPageComponent {
       .subscribe({
         next: (list) => {
           this.bookings.set(list);
+          if (this.liveRegionReady()) {
+            this.publishEntryAnnouncement();
+          }
           this.focusConfirmationAfterRender();
         },
         error: (err: HttpErrorResponse) => {
@@ -443,6 +620,151 @@ export class BookingsPageComponent {
     delete kept['booking'];
     this.location.replaceState(this.location.path(true), '', kept);
   }
+
+  /**
+   * Writes the entry message into {@link announcement} when there is one, and
+   * leaves the announcement unchanged otherwise.
+   */
+  private publishEntryAnnouncement(): void {
+    const message = this.entryAnnouncement();
+    if (message !== '') {
+      this.announcement.set(message);
+    }
+  }
+
+  /**
+   * The page's entry message: the booking the banner confirms
+   * ({@link confirmation}), when there is one, then "You have no bookings
+   * yet." when the loaded list is empty. Empty when neither applies, which
+   * includes while no list is loaded, because the banner too waits for the
+   * caller's list.
+   */
+  private entryAnnouncement(): string {
+    const c = this.confirmation();
+    const list = this.bookings();
+    const messages: string[] = [];
+    if (c !== null) {
+      messages.push(
+        `Booking confirmed: ${c.hotelName}, ${c.roomTypeName}, room ${c.roomNumber}, ` +
+          `${c.checkIn} to ${c.checkOut}. No payment is taken online in this version.`,
+      );
+    }
+    if (list !== null && list.length === 0) {
+      messages.push('You have no bookings yet.');
+    }
+    return messages.join(' ');
+  }
+
+  /** Cancels a pending live-region timer; does nothing when none is pending. */
+  private clearLiveRegionTimer(): void {
+    clearTimeout(this.liveRegionTimer);
+    this.liveRegionTimer = undefined;
+  }
+
+  /**
+   * Keeps {@link today} current while the page is open. A timer fires at the
+   * next UTC midnight; the tab becoming visible (`visibilitychange`), being
+   * restored from the back-forward cache (`pageshow`) or regaining focus
+   * (`focus`) refreshes the date too, because a hidden or frozen tab delays its
+   * timers. Every refresh re-arms the timer from the current clock, so a timer
+   * that fired early or late corrects itself.
+   *
+   * The timer and the listeners run outside Angular's zone and so trigger no
+   * change detection; only a refresh that finds a new date re-enters the zone
+   * to apply it through {@link applyToday}. All of them are removed when the
+   * page is destroyed.
+   */
+  private keepTodayCurrent(): void {
+    const view = this.document.defaultView;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const refresh = (): void => {
+      clearTimeout(timer);
+      timer = setTimeout(refresh, msUntilNextUtcMidnight());
+      const date = utcToday();
+      if (date !== this.today()) {
+        this.zone.run(() => this.applyToday(date));
+      }
+    };
+    const refreshIfVisible = (): void => {
+      if (this.document.visibilityState === 'visible') {
+        refresh();
+      }
+    };
+
+    this.zone.runOutsideAngular(() => {
+      timer = setTimeout(refresh, msUntilNextUtcMidnight());
+      this.document.addEventListener('visibilitychange', refreshIfVisible);
+      view?.addEventListener('pageshow', refresh);
+      view?.addEventListener('focus', refresh);
+    });
+
+    this.destroyRef.onDestroy(() => {
+      clearTimeout(timer);
+      this.document.removeEventListener('visibilitychange', refreshIfVisible);
+      view?.removeEventListener('pageshow', refresh);
+      view?.removeEventListener('focus', refresh);
+    });
+  }
+
+  /**
+   * Sets {@link today} to a new UTC date. A check-in that is now in the past
+   * stops offering "Cancel", so when the "Cancel" on this page that has focus
+   * is removed by the change, focus moves to that booking's status cell
+   * instead of falling to the document body. The removal is rendered at once
+   * to find out; focus anywhere else is left alone.
+   *
+   * @param date - The new current UTC date, as `yyyy-MM-dd`.
+   */
+  private applyToday(date: string): void {
+    const active = this.document.activeElement;
+    const focusedCancel =
+      active !== null &&
+      this.host.nativeElement.contains(active) &&
+      active.matches('[data-testid^="cancel-"]')
+        ? active
+        : null;
+    const row = focusedCancel?.closest('tr');
+    const status = row?.querySelector<HTMLElement>('[data-testid^="booking-status-"]') ?? null;
+
+    this.today.set(date);
+
+    if (focusedCancel !== null) {
+      this.changeDetector.detectChanges();
+      if (!focusedCancel.isConnected) {
+        status?.focus();
+      }
+    }
+  }
+}
+
+/** The length of a day in milliseconds, as ECMAScript time counts every day. */
+const DAY_MS = 86_400_000;
+
+/**
+ * How long, in milliseconds, the live region is in the page before the entry
+ * message is written into it: the interval Angular CDK's `LiveAnnouncer`
+ * waits, because screen readers miss live-region text written in the same
+ * frame the region is inserted.
+ */
+const LIVE_REGION_DELAY_MS = 100;
+
+/**
+ * The current UTC calendar date as `yyyy-MM-dd`. It is derived from the ISO
+ * string, never from local-time date methods, so it matches the API's UTC
+ * boundary in every time zone.
+ */
+function utcToday(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * The milliseconds from now until the next UTC midnight, from 1 to
+ * {@link DAY_MS}. ECMAScript time has no leap seconds and its epoch is a UTC
+ * midnight, so the remainder is the time elapsed since the last one.
+ */
+function msUntilNextUtcMidnight(): number {
+  return DAY_MS - (Date.now() % DAY_MS);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

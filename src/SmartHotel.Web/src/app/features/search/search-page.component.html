@@ -56,9 +56,11 @@
 
 <!-- Always mounted: assistive technology announces a change to an existing
      live region, not a region inserted with its text. It holds only the
-     outcome sentence; the result list stays outside it. -->
+     outcome sentence; the result list stays outside it. It is empty while a
+     search runs, as the hidden results below are, so it never shows the
+     previous outcome and every completed search is announced. -->
 <div role="status" aria-live="polite">
-  <ng-container *ngIf="searched() as s">
+  <ng-container *ngIf="!pending() && searched() as s">
     <ng-container *ngIf="results() as list">
       <p *ngIf="list.length > 0" class="visually-hidden">{{ list.length }} {{ list.length === 1 ? 'hotel' : 'hotels' }} with available rooms in {{ s.city }} for these dates.</p>
       <p *ngIf="list.length === 0" class="empty" data-testid="search-empty">No hotels with available rooms in {{ s.city }} for these dates.</p>
@@ -66,7 +68,11 @@
   </ng-container>
 </div>
 
-<ng-container *ngIf="searched() as s">
+<!-- A newer search keeps the previous results here but hidden, so none can be
+     seen, focused or clicked, and the new list then reuses their rows by hotel
+     id. A plain div, whose display no style sets (.results is a flex box), so
+     the [hidden] rule of the browser's own style sheet applies. -->
+<div *ngIf="searched() as s" [hidden]="pending()">
   <ng-container *ngIf="results() as list">
     <ul *ngIf="list.length > 0" class="results" role="list" aria-label="Search results">
       <li *ngFor="let h of list; trackBy: trackById" [attr.data-testid]="'hotel-result-' + h.id">
@@ -81,4 +87,4 @@
       </li>
     </ul>
   </ng-container>
-</ng-container>
+</div>
