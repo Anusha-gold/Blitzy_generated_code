@@ -218,7 +218,9 @@ static void CollectStartupFailure(List<Exception> failures, Func<object?> read)
 }
 
 // The exception handler is the first middleware added here, so it catches an exception before the Development
-// exception page that WebApplication wraps around the pipeline, and no stack trace reaches the response.
+// exception page that WebApplication wraps around the pipeline, and no stack trace reaches the response. Routing is
+// added explicitly after it and the status-code pages: left implicit, WebApplication would run endpoint matching
+// ahead of both, so an exception thrown while matching would escape the handler.
 app.UseExceptionHandler();
 app.UseStatusCodePages();
 
@@ -274,14 +276,37 @@ if (!app.Environment.IsDevelopment())
     });
 }
 
-app.UseCors(ApiCorsOptions.PolicyName);
+app.UseRouting();
+
+// The CORS middleware answers every preflight with 204 before the endpoint runs, so it would answer a preflight for
+// the readiness probe in place of the GET-only mapping's 405 problem. That preflight alone skips CORS; every other
+// request, controller preflights included, goes through the single-origin policy.
+app.UseWhen(
+    static context => !IsReadinessPreflight(context),
+    static branch => branch.UseCors(ApiCorsOptions.PolicyName));
 app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
 
-// The readiness probe matches GET only, so any other method gets routing's 405 as a problem.
-app.MapGet("/api/health", static () => Results.Text("Healthy", "text/plain"));
+// The readiness probe matches GET only, so any other method gets routing's 405 as a problem. Its name lets the CORS
+// condition recognize a preflight for it.
+const string ReadinessEndpointName = "Readiness";
+app.MapGet("/api/health", static () => Results.Text("Healthy", "text/plain")).WithName(ReadinessEndpointName);
+
+// A preflight is an OPTIONS request with Origin and Access-Control-Request-Method headers, the test the CORS
+// middleware applies. The path is parsed against the readiness route itself, so every path form routing sends to
+// the probe counts. The method and header checks come first, so only a preflight reaches the parse.
+static bool IsReadinessPreflight(HttpContext context)
+{
+    IHeaderDictionary headers = context.Request.Headers;
+    return HttpMethods.IsOptions(context.Request.Method)
+        && headers.ContainsKey(CorsConstants.Origin)
+        && headers.ContainsKey(CorsConstants.AccessControlRequestMethod)
+        && context.RequestServices
+            .GetRequiredService<LinkParser>()
+            .ParsePathByEndpointName(ReadinessEndpointName, context.Request.Path) is not null;
+}
 
 // Migrate, then seed, before the server listens: once the probe answers, the database is ready. The host's console
 // lifetime handles SIGINT, SIGQUIT and SIGTERM only once app.Run() starts it, so until then these registrations turn

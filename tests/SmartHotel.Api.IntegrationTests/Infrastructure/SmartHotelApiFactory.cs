@@ -1,12 +1,15 @@
 using System.Security.Cryptography;
 
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 
 using Npgsql;
@@ -27,6 +30,10 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// setup. <see cref="DisposeAsync"/> stops the host and drops the database and the role.
 /// </para>
 /// <para>
+/// A test that must reach the real server, such as its rejection of a malformed request, which the in-process server
+/// never parses, starts a second host of the same API through <see cref="StartLoopbackListenerAsync"/>.
+/// </para>
+/// <para>
 /// The host runs in the Development environment with in-memory <c>Cors:AllowedOrigin</c> configuration, and its
 /// <see cref="ISecretSource"/> is replaced by one that holds this factory's connection string and signing key. The
 /// connection string authenticates as this factory's own role with a random password, never as the server user, and
@@ -43,11 +50,26 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     private const string WebOrigin = "http://localhost:4200";
     private const int SigningKeyLength = 64;
 
+    // Port 0 lets the operating system choose a free port, so concurrent test runs never collide.
+    private const string LoopbackListenerUrl = "http://127.0.0.1:0";
+
+    private static readonly TimeSpan ListenerStartTimeout = TimeSpan.FromMinutes(1);
+
     private readonly TestPostgres _postgres;
+
+    // Serializes starting the listener and stopping it, so it is started at most once and never outlives the factory.
+    // It is never disposed: without its wait handle it holds no unmanaged resource, and a disposed gate would fail a
+    // caller that is still waiting for it with the wrong exception.
+    private readonly SemaphoreSlim _listenerGate = new(1, 1);
 
     // Set to 1 by the first DisposeAsync. The base class's synchronous Dispose also calls DisposeAsync, so the
     // shutdown and the drop must run only once however the factory is disposed.
     private int _disposed;
+
+    // The builder the in-process host was built from, recorded by CreateHost, and the listening host built from it.
+    private IHostBuilder? _hostBuilder;
+    private IHost? _listener;
+    private Uri? _listenerAddress;
 
     /// <summary>
     /// Creates a factory with a new database name, a new random password for the login role of the same name, and a
@@ -156,14 +178,103 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     }
 
     /// <summary>
-    /// Stops and disposes the host and its clients, then drops <see cref="DatabaseName"/> and its login role, even when
-    /// the shutdown throws or <see cref="InitializeAsync"/> never created them. Calls after the first do nothing.
+    /// Starts, on the first call, a second host of the API that serves this factory's database through Kestrel on a
+    /// loopback port the operating system chooses, and returns its address. Later calls return the same address.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The in-process host is built and started first, if it is not running yet. The listener is then built from the
+    /// same host builder, so <c>Program</c> runs again with every override of this factory: its migration and seed find
+    /// the database ready and change nothing. The two hosts share the database and the signing key, so a token one
+    /// issues is valid on the other.
+    /// </para>
+    /// <para>
+    /// The listener answers real HTTP/1.1 connections, so a test can send bytes the in-process server never parses,
+    /// such as an over-long request line or a malformed header. <see cref="DisposeAsync"/> stops and disposes it before
+    /// the in-process host. Concurrent calls are safe; they start one listener.
+    /// </para>
+    /// </remarks>
+    /// <param name="cancellationToken">Cancels waiting for the in-process host and for the listener to start.</param>
+    /// <returns>The listener's base address, such as <c>http://127.0.0.1:41234/</c>.</returns>
+    /// <exception cref="ObjectDisposedException">The factory has been disposed.</exception>
+    /// <exception cref="TimeoutException">The listener did not start within one minute.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The listener failed to start or reported no single bound address. The message carries only the operation, the
+    /// exception types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c>, and no inner
+    /// exception, because provider and host messages can quote the username or the database.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<Uri> StartLoopbackListenerAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+
+        await _listenerGate.WaitAsync(cancellationToken);
+        try
+        {
+            // Checked again under the gate: DisposeAsync may have stopped the hosts while this call waited.
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+            if (_listenerAddress is not null)
+            {
+                return _listenerAddress;
+            }
+
+            // Reading Server builds and starts the in-process host, which records the builder in CreateHost. It runs
+            // synchronously, so Task.Run keeps it off xUnit's synchronization context.
+            await Task.Run(() => _ = Server, cancellationToken);
+            IHostBuilder builder = _hostBuilder
+                ?? throw new InvalidOperationException("The in-process host was not built from a host builder.");
+
+            // Kestrel replaces the in-process server in the services of the next build, and the URL replaces the
+            // default listening ports.
+            builder.ConfigureWebHost(static web => web.UseKestrel().UseUrls(LoopbackListenerUrl));
+            IHost? listener = null;
+            try
+            {
+                listener = await Task.Run(builder.Build, cancellationToken);
+                Uri address = await WaitForListenerAddressAsync(listener, cancellationToken);
+                _listener = listener;
+                _listenerAddress = address;
+                return address;
+            }
+            catch (Exception exception)
+            {
+                if (listener is not null)
+                {
+                    await StopListenerAsync(listener);
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    // Raised afresh, so that no host exception rides along as its inner exception.
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
+                if (exception is TimeoutException)
+                {
+                    throw;
+                }
+
+                // As for the in-process host: Program's startup failures can quote the username or the database.
+                throw new InvalidOperationException(
+                    _postgres.DescribeServerFailure("Starting the loopback listener failed.", exception));
+            }
+        }
+        finally
+        {
+            _listenerGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Stops and disposes the loopback listener, if one was started, then the in-process host and its clients, and
+    /// finally drops <see cref="DatabaseName"/> and its login role, even when a shutdown throws or
+    /// <see cref="InitializeAsync"/> never created them. Calls after the first do nothing.
     /// </summary>
     /// <returns>
-    /// A task that completes once the host is stopped and neither the database nor the role exists.
+    /// A task that completes once both hosts are stopped and neither the database nor the role exists.
     /// </returns>
     /// <exception cref="InvalidOperationException">
-    /// The host failed to stop, or the database or the role could not be dropped. The message carries only the
+    /// A host failed to stop, or the database or the role could not be dropped. The message carries only the
     /// operation, the exception types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c>, and no
     /// inner exception.
     /// </exception>
@@ -176,7 +287,14 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
         try
         {
-            await base.DisposeAsync();
+            try
+            {
+                await DisposeListenerAsync();
+            }
+            finally
+            {
+                await base.DisposeAsync();
+            }
         }
         catch (Exception exception)
         {
@@ -351,6 +469,84 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
 
         // Sorted here, not in SQL, so the order is ordinal whatever the database's collation.
         return [.. rooms.OrderBy(static room => room.RoomNumber, StringComparer.Ordinal)];
+    }
+
+    /// <summary>
+    /// Records the host builder, from which <see cref="StartLoopbackListenerAsync"/> builds the listener, then builds
+    /// and starts the in-process host as the base class does.
+    /// </summary>
+    /// <param name="builder">The host builder that runs the API's <c>Program</c> with this factory's overrides.</param>
+    /// <returns>The started in-process host.</returns>
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        _hostBuilder = builder;
+        return base.CreateHost(builder);
+    }
+
+    // The deferred host that Build returns shares its start signal with the in-process host, which has already started,
+    // so its own StartAsync returns at once. Program starts the listener itself, and Kestrel has bound its address only
+    // once the listener's lifetime reports that it started. A Program that fails before it starts the host never
+    // signals, so the wait is bounded.
+    private static async Task<Uri> WaitForListenerAddressAsync(IHost listener, CancellationToken cancellationToken)
+    {
+        IHostApplicationLifetime lifetime = listener.Services.GetRequiredService<IHostApplicationLifetime>();
+        TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (lifetime.ApplicationStarted.Register(
+            static state => ((TaskCompletionSource)state!).TrySetResult(),
+            started))
+        {
+            await started.Task.WaitAsync(ListenerStartTimeout, cancellationToken);
+        }
+
+        ICollection<string>? addresses = listener.Services
+            .GetRequiredService<IServer>()
+            .Features
+            .Get<IServerAddressesFeature>()?
+            .Addresses;
+
+        return addresses is { Count: 1 }
+            ? new Uri(addresses.Single())
+            : throw new InvalidOperationException("The listener reported no single bound address.");
+    }
+
+    // Waits for a start in progress, so a listener it creates is stopped as well.
+    private async Task DisposeListenerAsync()
+    {
+        await _listenerGate.WaitAsync(CancellationToken.None);
+        try
+        {
+            IHost? listener = _listener;
+            _listener = null;
+            if (listener is not null)
+            {
+                await StopListenerAsync(listener);
+            }
+        }
+        finally
+        {
+            _listenerGate.Release();
+        }
+    }
+
+    private static async Task StopListenerAsync(IHost listener)
+    {
+        try
+        {
+            await listener.StopAsync(CancellationToken.None);
+        }
+        finally
+        {
+            if (listener is IAsyncDisposable asyncDisposable)
+            {
+                await asyncDisposable.DisposeAsync();
+            }
+            else
+            {
+                listener.Dispose();
+            }
+        }
     }
 
     // The overrides below are in time for everything the API checks at startup. Program.cs reads no configuration

@@ -9,7 +9,9 @@ namespace SmartHotel.Api.Infrastructure;
 
 /// <summary>
 /// Logs every unhandled exception as one sanitized Error event and leaves the response to the exception
-/// handler middleware, which writes a generic 500 problem through <see cref="IProblemDetailsService"/>.
+/// handler middleware, which writes a generic 500 problem through <see cref="IProblemDetailsService"/>. A
+/// <see cref="BadHttpRequestException"/> that carries a client error, which the server raises while the request is
+/// read, is answered here with the generic problem for that status instead, and is not logged.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -51,7 +53,10 @@ namespace SmartHotel.Api.Infrastructure;
 /// </para>
 /// </remarks>
 /// <param name="logger">The logger that receives the sanitized event.</param>
-public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger) : IExceptionHandler
+/// <param name="problemDetailsService">The service that writes the generic problem for a client error.</param>
+public sealed partial class ApiExceptionHandler(
+    ILogger<ApiExceptionHandler> logger,
+    IProblemDetailsService problemDetailsService) : IExceptionHandler
 {
     private const int MaxInspections = 65_536;
     private const int MaxListedExceptions = 256;
@@ -63,14 +68,20 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
     private static readonly object ReportedExceptionsKey = new();
 
     /// <summary>
-    /// Writes the sanitized Error event for <paramref name="exception"/> and declines to handle it, so the
-    /// middleware produces the 500 problem body, which holds no exception data.
+    /// Answers a <see cref="BadHttpRequestException"/> whose status is a client error, from 400 to 499, with the
+    /// generic problem for that status. Writes the sanitized Error event for every other exception and declines to
+    /// handle it, so the middleware produces the 500 problem body. Neither body holds exception data.
     /// </summary>
     /// <param name="httpContext">The request whose processing threw.</param>
     /// <param name="exception">The unhandled exception.</param>
-    /// <param name="cancellationToken">Not observed: the handler does no asynchronous work.</param>
-    /// <returns>Always <see langword="false"/>, so the response is never written here.</returns>
-    public ValueTask<bool> TryHandleAsync(
+    /// <param name="cancellationToken">
+    /// Not observed: the problem writer observes the request's own abort token.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> once the client-error problem has been written; otherwise <see langword="false"/>, so
+    /// the middleware writes the 500 problem.
+    /// </returns>
+    public async ValueTask<bool> TryHandleAsync(
         HttpContext httpContext,
         Exception exception,
         CancellationToken cancellationToken)
@@ -78,11 +89,36 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
         ArgumentNullException.ThrowIfNull(httpContext);
         ArgumentNullException.ThrowIfNull(exception);
 
+        // The server rejects a request it cannot read any further, such as a body over its size limit, by throwing
+        // from the body read with the client error it stands for, and MVC's JSON input formatter lets that exception
+        // through. The middleware has already set 500 by now and, when every handler declines, writes the problem with
+        // status 500, so declining would report the client's error as a server fault. The problem is written here
+        // instead, from the status alone: the exception and its message, which names the server's limit, are never
+        // passed on. A client error is not a server fault, so no Error event is written for it.
+        if (exception is BadHttpRequestException { StatusCode: >= 400 and < 500 } rejection)
+        {
+            httpContext.Response.StatusCode = rejection.StatusCode;
+            await problemDetailsService.WriteAsync(new ProblemDetailsContext { HttpContext = httpContext });
+            return true;
+        }
+
         // When writing the problem fails, the middleware rethrows this same exception and the server reports it;
         // the record kept for the request stops that report from logging it a second time.
         LogUnlessReported(logger, httpContext, exception, fallbackTraceId: null);
 
-        return ValueTask.FromResult(false);
+        return false;
+    }
+
+    /// <summary>
+    /// Writes the sanitized Error event for an exception raised outside the request pipeline, where neither the
+    /// request method nor the route is known, such as while the server's own rejection of a request is completed.
+    /// </summary>
+    /// <param name="logger">The logger that receives the event.</param>
+    /// <param name="exception">The exception to describe by its types and frames.</param>
+    /// <param name="traceIdentifier">The server's identifier for the request the exception concerns.</param>
+    internal static void LogOutsideRequest(ILogger logger, Exception exception, string traceIdentifier)
+    {
+        LogUnlessReported(logger, httpContext: null, exception, traceIdentifier);
     }
 
     // Writes the sanitized event unless this exception, or one it is reachable from, is already logged for the
@@ -420,9 +456,9 @@ public sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> log
     /// </summary>
     /// <remarks>
     /// The page receives an exception the exception handler middleware rethrows because handling it failed
-    /// before the response started, and one thrown outside that middleware, such as by routing. By then the
-    /// page has cleared the response and set its status, so the problem written here carries only the shared
-    /// defaults. The rest of the filter chain is never invoked, because it ends in the page itself.
+    /// before the response started, and one thrown by any middleware that runs ahead of the exception handler.
+    /// By then the page has cleared the response and set its status, so the problem written here carries only the
+    /// shared defaults. The rest of the filter chain is never invoked, because it ends in the page itself.
     /// </remarks>
     /// <param name="logger">The logger that receives the sanitized event.</param>
     /// <param name="problemDetailsService">The service that writes the generic problem.</param>

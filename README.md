@@ -198,6 +198,7 @@ Conventions:
 - Requests and responses are JSON with camelCase property names. Enums are strings, such as `Confirmed` and `Cancelled`. Timestamps are UTC ISO 8601 with a `Z` suffix, and money is a number in USD with two decimals.
 - Dates are exactly `yyyy-MM-dd`. Other forms, such as `2026-1-5` or `12/07/2026`, return `400`.
 - Every error is `application/problem+json`, whatever the `Accept` header says, with `type`, `title`, `status`, `detail` and `traceId`. A `400` also carries `errors`.
+- That includes requests the server rejects before the API sees them, such as an over-long request line (`414`) or oversized headers (`431`), which is why the API serves HTTP/1.1.
 - A stay is 1–30 nights, and check-in cannot be earlier than today's UTC date.
 - The check-out day is not occupied: a stay that ends on the 12th and one that starts on the 12th can share a room.
 - A bearer token from `POST /api/auth/login` is valid for 60 minutes. Send it as `Authorization: Bearer <token>`.

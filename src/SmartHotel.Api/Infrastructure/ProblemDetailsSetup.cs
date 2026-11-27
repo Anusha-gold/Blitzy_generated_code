@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Mvc.ModelBinding.Metadata;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -50,8 +51,9 @@ public static class ProblemDetailsSetup
     /// <summary>
     /// Adds ProblemDetails support with <see cref="ApplyDefaults"/> as its customization step, registers
     /// <see cref="ApiProblemDetailsWriter"/> ahead of every framework writer, wires the sanitized diagnostics
-    /// for unhandled exceptions that the exception handler cannot answer, and keeps the Development exception
-    /// page from rendering exception data.
+    /// for unhandled exceptions that the exception handler cannot answer, keeps the Development exception
+    /// page from rendering exception data, and gives the requests Kestrel rejects before the pipeline runs the
+    /// same problem body.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -63,6 +65,14 @@ public static class ProblemDetailsSetup
     /// <para>
     /// <see cref="ApiExceptionHandler.DeveloperPageProblemFilter"/> answers every exception that reaches the
     /// Development exception page with the generic problem in place of the page.
+    /// </para>
+    /// <para>
+    /// Every Kestrel endpoint defaults to HTTP/1.1 and runs <see cref="ApiProblemDetailsWriter.ServerRejections"/>
+    /// as its first connection middleware, ahead of any TLS layer. The middleware learns of each rejection from the
+    /// server's own diagnostic event, so nothing is added to the request pipeline, whose first middleware stays the
+    /// exception handler. An endpoint's own <c>Protocols</c> setting in configuration still overrides the default.
+    /// A host on another server, such as the in-process test server, never resolves the Kestrel options and builds
+    /// no connection middleware.
     /// </para>
     /// </remarks>
     /// <param name="services">The API host's service collection.</param>
@@ -97,6 +107,21 @@ public static class ProblemDetailsSetup
         services.TryAddEnumerable(ServiceDescriptor.Singleton<
             IDeveloperPageExceptionFilter,
             ApiExceptionHandler.DeveloperPageProblemFilter>());
+
+        // Kestrel rejects some requests while it parses them, before any middleware runs, and answers with a bodyless
+        // status of its own; the connection middleware gives that response the problem body. Over HTTP/2 the rejection
+        // is a bare HEADERS frame that the middleware cannot extend with a body, so endpoints default to HTTP/1.1,
+        // which TLS serves just as well. Kestrel applies the endpoint defaults when it binds each endpoint, before an
+        // HTTPS endpoint adds its TLS layer. When Kestrel builds the endpoint's connection pipeline, before it accepts
+        // a connection, the middleware resolves the problem writer from the endpoint's application services and
+        // subscribes to the server's rejection event on the host's diagnostic listener. ConfigureEndpointDefaults
+        // replaces any earlier defaults action; nothing else in the API sets one.
+        services.AddOptions<KestrelServerOptions>().Configure(static kestrel =>
+            kestrel.ConfigureEndpointDefaults(static listenOptions =>
+            {
+                listenOptions.Protocols = HttpProtocols.Http1;
+                listenOptions.Use(next => ApiProblemDetailsWriter.ServerRejections.Create(next, listenOptions));
+            }));
 
         return services;
     }
@@ -521,9 +546,14 @@ public static class ProblemDetailsSetup
             403 => "You do not have permission to perform this action.",
             404 => "The requested resource was not found.",
             405 => "The request method is not supported for this resource.",
+            408 => "The server did not receive the complete request in time.",
             409 => "The request conflicts with the current state of the resource.",
+            413 => "The request body exceeds the size the server accepts.",
+            414 => "The request target exceeds the length the server accepts.",
             415 => "The request content type is not supported. Send application/json.",
+            431 => "The request header fields exceed the size the server accepts.",
             500 => "An unexpected error occurred.",
+            505 => "The HTTP version of the request is not supported.",
             _ => "The request could not be processed.",
         };
     }
