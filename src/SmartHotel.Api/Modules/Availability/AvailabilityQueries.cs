@@ -80,8 +80,9 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// query.
     /// </remarks>
     /// <param name="normalizedCity">
-    /// The requested city, already trimmed and folded with <see cref="string.ToLowerInvariant"/> by the caller. It is
-    /// compared with <c>lower("City")</c>.
+    /// The requested city, already trimmed by the caller and not case-folded. The query folds it and the stored city
+    /// with the same function, <see cref="SmartHotelDbContext.Lower"/> (PostgreSQL's <c>lower</c>), and compares
+    /// <c>lower("City")</c> with the folded value, so the match ignores letter case under the database's collation.
     /// </param>
     /// <param name="period">The validated stay; its check-out day is exclusive.</param>
     /// <param name="guests">The validated party size, at least 1.</param>
@@ -110,12 +111,15 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
         // qualifying type forms no group and is not listed. The rooms are reached through the navigation as a
         // queryable, so Queryable.Any translates to an EXISTS correlated on the composite key, with the booking
         // NOT EXISTS inside it.
-        // ToLower translates to lower("City"), the expression IX_Hotels_City_Lower indexes. The StringComparison
-        // overload that CA1862 suggests would not translate to SQL. The groups are projected to an anonymous type
-        // first, because ordering on a record constructor would not translate.
+        // Both city operands go through SmartHotelDbContext.Lower, so PostgreSQL folds the stored and the requested
+        // city with one lower() and one collation in this statement: lower(h."City") = lower(<city parameter>). The
+        // stored side is lower("City"), the expression IX_Hotels_City_Lower indexes. string.ToLower on the captured
+        // city would be evaluated in .NET before the query is sent, and a StringComparison overload would not
+        // translate to SQL. The groups are projected to an anonymous type first, because ordering on a record
+        // constructor would not translate.
         var rows = await db.RoomTypes
             .AsNoTracking()
-            .Where(t => t.Hotel.City.ToLower() == normalizedCity
+            .Where(t => SmartHotelDbContext.Lower(t.Hotel.City) == SmartHotelDbContext.Lower(normalizedCity)
                 && t.MaxGuests >= guests
                 && t.Rooms.AsQueryable().Any(r => !blocking.Any(b => b.RoomId == r.Id)))
             .GroupBy(t => new { t.Hotel.Id, t.Hotel.Name, t.Hotel.City, t.Hotel.Address })

@@ -44,7 +44,10 @@ builder.Services.AddSingleton<IValidateOptions<ApiCorsOptions>, ApiCorsOptionsVa
 builder.Services.AddSmartHotelData(
     static serviceProvider => serviceProvider.GetRequiredService<ISecretSource>().DatabaseConnectionString);
 
-// Availability comes first: the Hotels and Bookings services consume its scoped queries.
+// The Hotels and Bookings services inject the scoped SmartHotelDbContext and AvailabilityQueries, so the host also
+// registers both in this collection, through AddSmartHotelData above and AddAvailabilityModule below. These calls may
+// come in any order, because no registration resolves a service: both need only be registered by the time the
+// provider is built and resolves the service.
 builder.Services
     .AddAvailabilityModule()
     .AddAuthModule()

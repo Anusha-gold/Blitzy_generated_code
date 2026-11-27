@@ -10,8 +10,9 @@ namespace SmartHotel.Api.Modules.Hotels;
 /// parameter has passed its checks.
 /// </summary>
 /// <param name="NormalizedCity">
-/// The requested city, trimmed and folded with <see cref="string.ToLowerInvariant"/>. A hotel matches when
-/// <c>lower("City")</c> equals it, so the search ignores letter case.
+/// The requested city, trimmed of surrounding white space and not case-folded. A hotel matches when
+/// <c>lower("City")</c> equals the database's <c>lower</c> of this value, so both are folded by the same function
+/// under the database's collation and the search ignores letter case.
 /// </param>
 /// <param name="Period">
 /// The requested stay, already validated: 1 to 30 nights and a check-in that is not earlier than the current UTC

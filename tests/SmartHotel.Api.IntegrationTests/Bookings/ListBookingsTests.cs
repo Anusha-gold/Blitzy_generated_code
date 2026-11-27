@@ -1,5 +1,12 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
+
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using SmartHotel.Api.IntegrationTests.Infrastructure;
 
@@ -14,13 +21,21 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
     private const int PartySize = 2;
     private const int StayNights = 2;
 
-    private readonly SmartHotelApiFactory _factory;
-    private readonly ApiTestClient _client;
+    // EF Core names each table by a short alias such as b. Both patterns capture the bookings table's alias, so the
+    // caller filter and both sort keys must apply to the bookings themselves, not to a joined room.
+    private const string CallerFilterPattern =
+        @"(?s)\bFROM ""Bookings"" AS (?<booking>\w+)\b.*\bWHERE \k<booking>\.""GuestId"" = @\w+";
+    private const string NewestFirstOrderPattern =
+        @"(?s)\bFROM ""Bookings"" AS (?<booking>\w+)\b.*"
+        + @"\bORDER BY \k<booking>\.""CreatedAt"" DESC, \k<booking>\.""Id"" DESC\s*\z";
 
-    public ListBookingsTests(SmartHotelApiFactory factory)
+    private readonly ApiTestClient _client;
+    private readonly TestPostgres _postgres;
+
+    public ListBookingsTests(SmartHotelApiFactory factory, TestPostgres postgres)
     {
-        _factory = factory;
         _client = factory.CreateApiClient();
+        _postgres = postgres;
     }
 
     [Fact]
@@ -34,18 +49,44 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
         ProblemAssert.AssertBearerChallenge(response);
     }
 
+    // Two of the bookings below share one createdAt, and PostgreSQL returns rows that tie on every ORDER BY key in no
+    // particular order, so a list query without the id tie-break can still return the expected order by chance. The
+    // test therefore also checks the SQL the list request executes, which states both sort keys on every run. That
+    // needs a host of its own: a variant whose log provider records EF Core's executed commands, with a database of
+    // its own, so this test books nothing in the class's shared one.
     [Fact]
     public async Task List_ReturnsOnlyCallersBookingsNewestFirst()
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
-        int hotelId = await _factory.GetHotelIdAsync(HotelName, ct);
-        SmartHotelApiFactory.SeededRoomType roomType = await _factory.GetRoomTypeAsync(HotelName, RoomTypeName, ct);
+
+        CommandCapturingLogProvider commandLog = new();
+        await using SmartHotelApiFactory variant = new(_postgres)
+        {
+            ServiceOverrides = services =>
+            {
+                services.AddSingleton<ILoggerProvider>(commandLog);
+
+                // appsettings.json holds EF Core's command category at Warning for every provider, and an executed
+                // command is an Information event, so only a rule for this provider lets it through. The console
+                // provider keeps Warning.
+                services.Configure<LoggerFilterOptions>(options => options.AddFilter<CommandCapturingLogProvider>(
+                    DbLoggerCategory.Database.Command.Name,
+                    LogLevel.Information));
+            },
+        };
+
+        // A hand-built factory is not a fixture, so it is started here.
+        await variant.InitializeAsync();
+        ApiTestClient client = variant.CreateApiClient();
+
+        int hotelId = await variant.GetHotelIdAsync(HotelName, ct);
+        SmartHotelApiFactory.SeededRoomType roomType = await variant.GetRoomTypeAsync(HotelName, RoomTypeName, ct);
         DateOnly today = ApiTestClient.TodayUtc;
 
-        ApiTestClient.GuestSession guestA = await _client.RegisterGuestAsync(ct);
-        ApiTestClient.GuestSession guestB = await _client.RegisterGuestAsync(ct);
+        ApiTestClient.GuestSession guestA = await client.RegisterGuestAsync(ct);
+        ApiTestClient.GuestSession guestB = await client.RegisterGuestAsync(ct);
 
-        ApiTestClient.Booking first = await _client.CreateBookingOkAsync(
+        ApiTestClient.Booking first = await client.CreateBookingOkAsync(
             guestA.Token,
             hotelId,
             roomType.Id,
@@ -53,7 +94,7 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
             today.AddDays(30 + StayNights),
             PartySize,
             ct);
-        ApiTestClient.Booking second = await _client.CreateBookingOkAsync(
+        ApiTestClient.Booking second = await client.CreateBookingOkAsync(
             guestA.Token,
             hotelId,
             roomType.Id,
@@ -61,36 +102,81 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
             today.AddDays(34 + StayNights),
             PartySize,
             ct);
-
-        // Cancelling the older booking puts both statuses in the list.
-        using (HttpResponseMessage cancelled = await _client.CancelBookingAsync(first.Id, guestA.Token, ct))
-        {
-            Assert.Equal(HttpStatusCode.NoContent, cancelled.StatusCode);
-        }
-
-        ApiTestClient.Booking other = await _client.CreateBookingOkAsync(
-            guestB.Token,
+        ApiTestClient.Booking third = await client.CreateBookingOkAsync(
+            guestA.Token,
             hotelId,
             roomType.Id,
             today.AddDays(38),
             today.AddDays(38 + StayNights),
             PartySize,
             ct);
+        Assert.True(
+            first.Id < second.Id && second.Id < third.Id,
+            "Expected the ids to rise in creation order, which the arrangement below relies on.");
 
-        List<ApiTestClient.Booking> listA = await ListOkAsync(guestA.Token, ct);
+        // Cancelling one booking puts both statuses in the list.
+        using (HttpResponseMessage cancelled = await client.CancelBookingAsync(second.Id, guestA.Token, ct))
+        {
+            Assert.Equal(HttpStatusCode.NoContent, cancelled.StatusCode);
+        }
 
-        // second was created after first, so it has the later createdAt and the higher id.
-        int[] expectedIds = [second.Id, first.Id];
+        ApiTestClient.Booking other = await client.CreateBookingOkAsync(
+            guestB.Token,
+            hotelId,
+            roomType.Id,
+            today.AddDays(42),
+            today.AddDays(42 + StayNights),
+            PartySize,
+            ct);
+
+        // The API stamps createdAt from the real clock, so a later booking has both the later instant and the higher
+        // id, and sorting by id alone would pass. The instants are rewritten so that they disagree with the ids: the
+        // lowest id gets the latest instant, and the two others share one instant, which only the id tie-break can
+        // order. The values are UTC, as timestamp with time zone requires, and whole microseconds, the column's
+        // precision, with all six fractional digits in use, so the list must return them exactly.
+        DateTime lastRealSecond = new(
+            third.CreatedAt.Ticks - (third.CreatedAt.Ticks % TimeSpan.TicksPerSecond),
+            DateTimeKind.Utc);
+        DateTime tiedCreatedAt = lastRealSecond.AddMinutes(1).AddTicks(123_456 * TimeSpan.TicksPerMicrosecond);
+        DateTime latestCreatedAt = tiedCreatedAt.AddMinutes(1);
+        await variant.ExecuteDbAsync(
+            async (db, token) =>
+            {
+                int latestRows = await db.Bookings
+                    .Where(booking => booking.Id == first.Id)
+                    .ExecuteUpdateAsync(
+                        setters => setters.SetProperty(booking => booking.CreatedAt, latestCreatedAt),
+                        token);
+                int tiedRows = await db.Bookings
+                    .Where(booking => booking.Id == second.Id || booking.Id == third.Id)
+                    .ExecuteUpdateAsync(
+                        setters => setters.SetProperty(booking => booking.CreatedAt, tiedCreatedAt),
+                        token);
+                Assert.Equal(1, latestRows);
+                Assert.Equal(2, tiedRows);
+            },
+            ct);
+
+        // Nothing else reaches the variant's database between clearing the capture and reading it, so the capture holds
+        // exactly what guest A's list request executed.
+        commandLog.Clear();
+        List<ApiTestClient.Booking> listA = await ListOkAsync(client, guestA.Token, ct);
+        List<string> listCommands = [.. commandLog.ExecutedCommands];
+
+        // One query reads the caller's bookings, sorted by createdAt descending and then by id descending. The SQL
+        // shows both keys on every run, whereas without the id key the tied pair below comes back in the expected
+        // order only by chance. Sensitive-data logging is off, so the parameter shows as a placeholder and only the
+        // SQL text is checked.
+        string listCommand = Assert.Single(listCommands);
+        Assert.Matches(CallerFilterPattern, listCommand);
+        Assert.Matches(NewestFirstOrderPattern, listCommand);
+
+        // Newest createdAt first, then highest id: first, then the tie in descending id order. Sorting by id alone
+        // gives third, second, first, and breaking the tie by ascending id gives first, second, third, so either
+        // fails here.
+        int[] expectedIds = [first.Id, third.Id, second.Id];
         Assert.Equal(expectedIds, listA.Select(static booking => booking.Id));
         Assert.DoesNotContain(listA, booking => booking.Id == other.Id);
-
-        for (int index = 1; index < listA.Count; index++)
-        {
-            Assert.True(
-                IsListedBefore(listA[index - 1], listA[index]),
-                $"Expected the booking at position {index - 1} to be newer than the one at position {index}: "
-                + "createdAt descending, then id descending.");
-        }
 
         foreach (ApiTestClient.Booking booking in listA)
         {
@@ -103,24 +189,22 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
             Assert.Equal(PartySize, booking.Guests);
         }
 
-        // Apart from the cancellation, each listed booking is exactly the one its 201 body described.
-        ApiTestClient.Booking listedSecond = listA[0];
-        ApiTestClient.Booking listedFirst = listA[1];
-        Assert.Equal("Confirmed", listedSecond.Status);
-        Assert.Equal("Cancelled", listedFirst.Status);
-        Assert.Equal(second, listedSecond);
-        Assert.Equal(first with { Status = "Cancelled" }, listedFirst);
+        // Apart from the arranged instant and the cancellation, each listed booking is exactly the one its 201 body
+        // described.
+        ApiTestClient.Booking listedFirst = listA[0];
+        ApiTestClient.Booking listedThird = listA[1];
+        ApiTestClient.Booking listedSecond = listA[2];
+        Assert.Equal("Confirmed", listedFirst.Status);
+        Assert.Equal("Confirmed", listedThird.Status);
+        Assert.Equal("Cancelled", listedSecond.Status);
+        Assert.Equal(first with { CreatedAt = latestCreatedAt }, listedFirst);
+        Assert.Equal(third with { CreatedAt = tiedCreatedAt }, listedThird);
+        Assert.Equal(second with { CreatedAt = tiedCreatedAt, Status = "Cancelled" }, listedSecond);
 
-        List<ApiTestClient.Booking> listB = await ListOkAsync(guestB.Token, ct);
+        List<ApiTestClient.Booking> listB = await ListOkAsync(client, guestB.Token, ct);
 
         ApiTestClient.Booking onlyB = Assert.Single(listB);
         Assert.Equal(other.Id, onlyB.Id);
-
-        static bool IsListedBefore(ApiTestClient.Booking newer, ApiTestClient.Booking older)
-        {
-            return newer.CreatedAt > older.CreatedAt
-                || (newer.CreatedAt == older.CreatedAt && newer.Id > older.Id);
-        }
     }
 
     [Fact]
@@ -138,11 +222,71 @@ public sealed class ListBookingsTests : IClassFixture<SmartHotelApiFactory>
         Assert.Empty(document.RootElement.EnumerateArray());
     }
 
-    private async Task<List<ApiTestClient.Booking>> ListOkAsync(string token, CancellationToken ct)
+    private static async Task<List<ApiTestClient.Booking>> ListOkAsync(
+        ApiTestClient client,
+        string token,
+        CancellationToken ct)
     {
-        using HttpResponseMessage response = await _client.ListBookingsAsync(token, ct);
+        using HttpResponseMessage response = await client.ListBookingsAsync(token, ct);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 
-        return await _client.ReadAsync<List<ApiTestClient.Booking>>(response, ct);
+        return await client.ReadAsync<List<ApiTestClient.Booking>>(response, ct);
+    }
+
+    // Hands EF Core's command category a logger that records the message of each executed command, which ends with
+    // the command's SQL text; every other category gets the null logger, so the host starts and serves as usual.
+    // Nothing is written to output.
+    private sealed class CommandCapturingLogProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<string> _executedCommands = new();
+        private int _disposed;
+
+        public IReadOnlyCollection<string> ExecutedCommands => _executedCommands;
+
+        public void Clear()
+        {
+            _executedCommands.Clear();
+        }
+
+        public ILogger CreateLogger(string categoryName)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+            return string.Equals(categoryName, DbLoggerCategory.Database.Command.Name, StringComparison.Ordinal)
+                ? new CommandCapturingLogger(_executedCommands)
+                : NullLogger.Instance;
+        }
+
+        public void Dispose()
+        {
+            Volatile.Write(ref _disposed, 1);
+        }
+    }
+
+    private sealed class CommandCapturingLogger(ConcurrentQueue<string> executedCommands) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull
+        {
+            return NullLogger.Instance.BeginScope(state);
+        }
+
+        public bool IsEnabled(LogLevel logLevel)
+        {
+            return true;
+        }
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            ArgumentNullException.ThrowIfNull(formatter);
+            if (eventId.Id == RelationalEventId.CommandExecuted.Id)
+            {
+                executedCommands.Enqueue(formatter(state, exception));
+            }
+        }
     }
 }

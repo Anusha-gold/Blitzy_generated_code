@@ -12,6 +12,20 @@ import { UiError, toUiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 
 /**
+ * Reads the URL's guest-count text as the number the form's number input
+ * shows: `null`, an empty input, when the text is blank or not a finite
+ * number. It is for display only; the search sends the text itself, so the
+ * server's binding, not this reading, decides whether it is valid.
+ */
+function guestsForDisplay(text: string): number | null {
+  if (text.trim() === '') {
+    return null;
+  }
+  const n = Number(text);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * The hotel search screen, route `search`: a city, a stay and a party size,
  * answered by `GET /api/hotels`.
  *
@@ -122,16 +136,26 @@ export class SearchPageComponent {
 
   /**
    * Runs one search for the given query, or returns to the idle state when the
-   * query names no criteria. Values are passed on exactly as the URL holds
-   * them, an empty string included, so the server decides their validity. The
-   * error handling and `finalize` sit inside this inner observable, so a failed
-   * search never ends the outer stream and a cancelled one still clears
-   * `pending`.
+   * query names none of the four criteria. `city`, `checkIn`, `checkOut` and a
+   * present `guests` are passed on exactly as the URL holds them, an empty
+   * string included; an absent `guests` is sent as 1, the server's own
+   * default. The server alone decides their validity. The form is refilled
+   * from the same values, its guest count with a numeric reading of the text
+   * for display only. The error handling and `finalize` sit inside this inner
+   * observable, so a failed search never ends the outer stream and a
+   * cancelled one still clears `pending`.
    */
   private run(params: ParamMap): Observable<HotelSummary[]> {
     // `has`, not truthiness: an empty value counts as present, so a blank
-    // submission still reaches the server and its 400 shows inline.
-    if (!params.has('city') && !params.has('checkIn') && !params.has('checkOut')) {
+    // submission still reaches the server and its 400 shows inline. Any one
+    // criterion, `guests` alone included, makes it a search, so the server's
+    // 400 for the missing ones shows inline too.
+    if (
+      !params.has('city') &&
+      !params.has('checkIn') &&
+      !params.has('checkOut') &&
+      !params.has('guests')
+    ) {
       this.results.set(null);
       this.searched.set(null);
       this.error.set(null);
@@ -142,12 +166,13 @@ export class SearchPageComponent {
     const city = params.get('city') ?? '';
     const checkIn = params.get('checkIn') ?? '';
     const checkOut = params.get('checkOut') ?? '';
-    // 1 is the server's own default for an omitted count. Any other value is
-    // passed on unchecked: a non-numeric one goes out as `NaN` and gets a 400.
-    const guests = params.has('guests') ? Number(params.get('guests')) : 1;
+    // 1 is the server's own default for an omitted count. A present value goes
+    // out as written, so the server binds the text itself: `2.0` gets its 400
+    // rather than being read as 2.
+    const guests = params.get('guests') ?? '1';
     const q: HotelSearchQuery = { city, checkIn, checkOut, guests };
 
-    this.form.patchValue({ city, checkIn, checkOut, guests });
+    this.form.patchValue({ city, checkIn, checkOut, guests: guestsForDisplay(guests) });
     this.error.set(null);
     this.results.set(null);
     this.pending.set(true);

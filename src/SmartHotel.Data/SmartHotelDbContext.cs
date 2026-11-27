@@ -61,12 +61,49 @@ public sealed class SmartHotelDbContext : DbContext
     /// </summary>
     public DbSet<Booking> Bookings => Set<Booking>();
 
+    /// <summary>
+    /// Folds text to lower case with PostgreSQL's built-in <c>lower</c> function, under the database's collation. It
+    /// is a query-only function: inside a LINQ query it translates to <c>lower(value)</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Applied to both operands of a comparison, it folds both with the same function and collation in the same
+    /// statement. <see cref="string.ToLower()"/> translates to the same SQL only on a column: on a value captured from
+    /// outside the query, EF Core evaluates it in .NET, whose casing rules differ from the database's, and sends the
+    /// result as a parameter. A mapped database function is never evaluated in .NET, so the database folds the
+    /// parameter itself.
+    /// </para>
+    /// <para>
+    /// Applied to <see cref="Hotel.City"/>, it yields <c>lower("City")</c>, the expression the hand-written index
+    /// <c>IX_Hotels_City_Lower</c> is built on.
+    /// </para>
+    /// </remarks>
+    /// <param name="value">The text to fold.</param>
+    /// <returns>Nothing: the database computes the folded text, and a call outside a query always throws.</returns>
+    /// <exception cref="NotSupportedException">
+    /// The method is called directly rather than inside a query that EF Core translates to SQL.
+    /// </exception>
+    public static string Lower(string value)
+    {
+        throw new NotSupportedException(
+            $"{nameof(SmartHotelDbContext)}.{nameof(Lower)} is PostgreSQL's lower function and can only be used "
+            + "inside a LINQ query that EF Core translates to SQL.");
+    }
+
     /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         // The hand-written EX_Bookings_Room_NoOverlap constraint compares the integer "RoomId" with = inside a GiST
         // index, which only btree_gist provides; this annotation makes the migration create the extension first.
         modelBuilder.HasPostgresExtension("btree_gist");
+
+        // lower is built in, so it is written unquoted and without a schema. It returns NULL only for a NULL argument,
+        // so a comparison of non-null operands needs no null compensation and keeps its index-matching shape.
+        modelBuilder.HasDbFunction(() => Lower(default!))
+            .HasName("lower")
+            .IsBuiltIn()
+            .HasParameter("value")
+            .PropagatesNullability();
 
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(SmartHotelDbContext).Assembly);
     }

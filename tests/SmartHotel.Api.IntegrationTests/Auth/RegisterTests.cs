@@ -21,6 +21,10 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     private const string ValidPassword = "Passw0rd!x";
     private const string ValidFullName = "Test Guest";
 
+    // U+1F600, a character outside the Basic Multilingual Plane: one Unicode scalar value but two UTF-16 code units,
+    // so a password built from it meets the registration bounds only when they count characters.
+    private const string SupplementaryCharacter = "\U0001F600";
+
     // ASP.NET Core Identity's V3 hash layout: a 0x01 marker, then three big-endian uint32 values (PRF, iteration
     // count, salt length), then the salt and the subkey. The expected values are the ones AuthModule configures.
     private const int V3HashLength = 1 + 4 + 4 + 4 + 16 + 32;
@@ -33,6 +37,8 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     [InlineData("email-not-an-address", "email")]
     [InlineData("email-non-ascii", "email")]
     [InlineData("password-too-short", "password")]
+    [InlineData("password-supplementary-too-short", "password")]
+    [InlineData("password-supplementary-too-long", "password")]
     [InlineData("fullname-missing", "fullName")]
     [InlineData("empty-json-body", "$")]
     [InlineData("malformed-json", null)]
@@ -44,6 +50,31 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         using HttpResponseMessage response = await SendInvalidRegistrationAsync(client, caseLabel, ct);
 
         await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.BadRequest, expectedErrorKey, ct);
+    }
+
+    // The password bound is an attribute check like Required, so it is reported in the same 400 as a missing
+    // fullName, and the register page can show both field errors at once.
+    [Fact]
+    public async Task Register_ShortPasswordAndMissingFullName_Returns400WithBothKeys()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        ApiTestClient client = factory.CreateApiClient();
+
+        using HttpResponseMessage response = await client.RegisterAsync(
+            new { email = UniqueEmail("twofields"), password = "short" },
+            ct);
+
+        JsonElement problem = await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.BadRequest,
+            "password",
+            ct);
+
+        // ProblemAssert has checked that errors is an object of message-string arrays.
+        Assert.True(
+            problem.GetProperty("errors").TryGetProperty("fullName", out JsonElement fullNameMessages)
+                && fullNameMessages.GetArrayLength() > 0,
+            "Expected errors to contain fullName, with at least one message, as well as password.");
     }
 
     [Fact]
@@ -115,10 +146,37 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
         Assert.Equal(SaltLengthBytes, BinaryPrimitives.ReadUInt32BigEndian(hash.AsSpan(9)));
     }
 
+    // 8 such characters are 16 UTF-16 code units and 128 are 256, so both bounds hold only when they count characters.
+    [Theory]
+    [InlineData(8)]
+    [InlineData(128)]
+    public async Task Register_SupplementaryPasswordAtLengthBound_Returns201AndLogsIn(int characterCount)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        ApiTestClient client = factory.CreateApiClient();
+        string email = UniqueEmail("supplementary");
+        string password = SupplementaryPassword(characterCount);
+
+        using HttpResponseMessage registered = await client.RegisterAsync(
+            new { email, password, fullName = ValidFullName },
+            ct);
+        Assert.Equal(HttpStatusCode.Created, registered.StatusCode);
+
+        // The 200 shows the stored hash is of the password exactly as sent. Only status codes reach a failure
+        // message, never the password.
+        using HttpResponseMessage loggedIn = await client.LoginAsync(new { email, password }, ct);
+        Assert.Equal(HttpStatusCode.OK, loggedIn.StatusCode);
+    }
+
     private static string UniqueEmail(string prefix)
     {
         // Every test in the class shares one database and runs in any order, so each address must be new.
         return $"{prefix}+{Guid.NewGuid():N}@example.test";
+    }
+
+    private static string SupplementaryPassword(int characterCount)
+    {
+        return string.Concat(Enumerable.Repeat(SupplementaryCharacter, characterCount));
     }
 
     // Each case breaks exactly one input and keeps the others valid: MVC runs RegisterRequest.Validate, which reports
@@ -143,6 +201,13 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
                 cancellationToken),
             "password-too-short" => client.RegisterAsync(
                 new { email = UniqueEmail("short"), password = "Passw0r", fullName = ValidFullName },
+                cancellationToken),
+            // 4 characters in 8 UTF-16 code units, and 129 characters in 258.
+            "password-supplementary-too-short" => client.RegisterAsync(
+                new { email = UniqueEmail("short"), password = SupplementaryPassword(4), fullName = ValidFullName },
+                cancellationToken),
+            "password-supplementary-too-long" => client.RegisterAsync(
+                new { email = UniqueEmail("long"), password = SupplementaryPassword(129), fullName = ValidFullName },
                 cancellationToken),
             "fullname-missing" => client.RegisterAsync(
                 new { email = UniqueEmail("noname"), password = ValidPassword },

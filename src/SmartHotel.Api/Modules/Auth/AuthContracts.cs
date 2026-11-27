@@ -10,13 +10,19 @@ namespace SmartHotel.Api.Modules.Auth;
 // implicit [Required] of its own; the explicit attributes below are the only required checks. Validation
 // attributes sit on the positional parameters because MVC throws when they target a record's properties.
 //
+// MVC runs IValidatableObject.Validate only after every attribute check on the object has passed, so a bound that
+// must be reported together with another member's missing value is an attribute: the password length bound is one.
+// Validate holds only the email and full-name bounds, which apply to the trimmed values.
+//
 // [ModelBinder(Name)] sets each parameter's key in the 400 errors object. For positional record parameters MVC
 // keys attribute errors by the CLR parameter name (Email) and ignores SystemTextJsonValidationMetadataProvider,
 // while the error contract keys them by the camelCase JSON name (email). The name does not affect body binding.
 
 /// <summary>
-/// Body of <c>POST /api/auth/register</c>. The attributes run first; <see cref="Validate"/> then applies the
-/// bounds that depend on the trimmed values. Error messages are fixed sentences that never echo the input.
+/// Body of <c>POST /api/auth/register</c>. The attributes run first: each member's required check and the password
+/// length bound, which applies to the value as sent. Once every attribute check has passed, <see cref="Validate"/>
+/// applies the email and full-name bounds to the trimmed values. The password and full-name lengths count Unicode
+/// scalar values, not UTF-16 code units. Error messages are fixed sentences that never echo the input.
 /// </summary>
 /// <param name="Email">
 /// Required. After trimming: printable ASCII only (U+0021 to U+007E), at most 254 characters (the RFC 5321 path
@@ -27,7 +33,8 @@ namespace SmartHotel.Api.Modules.Auth;
 /// only; the domain is never resolved or contacted.
 /// </param>
 /// <param name="Password">
-/// Required, 8 to 128 characters, and not trimmed. A whitespace-only value is rejected as missing.
+/// Required, 8 to 128 characters, and not trimmed. A whitespace-only value is rejected as missing. Both bounds count
+/// Unicode scalar values, so a character outside the Basic Multilingual Plane counts once.
 /// </param>
 /// <param name="FullName">
 /// Required. After trimming: not blank, at most 200 characters, and free of the null character (U+0000), which
@@ -40,7 +47,7 @@ public sealed partial record RegisterRequest(
     string? Email,
     [ModelBinder(Name = RegisterRequest.PasswordMember)]
     [Required(ErrorMessage = "password is required and must not be blank.")]
-    [StringLength(128, MinimumLength = 8, ErrorMessage = "password must be 8 to 128 characters long.")]
+    [RegisterRequest.PasswordLength(ErrorMessage = "password must be 8 to 128 characters long.")]
     string? Password,
     [ModelBinder(Name = RegisterRequest.FullNameMember)]
     [Required(ErrorMessage = "fullName is required and must not be blank.")]
@@ -49,6 +56,8 @@ public sealed partial record RegisterRequest(
 {
     private const int MaxEmailLength = 254;
     private const int MaxLocalPartLength = 64;
+    private const int MinPasswordLength = 8;
+    private const int MaxPasswordLength = 128;
     private const int MaxFullNameLength = 200;
 
     // The IPv6-address-literal tag, compared without regard to case.
@@ -120,6 +129,63 @@ public sealed partial record RegisterRequest(
         }
 
         return true;
+    }
+
+    // Internal rather than private: the compiler rejects a private nested attribute's constructor on the record's own
+    // positional parameters (CS0122).
+    /// <summary>
+    /// Validates that a password holds <see cref="MinPasswordLength"/> to <see cref="MaxPasswordLength"/> Unicode
+    /// scalar values. <see langword="null"/> and a whitespace-only value are valid, because
+    /// <see cref="RequiredAttribute"/> reports them.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="StringLengthAttribute"/> counts UTF-16 code units, so it counts a character outside the Basic
+    /// Multilingual Plane twice. The value is never trimmed: the bounds apply to the exact value that
+    /// <c>AuthService</c> hashes. As an attribute rather than a <see cref="Validate"/> check, its error is reported
+    /// together with the other members' required checks.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Parameter)]
+    internal sealed class PasswordLengthAttribute : ValidationAttribute
+    {
+        public override bool IsValid(object? value)
+        {
+            return value switch
+            {
+                null => true,
+                string password => string.IsNullOrWhiteSpace(password) || IsWithinPasswordLength(password),
+                _ => throw new InvalidOperationException(
+                    $"{nameof(PasswordLengthAttribute)} validates only strings, not {value.GetType().Name}."),
+            };
+        }
+
+        // Whether value holds MinPasswordLength to MaxPasswordLength Unicode scalar values. Each scalar value takes one
+        // or two UTF-16 code units, so fewer than MinPasswordLength code units is always too short and more than
+        // 2 * MaxPasswordLength always too long, while 2 * MinPasswordLength to MaxPasswordLength code units is always
+        // within the bounds. Only the remaining lengths need counting, and the count stops as soon as it passes the
+        // limit.
+        private static bool IsWithinPasswordLength(string value)
+        {
+            if (value.Length < MinPasswordLength || value.Length > 2 * MaxPasswordLength)
+            {
+                return false;
+            }
+
+            if (value.Length >= 2 * MinPasswordLength && value.Length <= MaxPasswordLength)
+            {
+                return true;
+            }
+
+            int scalarValues = 0;
+            foreach (Rune rune in value.EnumerateRunes())
+            {
+                if (++scalarValues > MaxPasswordLength)
+                {
+                    return false;
+                }
+            }
+
+            return scalarValues >= MinPasswordLength;
+        }
     }
 
     private static bool IsAcceptableEmail(string trimmed)

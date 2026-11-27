@@ -278,7 +278,8 @@ Unless reuse mode is on, every `ng test` or `npx playwright test` run first buil
 - It removes and rebuilds the Compose project `smarthotel-acceptance`: `down -v --remove-orphans`, then `up -d --build --force-recreate --wait`. The images are built from the current sources, and the volumes and secrets are fresh.
 - It publishes the API on host port 18080 and the web app on host port 14200. The tests target `http://localhost:14200` and `http://localhost:18080/api`.
 - Every Compose call names the project, the repository's `docker-compose.yml` and `--env-file deploy/acceptance.env`, an intentionally empty file. The Compose child process runs in a neutralized environment, without `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `COMPOSE_PROFILES`, `COMPOSE_ENV_FILES` or any `SMARTHOTEL_*` variable. Your own stack, its volumes and data, your `.env` and your overrides are never touched or read.
-- If another process holds port 18080 or 14200, setup fails with a message naming the port. It never switches to other ports.
+- If another process holds port 18080 or 14200 on `127.0.0.1` or `::1`, setup fails with a message naming the port. Both loopback addresses are checked because `localhost` can resolve to either; a host without IPv6 is checked on `127.0.0.1` alone. Setup never switches to other ports.
+- Only one fresh run per host owns the acceptance stack at a time. It does so by listening on `127.0.0.1:18079` from before its first Compose call until it ends, and the operating system frees that port however the run ends, even when it is killed. A second fresh run started meanwhile fails before touching the stack, with a message naming the run that owns it: its process id, start time and checkout. If another program holds port 18079, the run fails with a message naming that port.
 
 The stack stays up after the run. Remove it with:
 
@@ -288,7 +289,7 @@ docker compose -p smarthotel-acceptance down -v
 
 #### Reuse mode
 
-For local iteration, `E2E_REUSE_STACK=1` skips the bootstrap and runs the specs against an already running stack at `E2E_BASE_URL` (default `http://localhost:4200`) and `E2E_API_URL` (default `http://localhost:8080/api`). Setup then only checks that `<E2E_API_URL>/health` answers `Healthy` and that the web root answers. Use `localhost` in both URLs, because the stack's CORS origin and the SPA's API base URL are `localhost` origins.
+For local iteration, `E2E_REUSE_STACK=1` skips the bootstrap and runs the specs against an already running stack at `E2E_BASE_URL` (default `http://localhost:4200`) and `E2E_API_URL` (default `http://localhost:8080/api`). Setup then only checks that `<E2E_API_URL>/health` answers `Healthy` and that the web root answers. Use `localhost` in both URLs, because the stack's CORS origin and the SPA's API base URL are `localhost` origins. `E2E_REUSE_STACK` accepts only `1`; leave it unset or empty for a fresh run. Any other value, such as `true`, `yes` or `0`, fails the run before any Compose call, so a mistyped value never removes and rebuilds the acceptance stack.
 
 ```bash
 E2E_REUSE_STACK=1 ng test
@@ -407,7 +408,7 @@ Supply the secrets through the hosting environment's secret mechanism, never in 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SMARTHOTEL_TEST_POSTGRES` | Unset: the fixture starts `db-test` and uses `Host=127.0.0.1;Port=55432;Username=postgres` | The PostgreSQL server for the integration tests. A full connection string can carry a password, and the fixture never prints it. |
-| `E2E_REUSE_STACK` | Unset | `1` selects reuse mode for the web tests |
+| `E2E_REUSE_STACK` | Unset | `1` selects reuse mode for the web tests. Unset or empty runs a fresh acceptance stack. Any other value fails the run before any Compose call. |
 | `E2E_BASE_URL` | `http://localhost:4200` | The web app to target, in reuse mode only |
 | `E2E_API_URL` | `http://localhost:8080/api` | The API base to target, in reuse mode only |
 

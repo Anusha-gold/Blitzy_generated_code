@@ -87,11 +87,14 @@ export interface StayQuery {
    */
   checkOut: string;
   /**
-   * The party size, an integer of at least 1. It is optional on both
-   * `GET /api/hotels` and `GET /api/hotels/{id}`: when it is omitted the
-   * request carries no `guests` parameter and the server uses 1.
+   * The party size exactly as the page's URL holds it, sent unchanged. The
+   * server binds it as an integer of at least 1: text it cannot bind as an
+   * integer, such as `2.0`, `two` or an empty or blank value, and a value
+   * below 1 get 400. It is optional on both `GET /api/hotels` and
+   * `GET /api/hotels/{id}`: when it is omitted the request carries no `guests`
+   * parameter and the server uses 1.
    */
-  guests?: number;
+  guests?: string;
 }
 
 /**

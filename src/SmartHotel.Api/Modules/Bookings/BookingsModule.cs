@@ -15,9 +15,10 @@ public static class BookingsModule
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The service injects the request's scoped <c>SmartHotelDbContext</c>, registered by <c>AddSmartHotelData</c>,
-    /// and the scoped <c>AvailabilityQueries</c>, registered by <c>AddAvailabilityModule</c>, so <c>Program.cs</c>
-    /// calls this method after <c>AddAvailabilityModule()</c>.
+    /// The service injects the request's scoped <c>SmartHotelDbContext</c> and the scoped <c>AvailabilityQueries</c>,
+    /// so the host must also register both in the same collection, through <c>AddSmartHotelData</c> and
+    /// <c>AddAvailabilityModule</c>. Those calls may come before or after this one, because no registration resolves a
+    /// service: both need only be registered by the time the provider is built and resolves the service.
     /// </para>
     /// <para>
     /// The lifetime must be scoped. Within one request the service and the availability queries then share one

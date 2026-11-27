@@ -42,6 +42,13 @@ export const ACCEPTANCE_API_PORT = 18080;
  */
 export const ACCEPTANCE_WEB_PORT = 14200;
 
+/**
+ * The `127.0.0.1` port a fresh run listens on while it owns the acceptance
+ * project, so only one fresh run per host owns it at a time. It is never a
+ * stack port, and Compose never publishes it.
+ */
+export const ACCEPTANCE_LOCK_PORT = 18079;
+
 /** Reuse-mode default web URL: the developer stack's web origin. */
 export const DEFAULT_REUSE_BASE_URL = 'http://localhost:4200';
 
@@ -84,11 +91,29 @@ function trimTrailingSlash(value: string): string {
  * Tells whether the run reuses an already running stack instead of building
  * the acceptance stack.
  *
+ * `E2E_REUSE_STACK` accepts exactly the string `1`. Every other value is
+ * rejected rather than read as "not reuse mode", because a fresh run removes
+ * and rebuilds the acceptance stack: a mistyped value such as `true`, `yes`,
+ * ` 1` or `0` must stop the run before any Compose call instead of silently
+ * selecting that destructive path.
+ *
  * @param env - The environment to read; defaults to `process.env`.
- * @returns `true` only when `E2E_REUSE_STACK` is exactly the string `1`.
+ * @returns `true` when `E2E_REUSE_STACK` is exactly `1`; `false` when it is
+ *   unset or empty.
+ * @throws Error when `E2E_REUSE_STACK` holds any other value. The message names
+ *   the variable and its accepted value, never the value it holds.
  */
 export function isReuseMode(env: Record<string, string | undefined> = process.env): boolean {
-  return env['E2E_REUSE_STACK'] === '1';
+  const value = env['E2E_REUSE_STACK'];
+  if (value === undefined || value === '') {
+    return false;
+  }
+  if (value === '1') {
+    return true;
+  }
+  throw new Error(
+    'E2E_REUSE_STACK accepts only 1, which reuses a running stack; leave it unset or empty for a fresh acceptance run. Any other value is rejected so a mistyped value never removes and rebuilds the acceptance stack.',
+  );
 }
 
 /**
@@ -113,6 +138,10 @@ export function isReuseMode(env: Record<string, string | undefined> = process.en
  *
  * @param env - The environment to read; defaults to `process.env`.
  * @returns The resolved {@link StackTarget}.
+ * @throws Error when `E2E_REUSE_STACK` is set to anything other than `1` or
+ *   the empty string, as {@link isReuseMode} reports it. `playwright.config.ts`
+ *   resolves the target when it loads, so such a run fails before global
+ *   setup makes any Compose call.
  */
 export function resolveStackTarget(
   env: Record<string, string | undefined> = process.env,

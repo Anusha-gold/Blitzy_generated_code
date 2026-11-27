@@ -42,14 +42,18 @@ public sealed class HotelDetailTests : IClassFixture<SmartHotelApiFactory>
     }
 
     // Each row breaks exactly one input on a real hotel and keeps every other input at the valid baseline, so the
-    // 400 can come only from the broken input. The dates are built from the label because DateOnly cannot be an
-    // attribute argument.
+    // 400 can come only from the broken input. The same query for an unknown id must give the same 400 rather than
+    // the 404, because the input is checked before the hotel is looked up. The dates are built from the label because
+    // DateOnly cannot be an attribute argument.
     [Theory]
     [InlineData("checkOut-equals-checkIn", "checkOut")]
     [InlineData("checkOut-not-padded", "checkOut")]
     [InlineData("checkIn-missing", "checkIn")]
     [InlineData("guests-zero", "guests")]
     [InlineData("guests-not-integer", "guests")]
+    [InlineData("guests-blank", "guests")]
+    [InlineData("guests-white-space", "guests")]
+    [InlineData("guests-nul-suffixed", "guests")]
     public async Task Detail_InvalidInput_Returns400(string caseLabel, string expectedKey)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
@@ -57,8 +61,32 @@ public sealed class HotelDetailTests : IClassFixture<SmartHotelApiFactory>
         (string? checkIn, string? checkOut, string? guests) = InvalidQuery(caseLabel);
 
         using HttpResponseMessage response = await _client.GetHotelAsync(hotelId, checkIn, checkOut, guests, ct);
-
         await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.BadRequest, expectedKey, ct);
+
+        using HttpResponseMessage unknownHotel =
+            await _client.GetHotelAsync(UnknownHotelId, checkIn, checkOut, guests, ct);
+        await ProblemAssert.AssertProblemAsync(unknownHotel, HttpStatusCode.BadRequest, expectedKey, ct);
+    }
+
+    [Fact]
+    public async Task Detail_GuestsOmitted_EchoesOneGuest()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        DateOnly today = ApiTestClient.TodayUtc;
+        int hotelId = await _factory.GetHotelIdAsync(HotelName, ct);
+
+        // Only an omitted guests parameter means a party of 1; a supplied blank one is a 400 in the theory above.
+        using HttpResponseMessage response = await _client.GetHotelAsync(
+            hotelId,
+            ApiTestClient.Iso(today.AddDays(30)),
+            ApiTestClient.Iso(today.AddDays(32)),
+            guests: null,
+            ct);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        ApiTestClient.HotelDetail detail = await _client.ReadAsync<ApiTestClient.HotelDetail>(response, ct);
+
+        Assert.Equal(hotelId, detail.Id);
+        Assert.Equal(1, detail.Guests);
     }
 
     [Fact]
@@ -130,6 +158,13 @@ public sealed class HotelDetailTests : IClassFixture<SmartHotelApiFactory>
             "checkIn-missing" => (null, checkOut, BaselineGuests),
             "guests-zero" => (checkIn, checkOut, "0"),
             "guests-not-integer" => (checkIn, checkOut, "two"),
+
+            // Supplied but blank, guests is not an integer; only an omitted guests defaults to 1.
+            "guests-blank" => (checkIn, checkOut, string.Empty),
+            "guests-white-space" => (checkIn, checkOut, "  "),
+
+            // Sent as 2%00. .NET's integer parsing ignores trailing NULs, but guests allows only a sign and digits.
+            "guests-nul-suffixed" => (checkIn, checkOut, "2\0"),
             _ => throw new ArgumentOutOfRangeException(nameof(caseLabel), caseLabel, "Unknown invalid-input case."),
         };
     }

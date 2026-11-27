@@ -3,7 +3,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
-import { catchError, combineLatest, finalize, of, switchMap, tap } from 'rxjs';
+import { catchError, distinctUntilChanged, finalize, map, merge, of, switchMap, tap } from 'rxjs';
 import type { Observable } from 'rxjs';
 
 import { BookingsApiService } from '../../core/api/bookings-api.service';
@@ -20,14 +20,18 @@ import { ErrorMessageComponent } from '../../shared/error-message/error-message.
  * count of rooms free for the stay and the server-computed stay total, and it
  * books a room type through "Book".
  *
- * Loading: every change of the route's `id` or of its query sends
- * `GET /api/hotels/{id}` for that stay. `guests` defaults to 1 when the query
- * omits it, as on the server; every other value is passed on unchecked,
- * because the server is the only authority on the stay rules. A newer load
- * cancels the one still in flight. While a load runs the page shows nothing of
- * its own, and the app-wide indicator shows progress. A failed load, such as
- * the 400 for invalid dates or the 404 for an unknown hotel, is shown in place
- * of the content.
+ * Loading: the route's `id` and its query are read together, once per
+ * committed navigation, and each navigation that changes the `id`, `checkIn`,
+ * `checkOut` or `guests` sends one `GET /api/hotels/{id}` for that stay; one
+ * that changes none of them does not reload. The `id` and every query value
+ * are passed on exactly as the URL holds them, and `guests` is sent as 1 when
+ * the query omits it, as on the server, because the server is the only
+ * authority on the stay rules; `HotelsApiService.getHotel` answers an id that
+ * is not an integer literal with the API's own 404, sending nothing. A newer
+ * load cancels the one still in flight. While a load runs the page shows
+ * nothing of its own, and the app-wide indicator shows progress. A failed
+ * load, such as the 400 for invalid dates or a malformed `guests` or the 404
+ * for an unknown or non-integer hotel id, is shown in place of the content.
  *
  * Booking: "Book" while signed out makes no request and navigates to
  * `/login?returnUrl=<current URL>`, so the guest comes back here after logging
@@ -79,15 +83,35 @@ export class HotelDetailPageComponent {
   protected readonly bookingPending = signal(false);
 
   constructor() {
-    combineLatest([this.route.paramMap, this.route.queryParamMap])
+    merge(this.route.paramMap, this.route.queryParamMap)
       .pipe(
-        switchMap(([params, query]) =>
-          this.load(Number(params.get('id')), {
-            checkIn: query.get('checkIn') ?? '',
-            checkOut: query.get('checkOut') ?? '',
-            guests: query.has('guests') ? Number(query.get('guests')) : 1,
-          }),
+        // Either stream only signals a committed navigation. The router assigns
+        // the route's new snapshot before it emits the query and then the path
+        // parameters, so reading both from the snapshot never pairs an old id
+        // with a new stay. The texts go out as the URL holds them; an absent
+        // `guests` is sent as 1, the server's own default.
+        map(() => {
+          const { paramMap, queryParamMap } = this.route.snapshot;
+          return {
+            id: paramMap.get('id') ?? '',
+            stay: {
+              checkIn: queryParamMap.get('checkIn') ?? '',
+              checkOut: queryParamMap.get('checkOut') ?? '',
+              guests: queryParamMap.get('guests') ?? '1',
+            },
+          };
+        }),
+        // Entry emits once per stream, a navigation changing both id and query
+        // emits twice, and an unrelated query parameter changes no criterion:
+        // each of those loads at most once.
+        distinctUntilChanged(
+          (a, b) =>
+            a.id === b.id &&
+            a.stay.checkIn === b.stay.checkIn &&
+            a.stay.checkOut === b.stay.checkOut &&
+            a.stay.guests === b.stay.guests,
         ),
+        switchMap(({ id, stay }) => this.load(id, stay)),
         takeUntilDestroyed(),
       )
       .subscribe();
@@ -146,7 +170,7 @@ export class HotelDetailPageComponent {
    * error handling sits inside this inner observable, so a failed load never
    * ends the outer route stream and the next route change loads again.
    */
-  private load(id: number, stay: StayQuery): Observable<HotelDetail | null> {
+  private load(id: string, stay: StayQuery): Observable<HotelDetail | null> {
     this.hotel.set(null);
     this.loadError.set(null);
     this.bookError.set(null);

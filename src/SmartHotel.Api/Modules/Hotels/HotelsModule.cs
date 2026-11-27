@@ -13,10 +13,11 @@ public static class HotelsModule
     /// Registers <see cref="HotelQueryService"/> as scoped.
     /// </summary>
     /// <remarks>
-    /// The service injects the request's scoped <c>SmartHotelDbContext</c>, registered by <c>AddSmartHotelData</c>,
-    /// and the scoped <c>AvailabilityQueries</c>, registered by <c>AddAvailabilityModule</c>, so both must already
-    /// have been called, as <c>Program.cs</c> does before this method. A singleton would capture those scoped
-    /// services, which scope validation rejects.
+    /// The service injects the request's scoped <c>SmartHotelDbContext</c> and the scoped <c>AvailabilityQueries</c>,
+    /// so the host must also register both in the same collection, through <c>AddSmartHotelData</c> and
+    /// <c>AddAvailabilityModule</c>. Those calls may come before or after this one, because no registration resolves a
+    /// service: both need only be registered by the time the provider is built and resolves the service. A singleton
+    /// would capture those scoped services, which scope validation rejects.
     /// </remarks>
     /// <param name="services">The API host's service collection.</param>
     /// <returns>The same <paramref name="services"/> instance, for chaining.</returns>

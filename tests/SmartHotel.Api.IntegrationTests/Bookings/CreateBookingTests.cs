@@ -1,10 +1,18 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
 using SmartHotel.Api.Common.Pricing;
 using SmartHotel.Api.IntegrationTests.Infrastructure;
+using SmartHotel.Api.Modules.Bookings;
+using SmartHotel.Data.Entities;
 using SmartHotel.Data.Seed;
 
 namespace SmartHotel.Api.IntegrationTests.Bookings;
@@ -22,11 +30,13 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
 
     private readonly SmartHotelApiFactory _factory;
     private readonly ApiTestClient _client;
+    private readonly TestPostgres _postgres;
 
-    public CreateBookingTests(SmartHotelApiFactory factory)
+    public CreateBookingTests(SmartHotelApiFactory factory, TestPostgres postgres)
     {
         _factory = factory;
         _client = factory.CreateApiClient();
+        _postgres = postgres;
     }
 
     [Theory]
@@ -298,5 +308,133 @@ public sealed class CreateBookingTests : IClassFixture<SmartHotelApiFactory>
         Assert.Equal("101", first.RoomNumber);
         Assert.Equal(first.RoomNumber, second.RoomNumber);
         Assert.NotEqual(first.Id, second.Id);
+    }
+
+    // Every booking event is written after its outcome is final, so a log provider that fails each of them must leave
+    // the 201s, the sold-out 409 and the 204 unchanged, with their effects in the database. The variant host has a
+    // database of its own, so this test books nothing in the class's shared one.
+    [Fact]
+    public async Task CreateAndCancel_LoggingFailure_KeepsOutcomes()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        FailingBookingLogProvider logProvider = new();
+        await using SmartHotelApiFactory variant = new(_postgres)
+        {
+            ServiceOverrides = services => services.AddSingleton<ILoggerProvider>(logProvider),
+        };
+
+        // A hand-built factory is not a fixture, so it is started here.
+        await variant.InitializeAsync();
+        ApiTestClient client = variant.CreateApiClient();
+
+        SmartHotelApiFactory.SeededRoomType standard = await variant.GetRoomTypeAsync(ChicagoLoop, "Standard", ct);
+        IReadOnlyList<SmartHotelApiFactory.SeededRoom> rooms = await variant.GetRoomsAsync(standard.Id, ct);
+        Assert.Equal(SeedCatalog.RoomsPerType, rooms.Count);
+        ApiTestClient.GuestSession session = await client.RegisterGuestAsync(ct);
+        DateOnly checkIn = ApiTestClient.TodayUtc.AddDays(70);
+        DateOnly checkOut = checkIn.AddDays(2);
+
+        List<int> bookingIds = [];
+        for (int i = 0; i < rooms.Count; i++)
+        {
+            ApiTestClient.Booking booking = await client.CreateBookingOkAsync(
+                session.Token,
+                standard.HotelId,
+                standard.Id,
+                checkIn,
+                checkOut,
+                guests: 2,
+                ct);
+            bookingIds.Add(booking.Id);
+        }
+
+        int confirmed = await variant.ExecuteDbAsync(
+            (db, token) => db.Bookings
+                .AsNoTracking()
+                .CountAsync(b => b.GuestId == session.GuestId && b.Status == BookingStatus.Confirmed, token),
+            ct);
+        Assert.Equal(rooms.Count, confirmed);
+
+        JsonObject body = ApiTestClient.BookingBody(standard.HotelId, standard.Id, checkIn, checkOut, guests: 2);
+        using HttpResponseMessage conflict = await client.CreateBookingAsync(body, session.Token, ct);
+        await ProblemAssert.AssertProblemAsync(conflict, HttpStatusCode.Conflict, cancellationToken: ct);
+
+        int cancelledId = bookingIds[0];
+        using HttpResponseMessage cancelled = await client.CancelBookingAsync(cancelledId, session.Token, ct);
+        Assert.Equal(HttpStatusCode.NoContent, cancelled.StatusCode);
+
+        BookingStatus status = await variant.ExecuteDbAsync(
+            (db, token) => db.Bookings
+                .AsNoTracking()
+                .Where(b => b.Id == cancelledId)
+                .Select(static b => b.Status)
+                .SingleAsync(token),
+            ct);
+        Assert.Equal(BookingStatus.Cancelled, status);
+
+        // The provider was handed every event, so each outcome above survived a failed write; the dates are the API's
+        // exact yyyy-MM-dd form.
+        string dates = $"CheckIn={ApiTestClient.Iso(checkIn)} CheckOut={ApiTestClient.Iso(checkOut)}";
+        List<(int EventId, string Message)> expectedEvents =
+        [
+            .. bookingIds.Select(id => (3001, string.Create(
+                CultureInfo.InvariantCulture,
+                $"Booking created. BookingId={id} RoomTypeId={standard.Id} {dates}"))),
+            (3002, string.Create(CultureInfo.InvariantCulture, $"Booking conflict. RoomTypeId={standard.Id} {dates}")),
+            (3003, string.Create(CultureInfo.InvariantCulture, $"Booking cancelled. BookingId={cancelledId}")),
+        ];
+        Assert.Equal(expectedEvents, logProvider.FailedEvents);
+    }
+
+    // Hands BookingService's category a logger that records each event and then throws, as a broken log sink does;
+    // every other category gets the null logger, so the host starts and serves as usual.
+    private sealed class FailingBookingLogProvider : ILoggerProvider
+    {
+        private static readonly string? BookingServiceCategory = typeof(BookingService).FullName;
+
+        private readonly ConcurrentQueue<(int EventId, string Message)> _failedEvents = new();
+        private int _disposed;
+
+        public IReadOnlyCollection<(int EventId, string Message)> FailedEvents => _failedEvents;
+
+        public ILogger CreateLogger(string categoryName)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+            return string.Equals(categoryName, BookingServiceCategory, StringComparison.Ordinal)
+                ? new FailingLogger(_failedEvents)
+                : NullLogger.Instance;
+        }
+
+        public void Dispose()
+        {
+            Volatile.Write(ref _disposed, 1);
+        }
+    }
+
+    private sealed class FailingLogger(ConcurrentQueue<(int EventId, string Message)> failedEvents) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull
+        {
+            return NullLogger.Instance.BeginScope(state);
+        }
+
+        public bool IsEnabled(LogLevel logLevel)
+        {
+            return true;
+        }
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            ArgumentNullException.ThrowIfNull(formatter);
+            failedEvents.Enqueue((eventId.Id, formatter(state, exception)));
+            throw new InvalidOperationException("The log sink is unavailable.");
+        }
     }
 }

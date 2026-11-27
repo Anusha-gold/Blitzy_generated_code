@@ -1,4 +1,5 @@
 using System.Data;
+using System.Globalization;
 
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
@@ -33,7 +34,9 @@ namespace SmartHotel.Api.Modules.Bookings;
 /// <para>
 /// Registered scoped, beside the request's <see cref="SmartHotelDbContext"/>, which it shares with
 /// <see cref="AvailabilityQueries"/>, so the free-room query runs inside the transaction that holds the lock. Its log
-/// events carry booking ids, room type ids and dates only: never a guest id, an email, a price or an exception message.
+/// events carry booking ids, room type ids and <c>yyyy-MM-dd</c> dates only: never a guest id, an email, a price or an
+/// exception message. They are written once the outcome is final. A log provider that fails while writing one loses
+/// only its own copy of the event, the failure goes unreported, and the outcome stands.
 /// </para>
 /// </remarks>
 /// <param name="db">The request's database session, shared with <paramref name="availability"/>.</param>
@@ -63,9 +66,10 @@ public sealed partial class BookingService(
     /// </para>
     /// <para>
     /// Under the room type's row lock the lowest-numbered free room is assigned. When no room is free, or when
-    /// PostgreSQL reports a violation of <c>EX_Bookings_Room_NoOverlap</c> because a concurrent writer took the room,
-    /// the transaction is rolled back and the result is <see cref="CreateBookingResult.NoRoomAvailable"/>. Any other
-    /// database error propagates.
+    /// PostgreSQL reports a violation of <c>EX_Bookings_Room_NoOverlap</c> because a writer that did not take the lock
+    /// took that room first, the transaction is rolled back and the result is
+    /// <see cref="CreateBookingResult.NoRoomAvailable"/>; in the second case another room of the type may still be
+    /// free. Any other database error propagates.
     /// </para>
     /// </remarks>
     /// <param name="guestId">The caller's guest id, from the bearer token's <c>sub</c> claim.</param>
@@ -135,12 +139,15 @@ public sealed partial class BookingService(
             await db.Database.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken);
 
         // The row lock gives predictable allocation. Concurrent creators for this room type take turns here, and under
-        // READ COMMITTED each one's free-room query then sees every booking committed before it, so each is given a
-        // distinct room and a 409 means that no room of the type is free. The lock is not the guarantee against double
-        // booking: EX_Bookings_Room_NoOverlap alone guarantees that, whatever the interleaving. A booking row cannot be
-        // locked before it exists, so the parent RoomTypes row is locked, and creators for other room types never wait
-        // on it. SERIALIZABLE isolation was rejected because its 40001 failures need whole-transaction retries, which
-        // make "exactly one success for the last room" harder to keep deterministic.
+        // READ COMMITTED each one's free-room query then sees every booking committed before it. Among creators that
+        // take this lock, each is therefore given a distinct room, and a 409 from the free-room check below means that
+        // no room of the type was free in that query's snapshot. The lock is not the guarantee against double booking:
+        // EX_Bookings_Room_NoOverlap alone guarantees that, whatever the interleaving. It is also the safety net for a
+        // writer that does not take this lock: when such a writer takes the chosen room first, the constraint rejects
+        // the insert and the catch below returns 409, even though another room of the type may still be free. A
+        // booking row cannot be locked before it exists, so the parent RoomTypes row is locked, and creators for other
+        // room types never wait on it. SERIALIZABLE isolation was rejected because its 40001 failures need
+        // whole-transaction retries, which make "exactly one success for the last room" harder to keep deterministic.
         // No operator may be composed onto this query: any would wrap the statement in a subquery, and it must reach
         // PostgreSQL exactly as written.
         await db.RoomTypes
@@ -152,7 +159,7 @@ public sealed partial class BookingService(
         if (room is null)
         {
             await transaction.RollbackAsync(cancellationToken);
-            LogBookingConflict(logger, roomTypeId, period.CheckIn, period.CheckOut);
+            WriteBookingConflict(roomTypeId, period);
             return new CreateBookingResult.NoRoomAvailable(roomType.Name, period.CheckIn, period.CheckOut);
         }
 
@@ -185,11 +192,11 @@ public sealed partial class BookingService(
             // retrying it. The transaction now holds nothing worth keeping, and rolling it back releases the lock.
             db.Entry(booking).State = EntityState.Detached;
             await transaction.RollbackAsync(cancellationToken);
-            LogBookingConflict(logger, roomTypeId, period.CheckIn, period.CheckOut);
+            WriteBookingConflict(roomTypeId, period);
             return new CreateBookingResult.NoRoomAvailable(roomType.Name, period.CheckIn, period.CheckOut);
         }
 
-        LogBookingCreated(logger, booking.Id, roomTypeId, period.CheckIn, period.CheckOut);
+        WriteBookingCreated(booking.Id, roomTypeId, period);
         return new CreateBookingResult.Created(new BookingResponse(
             booking.Id,
             hotelId,
@@ -211,51 +218,38 @@ public sealed partial class BookingService(
     /// </summary>
     /// <remarks>
     /// One SQL statement reads the bookings with their room, room type and hotel, ordered by creation instant and then
-    /// by id, both descending, which <c>IX_Bookings_GuestId_CreatedAt</c> serves. The nights are computed in memory.
+    /// by id, both descending, which <c>IX_Bookings_GuestId_CreatedAt</c> serves. Each row is materialized straight
+    /// into its <see cref="BookingResponse"/>, so the result is the only list allocated. The nights are not a column:
+    /// EF Core evaluates that part of the projection in memory, from the dates the row read, with
+    /// <see cref="StayPeriod.Nights"/>.
     /// </remarks>
     /// <param name="guestId">The caller's guest id, from the bearer token's <c>sub</c> claim.</param>
     /// <param name="cancellationToken">Cancels the database query.</param>
     /// <returns>The guest's bookings, newest first; an empty list when the guest has none.</returns>
     public async Task<IReadOnlyList<BookingResponse>> ListAsync(int guestId, CancellationToken cancellationToken)
     {
-        var rows = await db.Bookings
+        // The projection calls no instance member of this service: EF Core rejects a client projection that captures
+        // the instance, because the cached query would keep it alive.
+        return await db.Bookings
             .AsNoTracking()
             .Where(b => b.GuestId == guestId)
             .OrderByDescending(b => b.CreatedAt)
             .ThenByDescending(b => b.Id)
-            .Select(b => new
-            {
+            .Select(b => new BookingResponse(
                 b.Id,
                 b.Room.RoomType.HotelId,
-                HotelName = b.Room.RoomType.Hotel.Name,
+                b.Room.RoomType.Hotel.Name,
                 b.Room.RoomTypeId,
-                RoomTypeName = b.Room.RoomType.Name,
+                b.Room.RoomType.Name,
                 b.Room.RoomNumber,
                 b.CheckIn,
                 b.CheckOut,
+                new StayPeriod(b.CheckIn, b.CheckOut).Nights,
                 b.GuestCount,
                 b.TotalPrice,
                 b.Status,
-                b.CreatedAt,
-            })
+                b.CreatedAt))
             .ToListAsync(cancellationToken);
-
-        return rows
-            .Select(x => new BookingResponse(
-                x.Id,
-                x.HotelId,
-                x.HotelName,
-                x.RoomTypeId,
-                x.RoomTypeName,
-                x.RoomNumber,
-                x.CheckIn,
-                x.CheckOut,
-                new StayPeriod(x.CheckIn, x.CheckOut).Nights,
-                x.GuestCount,
-                x.TotalPrice,
-                x.Status,
-                x.CreatedAt))
-            .ToList();
     }
 
     /// <summary>
@@ -316,7 +310,7 @@ public sealed partial class BookingService(
             return new CancelResult.AlreadyCancelled();
         }
 
-        LogBookingCancelled(logger, bookingId);
+        WriteBookingCancelled(bookingId);
         return new CancelResult.Cancelled();
     }
 
@@ -333,6 +327,58 @@ public sealed partial class BookingService(
         return new DateTime(now.Ticks - (now.Ticks % TimeSpan.TicksPerMicrosecond), DateTimeKind.Utc);
     }
 
+    // Each booking event is written through one of the three methods below, so that a failing log provider cannot turn
+    // a 201, 204 or 409 into a 500 once the outcome is final. The aggregate logger behind ILogger<T> passes the event
+    // to every provider and only then throws their failures as one AggregateException, so that is the only type caught,
+    // and the providers that did not fail have already written it; a provider whose IsEnabled throws can instead stop
+    // the write for all of them. Each try block holds only the event's own formatting and write: never a database call,
+    // whose errors must keep reaching the exception handler.
+    private void WriteBookingCreated(int bookingId, int roomTypeId, StayPeriod period)
+    {
+        try
+        {
+            LogBookingCreated(logger, bookingId, roomTypeId, FormatDate(period.CheckIn), FormatDate(period.CheckOut));
+        }
+        catch (AggregateException)
+        {
+            // The booking is already committed. A failed write loses only the failing providers' copies of the event,
+            // and the failure goes unreported because the logger is the channel that failed.
+        }
+    }
+
+    private void WriteBookingConflict(int roomTypeId, StayPeriod period)
+    {
+        try
+        {
+            LogBookingConflict(logger, roomTypeId, FormatDate(period.CheckIn), FormatDate(period.CheckOut));
+        }
+        catch (AggregateException)
+        {
+            // The transaction is already rolled back. A failed write loses only the failing providers' copies of the
+            // event, and the failure goes unreported because the logger is the channel that failed.
+        }
+    }
+
+    private void WriteBookingCancelled(int bookingId)
+    {
+        try
+        {
+            LogBookingCancelled(logger, bookingId);
+        }
+        catch (AggregateException)
+        {
+            // The cancellation is already committed. A failed write loses only the failing providers' copies of the
+            // event, and the failure goes unreported because the logger is the channel that failed.
+        }
+    }
+
+    // The events carry dates in the API's own exact form, the one the 409 detail uses, as their message text and as
+    // their structured values; DateOnly's invariant ToString() would write the ambiguous MM/dd/yyyy.
+    private static string FormatDate(DateOnly date)
+    {
+        return date.ToString(IsoDate.Format, CultureInfo.InvariantCulture);
+    }
+
     [LoggerMessage(
         EventId = 3001,
         EventName = "BookingCreated",
@@ -342,15 +388,15 @@ public sealed partial class BookingService(
         ILogger logger,
         int bookingId,
         int roomTypeId,
-        DateOnly checkIn,
-        DateOnly checkOut);
+        string checkIn,
+        string checkOut);
 
     [LoggerMessage(
         EventId = 3002,
         EventName = "BookingConflict",
         Level = LogLevel.Warning,
         Message = "Booking conflict. RoomTypeId={RoomTypeId} CheckIn={CheckIn} CheckOut={CheckOut}")]
-    private static partial void LogBookingConflict(ILogger logger, int roomTypeId, DateOnly checkIn, DateOnly checkOut);
+    private static partial void LogBookingConflict(ILogger logger, int roomTypeId, string checkIn, string checkOut);
 
     [LoggerMessage(
         EventId = 3003,

@@ -15,10 +15,19 @@
  * and a "Log in again" link. In both branches the auth interceptor has
  * cleared the session, so the nav bar offers "Log in" again.
  *
+ * URL criteria: the search and hotel detail pages send the text their URL
+ * holds, so the server's own binding judges a deep link such as a guests-only
+ * search, `guests=2.0`, `guests=2e0` or an empty `guests`, and its 400 shows
+ * inline. A hotel id that is not an integer literal, such as `1.0`, `abc` or a
+ * NUL reached through the login page's return URL, matches no API route, so
+ * the detail page shows the API's 404 inline without sending a request. A
+ * detail page reused by one history traversal that changes both its hotel and
+ * its stay loads once, for the hotel and stay it lands on.
+ *
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory.
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 
 import {
   TEST_PASSWORD,
@@ -56,6 +65,117 @@ const isLoginApi = (url: URL): boolean => url.pathname === '/api/auth/login';
 
 /** Every hotel card on the search page. */
 const HOTEL_RESULTS = '[data-testid^="hotel-result-"]';
+
+/** Every "View rooms" link on the search page. */
+const VIEW_ROOMS = '[data-testid^="view-rooms-"]';
+
+/**
+ * A deep link whose criteria only the server can judge: the page must send
+ * the URL's text unchanged and show the server's answer inline.
+ */
+interface RawCriteriaCase {
+  /** What the URL holds, for the test title. */
+  title: string;
+  /** The page URL; `{stay}` stands for a valid `checkIn=…&checkOut=…` query. */
+  url: string;
+  /** The path the page's `GET` must request, the hotel id included. */
+  apiPath: string;
+  /** The `guests` text that `GET` must carry: the URL's own, or `1` when it has none. */
+  guests: string;
+  /** The status the server answers. */
+  status: number;
+}
+
+/** The deep links of the raw-criteria test, one test each. */
+const RAW_CRITERIA_CASES: readonly RawCriteriaCase[] = [
+  {
+    title: 'a search URL with only guests',
+    url: '/search?guests=2',
+    apiPath: '/api/hotels',
+    guests: '2',
+    status: 400,
+  },
+  {
+    title: 'a search URL with guests=2.0',
+    url: '/search?city=Seattle&{stay}&guests=2.0',
+    apiPath: '/api/hotels',
+    guests: '2.0',
+    status: 400,
+  },
+  {
+    title: 'a search URL with an empty guests',
+    url: '/search?city=Seattle&{stay}&guests=',
+    apiPath: '/api/hotels',
+    guests: '',
+    status: 400,
+  },
+  {
+    title: 'a detail URL with guests=2e0',
+    url: '/hotels/1?{stay}&guests=2e0',
+    apiPath: '/api/hotels/1',
+    guests: '2e0',
+    status: 400,
+  },
+  {
+    title: 'a detail URL with an empty guests',
+    url: '/hotels/1?{stay}&guests=',
+    apiPath: '/api/hotels/1',
+    guests: '',
+    status: 400,
+  },
+];
+
+/**
+ * Hotel ids a deep link can carry that are not integer literals, one test
+ * each. The API's `{id:int}` route matches none of them.
+ */
+const NON_INTEGER_HOTEL_IDS: readonly string[] = ['1.0', 'abc'];
+
+/**
+ * Records, from now on, every request the page sends to a hotel detail path,
+ * `/api/hotels/{id}`, whatever its method, and returns the list it fills.
+ */
+function recordDetailRequests(page: Page): URL[] {
+  const requested: URL[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/hotels/')) {
+      requested.push(url);
+    }
+  });
+  return requested;
+}
+
+/**
+ * Asserts the hotel detail page's answer to a non-integer id: the 404 the API
+ * gives such an id is shown inline in place of the content, the page does not
+ * report the service as unreachable, and `detailRequests` stayed empty.
+ */
+async function expectLocal404(page: Page, detailRequests: readonly URL[]): Promise<void> {
+  const error = page.getByTestId('inline-error');
+  await expect(error).toBeVisible();
+  await expect(error).toContainText('404');
+  await expect(error).not.toContainText('The service is unreachable.');
+  await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+  expect(detailRequests.map((u) => u.href)).toEqual([]);
+}
+
+/**
+ * Clicks a "View rooms" link and waits until the hotel detail page shows the
+ * hotel it opens. Returns that hotel's id, read from the link's
+ * `view-rooms-<id>` hook, and the name the page shows.
+ */
+async function openHotel(page: Page, link: Locator): Promise<{ id: string; name: string }> {
+  const testId = (await link.getAttribute('data-testid')) ?? '';
+  expect(testId).toMatch(/^view-rooms-\d+$/);
+  const id = testId.slice('view-rooms-'.length);
+
+  await link.click();
+  await expect(page).toHaveURL(new RegExp(`/hotels/${id}\\?`));
+  const name = page.getByTestId('hotel-name');
+  await expect(name).toHaveText(/\S/);
+  return { id, name: (await name.innerText()).trim() };
+}
 
 /**
  * Opens the register page, registers a fresh guest and returns the email.
@@ -143,6 +263,103 @@ test('search with no availability shows the empty message', async ({ page }) => 
     'No hotels with available rooms in Atlantis for these dates.',
   );
   await expectNoInlineError(page);
+});
+
+for (const c of RAW_CRITERIA_CASES) {
+  test(`${c.title} reaches the server as written and its ${c.status} shows inline`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const url = c.url.replace('{stay}', `checkIn=${checkIn}&checkOut=${checkOut}`);
+
+    const res = await test.step('open the deep link', async () => {
+      const response = page.waitForResponse(
+        (r) => new URL(r.url()).pathname === c.apiPath && r.request().method() === 'GET',
+      );
+      await page.goto(url);
+      return response;
+    });
+
+    await test.step(`the GET carries the URL's text and gets ${c.status}`, () => {
+      expect(new URL(res.url()).searchParams.get('guests')).toBe(c.guests);
+      expect(res.status()).toBe(c.status);
+    });
+
+    await test.step('the page shows the error inline and no hotel', async () => {
+      await expect(page.getByTestId('inline-error')).toBeVisible();
+      await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="hotel-name"]`)).toHaveCount(0);
+    });
+  });
+}
+
+for (const id of NON_INTEGER_HOTEL_IDS) {
+  test(`the hotel id ${id} shows an inline 404 without a request`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const detailRequests = recordDetailRequests(page);
+    await page.goto(`/hotels/${id}?checkIn=${checkIn}&checkOut=${checkOut}`);
+    await expectLocal404(page, detailRequests);
+  });
+}
+
+test('the hotel id NUL from the login return URL shows an inline 404 without a request', async ({ page }) => {
+  const email = await test.step('register a guest', () => registerNewGuest(page));
+
+  // nginx rejects /hotels/%00 on a direct load, so the in-app navigation
+  // after login, which accepts any same-app path, is the way to reach it.
+  const detailRequests = recordDetailRequests(page);
+  await test.step('log in with a return URL to the hotel id %00', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const returnUrl = `/hotels/%00?checkIn=${checkIn}&checkOut=${checkOut}`;
+    await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+    await logIn(page, email, TEST_PASSWORD);
+    await expect(page).toHaveURL(/\/hotels\/%00\?/);
+  });
+
+  await test.step('the page shows the 404 inline and sent no request', () =>
+    expectLocal404(page, detailRequests),
+  );
+});
+
+test('a reused detail page loads once, for the hotel and stay it lands on', async ({ page }) => {
+  const [firstIn, firstOut, secondIn, secondOut] = utcDates(40, 42, 44, 47);
+  const firstStay = { city: 'Seattle', checkIn: firstIn, checkOut: firstOut, guests: 1 };
+  const secondStay = { city: 'Seattle', checkIn: secondIn, checkOut: secondOut, guests: 2 };
+
+  const first = await test.step('open a Seattle hotel for the first stay', async () => {
+    await page.goto('/search');
+    await searchHotels(page, firstStay);
+    return openHotel(page, page.locator(VIEW_ROOMS).first());
+  });
+
+  await test.step('open the other Seattle hotel for a second stay', async () => {
+    await page.getByTestId('nav-search').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await searchHotels(page, secondStay);
+    const other = page.locator(`${VIEW_ROOMS}:not([data-testid="view-rooms-${first.id}"])`).first();
+    await openHotel(page, other);
+  });
+
+  await test.step('go back to the first hotel in one history traversal', async () => {
+    const loads: URL[] = [];
+    page.on('request', (request) => {
+      const requested = new URL(request.url());
+      if (requested.pathname.startsWith('/api/hotels/') && request.method() === 'GET') {
+        loads.push(requested);
+      }
+    });
+
+    // The history holds /search, /search?<first stay>, /hotels/<first>,
+    // /search, /search?<second stay> and /hotels/<other>. Three entries back
+    // is the first hotel: one navigation that reuses the detail page and
+    // changes both its id and its query.
+    await page.evaluate(() => history.go(-3));
+    await expect(page).toHaveURL(new RegExp(`/hotels/${first.id}\\?`));
+    await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
+
+    expect(loads.map((u) => u.pathname)).toEqual([`/api/hotels/${first.id}`]);
+    const [load] = loads;
+    expect(load.searchParams.get('checkIn')).toBe(firstStay.checkIn);
+    expect(load.searchParams.get('checkOut')).toBe(firstStay.checkOut);
+    expect(load.searchParams.get('guests')).toBe(String(firstStay.guests));
+  });
 });
 
 test('duplicate registration shows an inline 409', async ({ page }) => {

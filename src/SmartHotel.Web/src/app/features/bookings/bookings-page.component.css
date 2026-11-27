@@ -1,10 +1,6 @@
 /* My bookings page: the confirmation banner and the bookings table. */
 :host {
   display: block;
-  /* Ten columns overflow narrow screens, so this region scrolls sideways, not the page.
-     Relative, so the absolute .visually-hidden spans stay inside the scroller. */
-  position: relative;
-  overflow-x: auto;
   /* On white: success 6.3:1. */
   --bookings-success: #1b6e37;
 }
@@ -36,6 +32,14 @@
 .empty {
   margin-block: 1rem 0;
   color: var(--sh-color-text-muted);
+}
+
+/* Ten columns overflow narrow screens, so the table scrolls sideways here, not the
+   page. Relative, so the absolute .visually-hidden spans stay inside the scroller.
+   :host has no overflow, so this region's global focus ring is not clipped. */
+.bookings-scroll {
+  position: relative;
+  overflow-x: auto;
 }
 
 /* Width, collapse, start-aligned headers and row rules are the global table base. */
@@ -70,7 +74,35 @@
   color: var(--sh-color-text-muted);
 }
 
-/* A 44px target; the focus ring and the disabled state are the global button's. */
-.bookings button {
+/* A 44px target. The focus ring is the global button's, as is Cancel's
+   disabled state; the pager's aria-disabled state is drawn below. The scroll
+   margin makes scrollIntoView and focus scrolling, which stop at the border
+   box, also bring the whole 2px + 2px focus ring into view. */
+.bookings button,
+.pager button {
   min-block-size: 2.75rem;
+  scroll-margin-block: 0.5rem;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-block-start: 1rem;
+}
+
+.pager p {
+  margin-block: 0;
+}
+
+/* The same look as the global button:disabled, drawn with colours instead of
+   opacity, so the focus ring of this still-focusable button keeps full
+   contrast. The transparent border shows the background beneath it. This rule
+   outranks the global hover and press rules, so the colours stay put on hover
+   and press too. */
+.pager button[aria-disabled='true'] {
+  border-color: transparent;
+  background-color: color-mix(in srgb, var(--sh-color-accent) 60%, var(--sh-color-bg));
+  cursor: not-allowed;
 }

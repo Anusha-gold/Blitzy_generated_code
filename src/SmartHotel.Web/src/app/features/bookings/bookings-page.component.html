@@ -25,52 +25,86 @@
 <ng-container *ngIf="bookings() as list">
   <p *ngIf="list.length === 0" class="empty" data-testid="bookings-empty">You have no bookings yet.</p>
 
-  <table *ngIf="list.length > 0" class="bookings" data-testid="bookings-table">
-    <caption class="visually-hidden">Your bookings, newest first</caption>
-    <thead>
-      <tr>
-        <th scope="col">Hotel</th>
-        <th scope="col">Room type</th>
-        <th scope="col">Room</th>
-        <th scope="col">Check-in</th>
-        <th scope="col">Check-out</th>
-        <th scope="col">Nights</th>
-        <th scope="col">Guests</th>
-        <th scope="col" class="money">Total</th>
-        <th scope="col">Status</th>
-        <th scope="col"><span class="visually-hidden">Actions</span></th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr *ngFor="let b of list; trackBy: trackById" [attr.data-testid]="'booking-row-' + b.id">
-        <td [id]="'booking-' + b.id + '-hotel'">{{ b.hotelName }}</td>
-        <td>{{ b.roomTypeName }}</td>
-        <td>{{ b.roomNumber }}</td>
-        <td [id]="'booking-' + b.id + '-check-in'">{{ b.checkIn }}</td>
-        <td [id]="'booking-' + b.id + '-check-out'">{{ b.checkOut }}</td>
-        <td>{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
-        <td>{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
-        <td class="money" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
-        <td
-          class="status"
-          [class.status-confirmed]="b.status === 'Confirmed'"
-          [class.status-cancelled]="b.status === 'Cancelled'"
-          [attr.data-testid]="'booking-status-' + b.id"
-        >{{ b.status }}</td>
-        <td>
-          <!-- The visible name stays "Cancel"; the description names the
-               booking, so each row's button is distinguishable to assistive
-               technology without changing the text. -->
-          <button
-            *ngIf="canCancel(b)"
-            type="button"
-            [attr.data-testid]="'cancel-' + b.id"
-            [attr.aria-describedby]="'booking-' + b.id + '-hotel booking-' + b.id + '-check-in booking-' + b.id + '-check-out'"
-            [disabled]="cancelPending()"
-            (click)="cancel(b)"
-          >Cancel</button>
-        </td>
-      </tr>
-    </tbody>
-  </table>
+  <ng-container *ngIf="list.length > 0">
+    <!-- A Cancel button may be on no row, so the scroller itself is a focusable
+         region named by the caption: Tab reaches it and the arrow keys scroll it. -->
+    <div
+      class="bookings-scroll"
+      role="region"
+      aria-labelledby="bookings-caption"
+      tabindex="0"
+      data-testid="bookings-scroll"
+    >
+      <table class="bookings" data-testid="bookings-table">
+        <caption id="bookings-caption" class="visually-hidden">Your bookings, newest first</caption>
+        <thead>
+          <tr>
+            <th scope="col">Hotel</th>
+            <th scope="col">Room type</th>
+            <th scope="col">Room</th>
+            <th scope="col">Check-in</th>
+            <th scope="col">Check-out</th>
+            <th scope="col">Nights</th>
+            <th scope="col">Guests</th>
+            <th scope="col" class="money">Total</th>
+            <th scope="col">Status</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let b of visibleBookings(); trackBy: trackById" [attr.data-testid]="'booking-row-' + b.id">
+            <td>{{ b.hotelName }}</td>
+            <td>{{ b.roomTypeName }}</td>
+            <td>{{ b.roomNumber }}</td>
+            <td>{{ b.checkIn }}</td>
+            <td>{{ b.checkOut }}</td>
+            <td>{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
+            <td>{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
+            <td class="money" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
+            <td
+              class="status"
+              [class.status-confirmed]="b.status === 'Confirmed'"
+              [class.status-cancelled]="b.status === 'Cancelled'"
+              [attr.data-testid]="'booking-status-' + b.id"
+            >{{ b.status }}</td>
+            <td>
+              <!-- The visible label "Cancel" starts the accessible name, and the
+                   visually hidden rest names the booking: hotel, room type, room
+                   and dates. The seeded hotel names are distinct, a room number
+                   is unique within its hotel and a room never has two
+                   overlapping Confirmed bookings, so no two buttons share a name. -->
+              <button
+                *ngIf="canCancel(b)"
+                type="button"
+                [attr.data-testid]="'cancel-' + b.id"
+                [disabled]="cancelPending()"
+                (click)="cancel(b)"
+              >Cancel<span class="visually-hidden"> booking at {{ b.hotelName }}, {{ b.roomTypeName }} room {{ b.roomNumber }}, {{ b.checkIn }} to {{ b.checkOut }}</span></button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- At either end the button is aria-disabled, not disabled: a native
+         disabled button would drop keyboard focus to the page body after the
+         press that reached that end. The handlers ignore those clicks. -->
+    <nav *ngIf="pageCount() > 1" class="pager" aria-label="Bookings pages" data-testid="bookings-pager">
+      <button
+        #previousButton
+        type="button"
+        data-testid="bookings-previous"
+        [attr.aria-disabled]="page() === 0 ? 'true' : null"
+        (click)="previousPage(previousButton)"
+      >Previous</button>
+      <p aria-live="polite" data-testid="bookings-range">Showing {{ range().first }}–{{ range().last }} of {{ range().total }} bookings</p>
+      <button
+        #nextButton
+        type="button"
+        data-testid="bookings-next"
+        [attr.aria-disabled]="page() === pageCount() - 1 ? 'true' : null"
+        (click)="nextPage(nextButton)"
+      >Next</button>
+    </nav>
+  </ng-container>
 </ng-container>

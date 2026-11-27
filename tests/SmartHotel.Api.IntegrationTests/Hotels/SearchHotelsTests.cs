@@ -10,7 +10,8 @@ using SmartHotel.Data.Entities;
 namespace SmartHotel.Api.IntegrationTests.Hotels;
 
 // The tests share this class's database, so each one searches its own stay window: only
-// Search_NoAvailability_ReturnsEmptyList writes bookings, and only for a window no other test reads.
+// Search_NoAvailability_ReturnsEmptyList writes bookings, and only for a window no other test reads. Only
+// Search_CityWithLocaleSensitiveCase_ReturnsStoredHotel adds a hotel, in a city no other test searches.
 public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
 {
     private const string BaselineCity = "Seattle";
@@ -20,8 +21,16 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
     private const string SeattleWaterfront = "SmartHotel Seattle Waterfront";
     private const string ChicagoLoop = "SmartHotel Chicago Loop";
 
+    // A city outside the seed whose first letter is U+0130, the capital dotted I. PostgreSQL's lower() maps it to "i"
+    // under collations such as en_US.utf8, while .NET's invariant casing leaves it unchanged.
+    private const string IzmirCity = "\u0130zmir";
+    private const string IzmirHotel = "SmartHotel \u0130zmir Konak";
+
     // The seed gives every hotel 4 room types with 10 rooms each.
     private const int RoomsPerHotel = 40;
+
+    // U+1D538, a letter outside the Basic Multilingual Plane: one character, but two UTF-16 code units.
+    private const string OutsideBmpLetter = "\U0001D538";
 
     private readonly SmartHotelApiFactory _factory;
     private readonly ApiTestClient _client;
@@ -45,8 +54,12 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
     [InlineData("city-missing", "city")]
     [InlineData("city-blank", "city")]
     [InlineData("city-too-long", "city")]
+    [InlineData("city-too-long-outside-bmp", "city")]
     [InlineData("guests-zero", "guests")]
     [InlineData("guests-not-integer", "guests")]
+    [InlineData("guests-blank", "guests")]
+    [InlineData("guests-white-space", "guests")]
+    [InlineData("guests-nul-suffixed", "guests")]
     public async Task Search_InvalidInput_Returns400(string caseLabel, string expectedKey)
     {
         (string? city, string? checkIn, string? checkOut, string? guests) = InvalidQuery(caseLabel);
@@ -90,6 +103,26 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
             await SearchOkAsync("seattle", checkIn, checkOut, 2, cancellationToken);
         AssertSeattleHotels(lowerCase, downtownId, 129.00m, waterfrontId, 139.00m);
         Assert.Equal(forTwo, lowerCase);
+    }
+
+    [Fact]
+    public async Task Search_GuestsOmitted_SearchesForOneGuest()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        DateOnly today = ApiTestClient.TodayUtc;
+        DateOnly checkIn = today.AddDays(30);
+        DateOnly checkOut = today.AddDays(32);
+        int downtownId = await _factory.GetHotelIdAsync(SeattleDowntown, cancellationToken);
+        int waterfrontId = await _factory.GetHotelIdAsync(SeattleWaterfront, cancellationToken);
+
+        // Only an omitted guests parameter means a party of 1; a supplied blank one is a 400 in the theory above.
+        IReadOnlyList<ApiTestClient.HotelSummary> omitted =
+            await SearchOkAsync(BaselineCity, checkIn, checkOut, null, cancellationToken);
+        IReadOnlyList<ApiTestClient.HotelSummary> forOne =
+            await SearchOkAsync(BaselineCity, checkIn, checkOut, 1, cancellationToken);
+
+        AssertSeattleHotels(omitted, downtownId, 129.00m, waterfrontId, 139.00m);
+        Assert.Equal(forOne, omitted);
     }
 
     [Fact]
@@ -157,6 +190,69 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         IReadOnlyList<ApiTestClient.HotelSummary> unknownCity =
             await SearchOkAsync("Atlantis", today.AddDays(30), today.AddDays(32), 2, cancellationToken);
         Assert.Empty(unknownCity);
+
+        // 100 characters is within the bound even when each one takes two UTF-16 code units, so an unknown city of
+        // that length is searched too.
+        IReadOnlyList<ApiTestClient.HotelSummary> outsideBmpCity =
+            await SearchOkAsync(OutsideBmpCity(100), today.AddDays(30), today.AddDays(32), 2, cancellationToken);
+        Assert.Empty(outsideBmpCity);
+    }
+
+    [Fact]
+    public async Task Search_CityWithLocaleSensitiveCase_ReturnsStoredHotel()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        DateOnly today = ApiTestClient.TodayUtc;
+        DateOnly checkIn = today.AddDays(30);
+        DateOnly checkOut = today.AddDays(32);
+
+        // The hotel is built through the same navigations as the seed, so EF Core fills the room's composite foreign
+        // key (RoomTypeId, HotelId) from its room type.
+        int hotelId = await _factory.ExecuteDbAsync(
+            async (db, ct) =>
+            {
+                RoomType roomType = new()
+                {
+                    Name = "Standard",
+                    MaxGuests = 2,
+                    NightlyPrice = 99.00m,
+                };
+                roomType.Rooms.Add(new Room { RoomNumber = "101" });
+
+                Hotel hotel = new()
+                {
+                    Name = IzmirHotel,
+                    City = IzmirCity,
+                    Address = "1 Kordon Boyu, Konak",
+                    Description = "A test hotel in a city whose name PostgreSQL and .NET fold to different text.",
+                };
+                hotel.RoomTypes.Add(roomType);
+                db.Hotels.Add(hotel);
+                await db.SaveChangesAsync(ct);
+
+                return hotel.Id;
+            },
+            cancellationToken);
+
+        // The stored text itself finds the hotel, and the stored spelling comes back. A search that folded only its
+        // input in .NET would keep U+0130 while a database whose collation lowers U+0130 to "i", en_US.utf8 among them,
+        // folds the stored city to "izmir", and would find nothing.
+        IReadOnlyList<ApiTestClient.HotelSummary> identical =
+            await SearchOkAsync(IzmirCity, checkIn, checkOut, 2, cancellationToken);
+        ApiTestClient.HotelSummary found = Assert.Single(identical);
+        Assert.Equal(hotelId, found.Id);
+        Assert.Equal(IzmirHotel, found.Name);
+        Assert.Equal(IzmirCity, found.City);
+        Assert.Equal(99.00m, found.LowestNightlyPrice);
+
+        // The other-case spelling upper-cases only z, m and r, which every collation lowers alike, and keeps U+0130 and
+        // the small i as stored, because lower() folds U+0130 and "I" differently from one locale to another: C leaves
+        // U+0130 unchanged, ICU's en-US rules give "i" followed by U+0307, and Turkish rules lower "I" to the dotless
+        // U+0131. Upper-casing the i, to U+0130 or to "I", would make the match depend on the test server's locale;
+        // this spelling folds to the stored city's lower() under each of them.
+        IReadOnlyList<ApiTestClient.HotelSummary> otherCase =
+            await SearchOkAsync("\u0130ZMiR", checkIn, checkOut, 2, cancellationToken);
+        Assert.Equal(identical, otherCase);
     }
 
     // DateOnly values cannot be attribute arguments, so each theory row names its case and the query is built here.
@@ -209,13 +305,28 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
             "city-missing" => (null, checkIn, checkOut, BaselineGuests),
             "city-blank" => ("   ", checkIn, checkOut, BaselineGuests),
             "city-too-long" => (new string('a', 101), checkIn, checkOut, BaselineGuests),
+            "city-too-long-outside-bmp" => (OutsideBmpCity(101), checkIn, checkOut, BaselineGuests),
             "guests-zero" => (BaselineCity, checkIn, checkOut, "0"),
             "guests-not-integer" => (BaselineCity, checkIn, checkOut, "two"),
+
+            // Supplied but blank, guests is not an integer; only an omitted guests defaults to 1.
+            "guests-blank" => (BaselineCity, checkIn, checkOut, string.Empty),
+            "guests-white-space" => (BaselineCity, checkIn, checkOut, "  "),
+
+            // Sent as 2%00. .NET's integer parsing ignores trailing NULs, but guests allows only a sign and digits.
+            "guests-nul-suffixed" => (BaselineCity, checkIn, checkOut, "2\0"),
             _ => throw new ArgumentOutOfRangeException(
                 nameof(caseLabel),
                 caseLabel,
                 "No query is defined for this case."),
         };
+    }
+
+    // A city of the given number of characters, each outside the Basic Multilingual Plane, so its UTF-16 length is
+    // twice that number. It matches no hotel.
+    private static string OutsideBmpCity(int characters)
+    {
+        return string.Concat(Enumerable.Repeat(OutsideBmpLetter, characters));
     }
 
     private static void AssertSeattleHotels(
@@ -242,19 +353,20 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         }
     }
 
-    // Sends a valid search, asserts 200 and returns the parsed list; the response is disposed before returning.
+    // Sends a valid search, asserts 200 and returns the parsed list; the response is disposed before returning. A null
+    // guests omits the parameter.
     private async Task<IReadOnlyList<ApiTestClient.HotelSummary>> SearchOkAsync(
         string city,
         DateOnly checkIn,
         DateOnly checkOut,
-        int guests,
+        int? guests,
         CancellationToken cancellationToken)
     {
         using HttpResponseMessage response = await _client.SearchAsync(
             city,
             ApiTestClient.Iso(checkIn),
             ApiTestClient.Iso(checkOut),
-            guests.ToString(CultureInfo.InvariantCulture),
+            guests?.ToString(CultureInfo.InvariantCulture),
             cancellationToken);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
 

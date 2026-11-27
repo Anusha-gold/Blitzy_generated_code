@@ -1,5 +1,6 @@
 import { Injectable, inject } from '@angular/core';
-import { HttpClient, HttpParams } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse, HttpParams } from '@angular/common/http';
+import { throwError } from 'rxjs';
 import type { Observable } from 'rxjs';
 
 import { API_CONFIG } from '../config/runtime-config';
@@ -8,14 +9,45 @@ import type { HotelDetail, HotelSearchQuery, HotelSummary, StayQuery } from './m
 
 /**
  * Appends the stay criteria to `params` as `checkIn`, `checkOut` and `guests`,
- * in that order, with every value unchanged.
+ * in that order, each as the exact text the page holds, so the server's own
+ * binding decides whether it is valid.
  */
 function withStayParams(params: HttpParams, q: StayQuery): HttpParams {
   const stay = params.set('checkIn', q.checkIn).set('checkOut', q.checkOut);
-  // An omitted `guests` leaves the parameter out so that the server applies its
-  // default of 1. Stringifying it would send the literal "undefined", which the
-  // server rejects with 400.
+  // A present `guests` goes out as its text, an empty one included. An omitted
+  // one leaves the parameter out so that the server applies its default of 1;
+  // stringifying it would send the literal "undefined", which the server
+  // rejects with 400.
   return q.guests === undefined ? stay : stay.set('guests', q.guests);
+}
+
+/** The smallest id the API's `{id:int}` route accepts: the 32-bit signed minimum. */
+const MIN_ROUTE_ID = -2147483648;
+
+/** The largest id the API's `{id:int}` route accepts: the 32-bit signed maximum. */
+const MAX_ROUTE_ID = 2147483647;
+
+/**
+ * Returns the path segment that carries the hotel id `text` to the API's
+ * `{id:int}` route, or `null` when `text` is not an integer literal.
+ *
+ * An integer literal is an optional `+` or `-` followed by ASCII digits,
+ * nothing else, whose value is a 32-bit signed integer, the range of that
+ * route. It is written as its canonical decimal, `String(value)`: the server
+ * parses it to the same value, and the segment stays short whatever the
+ * number of leading zeros. Any other text, such as `1.0`, `abc`, an empty id,
+ * `.`, `..`, a NUL or another control character, white space around the
+ * digits or digits beyond that range, gives `null`; it is never converted to
+ * a number or percent-encoded.
+ */
+function hotelIdSegment(text: string): string | null {
+  if (!/^[+-]?[0-9]+$/.test(text)) {
+    return null;
+  }
+  const value = Number(text);
+  return Number.isSafeInteger(value) && value >= MIN_ROUTE_ID && value <= MAX_ROUTE_ID
+    ? String(value)
+    : null;
 }
 
 /**
@@ -33,7 +65,9 @@ function withStayParams(params: HttpParams, q: StayQuery): HttpParams {
  * {@link withRequestDeadline}: one with no response by then is aborted and
  * fails as a status-0 `HttpErrorResponse`, which `toUiError` shows as "The
  * service is unreachable.". Apart from that deadline the returned observables
- * are the `HttpClient` requests unchanged: pages map their errors through
+ * are the `HttpClient` requests unchanged, except for a hotel id that is not
+ * an integer literal, which fails with a local 404 and sends nothing
+ * ({@link HotelsApiService.getHotel}): pages map their errors through
  * `toUiError`, and nothing here retries, caches, transforms or logs them.
  * Availability changes with every booking and cancellation, so each call sends
  * a new request.
@@ -60,8 +94,9 @@ export class HotelsApiService {
    * response within `REQUEST_DEADLINE_MS` is aborted and fails with status 0.
    *
    * @param q - The city and stay as the page holds them. Every parameter is
-   *   sent, an empty string included, so the server answers it with 400; the
-   *   exception is an omitted `guests`, which the server takes as 1.
+   *   sent as its text, an empty string included, so the server decides it:
+   *   an empty city, date or `guests` gets 400; only an omitted `guests` the
+   *   server takes as 1.
    * @returns The 200 body: the qualifying hotels, in server order.
    */
   search(q: HotelSearchQuery): Observable<HotelSummary[]> {
@@ -82,20 +117,36 @@ export class HotelsApiService {
    * Errors, as `application/problem+json`:
    * - 400 for the date and `guests` rules of {@link HotelsApiService.search},
    *   checked before the hotel is looked up;
-   * - 404 when no hotel has `id`. A non-integer id, such as `NaN`, matches no
-   *   API route, and the server answers it with 404 as well.
+   * - 404 when no hotel has `id`.
+   *
+   * An id that is an integer literal, an optional sign and ASCII digits within
+   * the 32-bit signed range, is sent as its canonical decimal, so the server
+   * keeps its own order for it: a 400 for the stay or `guests` before a 404
+   * for an unknown hotel. Any other id, such as `1.0` or `abc`, is a
+   * non-integer id, which the API's `{id:int}` route answers with 404. That
+   * 404 is given here instead, with nothing sent, because some non-integer
+   * text cannot travel as one path segment: an empty id would address the
+   * search, URL parsing collapses the dot segments `.` and `..`,
+   * percent-encoded or not, and the API's HTTP server rejects a NUL before
+   * routing with a bare 400 that carries no CORS headers, which the page could
+   * only show as an unreachable service. The local 404 is an
+   * `HttpErrorResponse` with no body.
    *
    * A request with no response within `REQUEST_DEADLINE_MS` is aborted and
    * fails with status 0.
    *
-   * @param id - The hotel's id, as the page's route holds it.
+   * @param id - The hotel's id: the route's path segment text, unchanged.
    * @param q - The stay as the page holds it, sent unchanged like the search
    *   criteria.
    * @returns The 200 body: the hotel with its room types.
    */
-  getHotel(id: number, q: StayQuery): Observable<HotelDetail> {
+  getHotel(id: string, q: StayQuery): Observable<HotelDetail> {
+    const segment = hotelIdSegment(id);
+    if (segment === null) {
+      return throwError(() => new HttpErrorResponse({ status: 404, statusText: 'Not Found' }));
+    }
     const params = withStayParams(new HttpParams(), q);
-    const url = `${this.config.apiBaseUrl}/hotels/${id}`;
+    const url = `${this.config.apiBaseUrl}/hotels/${segment}`;
     return this.http.get<HotelDetail>(url, { params }).pipe(withRequestDeadline(url));
   }
 }

@@ -32,11 +32,19 @@
   <!-- Six columns are wider than a phone screen. The component CSS gives this
        wrapper overflow-x: auto, so the table scrolls inside it instead of
        widening the page, and position: relative, so it also clips the
-       absolutely positioned visually hidden "Actions" text. The Book buttons
-       keep the scrolled area keyboard-reachable. -->
-  <div *ngIf="hotel.roomTypes.length > 0; else noRoomTypes" class="rooms-scroll">
+       absolutely positioned visually hidden "Actions" text. Every Book button
+       can be disabled, so the wrapper itself is a focusable region named by the
+       caption: Tab reaches it and the arrow keys scroll it. -->
+  <div
+    *ngIf="hotel.roomTypes.length > 0; else noRoomTypes"
+    class="rooms-scroll"
+    role="region"
+    aria-labelledby="rooms-caption"
+    tabindex="0"
+    data-testid="rooms-scroll"
+  >
     <table class="rooms">
-      <caption>Rooms</caption>
+      <caption id="rooms-caption">Rooms</caption>
       <thead>
         <tr>
           <th scope="col">Room type</th>
