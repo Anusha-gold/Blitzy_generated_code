@@ -33,13 +33,57 @@ public sealed class StayPeriodTests
     [InlineData(null, "2026-12-07", "checkIn")] // Check-in missing.
     [InlineData("2026-12-05", null, "checkOut")] // Check-out missing.
     [InlineData("", "2026-12-07", "checkIn")]
-    [InlineData("2026-1-5", "2026-12-07", "checkIn")]
+    [InlineData("2026-12-5", "2026-12-07", "checkIn")] // Unpadded day; read loosely it is a valid 2-night stay.
     [InlineData("2026-12-05", "12/07/2026", "checkOut")]
     public void TryCreate_InvalidStay_ReturnsErrorForField(string? checkIn, string? checkOut, string expectedKey)
     {
         Assert.False(StayPeriod.TryCreate(checkIn, checkOut, Today, out var period, out var errors));
         Assert.Equal(default(StayPeriod), period);
         var messages = Assert.Contains(expectedKey, errors);
+        Assert.NotEmpty(messages);
+    }
+
+    // Each row breaks several rules at once and lists every field that must report, and no other.
+    [Theory]
+    [InlineData("2026-12-5", "12/07/2026", "checkIn", "checkOut")] // Both malformed: the second field is still checked.
+    [InlineData(null, null, "checkIn", "checkOut")] // Both missing.
+    [InlineData("2026-11-30", "12/07/2026", "checkOut")] // Past check-in, malformed check-out: no relational rule runs.
+    [InlineData("2026-11-30", "2026-11-29", "checkIn", "checkOut")] // Past check-in and check-out before check-in.
+    [InlineData("2026-11-30", "2027-01-01", "checkIn", "checkOut")] // Past check-in and a 32-night stay.
+    public void TryCreate_SeveralInvalidFields_ReturnsExactlyTheseErrorKeys(
+        string? checkIn,
+        string? checkOut,
+        params string[] expectedKeys)
+    {
+        Assert.False(StayPeriod.TryCreate(checkIn, checkOut, Today, out var period, out var errors));
+        Assert.Equal(default, period);
+        Assert.Equal(expectedKeys.Order(StringComparer.Ordinal), errors.Keys.Order(StringComparer.Ordinal));
+        Assert.All(errors.Values, Assert.NotEmpty);
+    }
+
+    // The next two facts check one stay against two supplied dates, neither of them Today, so the past
+    // check must use the date it is given rather than a fixed cutoff.
+    [Fact]
+    public void TryCreate_CheckInOnSuppliedToday_Succeeds()
+    {
+        DateOnly checkInDay = new(2026, 12, 5);
+
+        Assert.True(StayPeriod.TryCreate("2026-12-05", "2026-12-07", checkInDay, out var period, out var errors));
+        Assert.Empty(errors);
+        Assert.Equal(checkInDay, period.CheckIn);
+        Assert.Equal(new DateOnly(2026, 12, 7), period.CheckOut);
+        Assert.Equal(2, period.Nights);
+    }
+
+    [Fact]
+    public void TryCreate_CheckInBeforeSuppliedToday_ReturnsOnlyCheckInError()
+    {
+        DateOnly dayAfterCheckIn = new(2026, 12, 6);
+
+        Assert.False(StayPeriod.TryCreate("2026-12-05", "2026-12-07", dayAfterCheckIn, out var period, out var errors));
+        Assert.Equal(default, period);
+        var (key, messages) = Assert.Single(errors);
+        Assert.Equal("checkIn", key);
         Assert.NotEmpty(messages);
     }
 }

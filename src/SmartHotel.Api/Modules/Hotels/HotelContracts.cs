@@ -118,8 +118,10 @@ public sealed record HotelDetailResponse(
 /// </param>
 /// <param name="AvailableRooms">
 /// The number of rooms of this type with no <c>Confirmed</c> booking that overlaps the stay. It counts physical
-/// inventory whatever the requested guest count, so one booking lowers it by exactly one and its cancellation
-/// restores it. The web app disables "Book" when it is 0 or when the guest count exceeds
+/// inventory whatever the requested guest count. For a search of the booked dates, one booking lowers it by exactly one
+/// and its cancellation restores it, provided nothing else changed this room type's bookings or rooms in between; for
+/// other searched dates the change can be zero, because a stay can overlap two bookings of one room and cancelling one
+/// leaves it taken. The web app disables "Book" when it is 0 or when the guest count exceeds
 /// <paramref name="MaxGuests"/>.
 /// </param>
 /// <param name="StayTotal">

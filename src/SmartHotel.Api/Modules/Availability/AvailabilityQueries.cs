@@ -166,8 +166,19 @@ public sealed class AvailabilityQueries(SmartHotelDbContext db)
     /// Counts, for every room type of a hotel, the rooms that are free for the whole stay, in one SQL query.
     /// </summary>
     /// <remarks>
-    /// The counts are physical inventory and ignore the party size, so one booking lowers its room type's count by
-    /// exactly one and cancelling it restores the count.
+    /// <para>
+    /// The counts are physical inventory and ignore the party size: a room counts only while no confirmed booking
+    /// overlaps the stay. A booking or a cancellation changes a count only when it moves a room between having no
+    /// overlapping confirmed booking and having at least one.
+    /// </para>
+    /// <para>
+    /// For a search of the booked dates, one booking lowers its room type's count by exactly one and cancelling it
+    /// restores the count, provided nothing else changed that room type's bookings or rooms in between: the booking
+    /// takes a room that was free for those dates, and while it stands <c>EX_Bookings_Room_NoOverlap</c> keeps every
+    /// other confirmed booking of that room off them. For other searched dates the change can be zero, because a stay
+    /// can overlap two bookings of one room: cancelling one leaves the room taken, and a new booking can land on a room
+    /// that is already taken.
+    /// </para>
     /// </remarks>
     /// <param name="hotelId">The hotel's identifier.</param>
     /// <param name="period">The validated stay; its check-out day is exclusive.</param>

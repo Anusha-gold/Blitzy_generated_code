@@ -17,9 +17,11 @@ namespace SmartHotel.Api.Modules.Hotels;
 /// onto the Hotels contracts, so the Availability module's records never reach the Hotels JSON.
 /// </para>
 /// <para>
-/// The search issues at most one SQL query, and none when the city cannot match any stored hotel, for example one
-/// containing U+0000. The detail issues two: the hotel with its room types, then the per-type counts. Neither writes,
-/// opens a transaction or tracks entities.
+/// The search issues one SQL statement for any city text PostgreSQL can store, including a city no hotel is in, and
+/// none for text containing U+0000 or an unpaired surrogate, which cannot equal any stored city. The detail issues one
+/// statement for the hotel with its room types and, only when the hotel exists, a second for the per-type counts, so
+/// an unknown id costs one statement and returns <see langword="null"/>. Neither writes, opens a transaction or tracks
+/// entities.
 /// </para>
 /// <para>
 /// Registered scoped, beside the request's <see cref="SmartHotelDbContext"/> and <see cref="AvailabilityQueries"/>.
@@ -66,9 +68,12 @@ public sealed class HotelQueryService(SmartHotelDbContext db, AvailabilityQuerie
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The available-room counts are physical inventory and ignore <see cref="HotelDetailQuery.Guests"/>: one booking
-    /// lowers its room type's count by exactly one and cancelling it restores the count. Room types too small for the
-    /// party are still listed; the guest count is only echoed, and the web app disables booking them.
+    /// The available-room counts are physical inventory and ignore <see cref="HotelDetailQuery.Guests"/>: a room counts
+    /// only while no confirmed booking overlaps the stay. For a search of the booked dates, one booking lowers its room
+    /// type's count by exactly one and cancelling it restores the count, provided nothing else changed that room type's
+    /// bookings or rooms in between; for other searched dates the change can be zero, because a stay can overlap two
+    /// bookings of one room and cancelling one leaves it taken. Room types too small for the party are still listed;
+    /// the guest count is only echoed, and the web app disables booking them.
     /// </para>
     /// <para>
     /// Each stay total comes from <see cref="PriceCalculator.Total"/>, the function that also computes a booking's

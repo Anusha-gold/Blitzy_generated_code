@@ -21,6 +21,11 @@ public sealed class IsoDateTests
     [InlineData(null)]
     [InlineData(" 2026-12-07")]
     [InlineData("2026-12-07 ")]
+    // Exact width and ASCII digits, but only the first, then only the second, separator is wrong.
+    [InlineData("2026/12-07")]
+    [InlineData("2026-12/07")]
+    // Exact width and hyphens, but 2026-12-07 written in non-ASCII (Arabic-Indic) digits.
+    [InlineData("\u0662\u0660\u0662\u0666-\u0661\u0662-\u0660\u0667")]
     // Exact shape, but no such calendar day: February has 28 days in 2026 and 2027.
     [InlineData("2026-02-30")]
     [InlineData("2027-02-29")]

@@ -137,8 +137,12 @@ export interface RoomTypeAvailability {
   nightlyPrice: number;
   /**
    * The number of rooms of this type with no `Confirmed` booking that overlaps
-   * the stay. It counts physical rooms whatever `guests` is, so one booking
-   * lowers it by exactly one and its cancellation restores it.
+   * the stay. It counts physical rooms whatever `guests` is. For a search of
+   * the booked dates, one booking lowers it by exactly one and its cancellation
+   * restores it, provided nothing else changed this room type's bookings or
+   * rooms in between; for other searched dates the change can be zero, because
+   * a stay can overlap two bookings of one room and cancelling one leaves it
+   * taken.
    */
   availableRooms: number;
   /**
