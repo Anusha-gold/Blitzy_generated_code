@@ -3,7 +3,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, Location, NgFor, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { Router, RouterLink } from '@angular/router';
-import { finalize } from 'rxjs';
+import { finalize, switchMap } from 'rxjs';
 
 import { BookingsApiService } from '../../core/api/bookings-api.service';
 import type { Booking } from '../../core/api/models';
@@ -63,7 +63,10 @@ export class BookingsPageComponent {
   /** The inline error of the last load or cancel, or `null` when there is none. */
   protected readonly error = signal<UiError | null>(null);
 
-  /** Whether a cancel request is in flight; disables every "Cancel" button. */
+  /**
+   * Whether a cancel, or the list reload that follows it, is in flight;
+   * disables every "Cancel" button.
+   */
   protected readonly cancelPending = signal(false);
 
   /**
@@ -80,26 +83,40 @@ export class BookingsPageComponent {
   protected readonly confirmation: Booking | null = readConfirmation(this.location.getState());
 
   constructor() {
-    this.load(true);
+    this.loadOnEntry();
   }
 
   /**
    * Cancels a booking. A 204 reloads the list, so the row's new status comes
-   * from the server. Every error, 401 included, is shown inline and the page
-   * stays where it is.
+   * from the server. Every error of the cancel or of that reload, 401
+   * included, is shown inline and the page stays where it is.
+   *
+   * The reload runs inside the pending window: "Cancel" stays disabled until
+   * the row shows the server's new status, so a second click can never send a
+   * DELETE for a booking that is already cancelled. While a cancel, or its
+   * reload, is in flight the method returns without a request, because the
+   * disabled binding reaches the DOM only on the next change-detection pass
+   * and a click landing before it still calls here. The subscription is bound
+   * to the stored `DestroyRef`, because this runs from an event callback,
+   * outside an injection context.
    */
   protected cancel(b: Booking): void {
+    if (this.cancelPending()) {
+      return;
+    }
+
     this.error.set(null);
     this.cancelPending.set(true);
 
     this.api
       .cancel(b.id)
       .pipe(
+        switchMap(() => this.api.list()),
         finalize(() => this.cancelPending.set(false)),
         takeUntilDestroyed(this.destroyRef),
       )
       .subscribe({
-        next: () => this.load(false),
+        next: (list) => this.bookings.set(list),
         error: (err: HttpErrorResponse) => this.error.set(toUiError(err)),
       });
   }
@@ -118,19 +135,18 @@ export class BookingsPageComponent {
   }
 
   /**
-   * Loads the caller's bookings. `entry` marks the request sent when the page
-   * opens: only its 401 redirects to the login page. A reload after a cancel
-   * runs from an event callback, outside an injection context, so the
-   * subscription is bound to the stored `DestroyRef`.
+   * Loads the caller's bookings when the page opens. This protected-page
+   * request is the only one whose 401 redirects to the login page; any other
+   * error is shown inline.
    */
-  private load(entry: boolean): void {
+  private loadOnEntry(): void {
     this.api
       .list()
       .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe({
         next: (list) => this.bookings.set(list),
         error: (err: HttpErrorResponse) => {
-          if (entry && err.status === 401) {
+          if (err.status === 401) {
             // `replaceUrl` drops the rejected `/bookings` entry from history,
             // so Back does not return to a page that bounces to login again.
             void this.router.navigate(['/login'], {

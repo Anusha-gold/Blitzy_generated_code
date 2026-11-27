@@ -1,0 +1,76 @@
+<h1>My bookings</h1>
+
+<section
+  *ngIf="confirmation as c"
+  class="confirmation"
+  data-testid="booking-confirmation"
+  aria-label="Booking confirmed"
+>
+  <h2>Booking confirmed</h2>
+  <p>{{ c.hotelName }}, {{ c.roomTypeName }}, room {{ c.roomNumber }}</p>
+  <p>{{ c.checkIn }} to {{ c.checkOut }}, {{ c.nights }} {{ c.nights === 1 ? 'night' : 'nights' }}</p>
+  <p>Total: {{ c.totalPrice | currency: 'USD' }}</p>
+  <p>No payment is taken online in this version.</p>
+</section>
+
+<app-error-message [error]="error()">
+  <a
+    *ngIf="error()?.status === 401"
+    routerLink="/login"
+    [queryParams]="{ returnUrl: '/bookings' }"
+    data-testid="login-again"
+  >Log in again</a>
+</app-error-message>
+
+<ng-container *ngIf="bookings() as list">
+  <p *ngIf="list.length === 0" class="empty" data-testid="bookings-empty">You have no bookings yet.</p>
+
+  <table *ngIf="list.length > 0" class="bookings" data-testid="bookings-table">
+    <caption class="visually-hidden">Your bookings, newest first</caption>
+    <thead>
+      <tr>
+        <th scope="col">Hotel</th>
+        <th scope="col">Room type</th>
+        <th scope="col">Room</th>
+        <th scope="col">Check-in</th>
+        <th scope="col">Check-out</th>
+        <th scope="col">Nights</th>
+        <th scope="col">Guests</th>
+        <th scope="col" class="money">Total</th>
+        <th scope="col">Status</th>
+        <th scope="col"><span class="visually-hidden">Actions</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr *ngFor="let b of list; trackBy: trackById" [attr.data-testid]="'booking-row-' + b.id">
+        <td [id]="'booking-' + b.id + '-hotel'">{{ b.hotelName }}</td>
+        <td>{{ b.roomTypeName }}</td>
+        <td>{{ b.roomNumber }}</td>
+        <td [id]="'booking-' + b.id + '-check-in'">{{ b.checkIn }}</td>
+        <td [id]="'booking-' + b.id + '-check-out'">{{ b.checkOut }}</td>
+        <td>{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
+        <td>{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
+        <td class="money" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
+        <td
+          class="status"
+          [class.status-confirmed]="b.status === 'Confirmed'"
+          [class.status-cancelled]="b.status === 'Cancelled'"
+          [attr.data-testid]="'booking-status-' + b.id"
+        >{{ b.status }}</td>
+        <td>
+          <!-- The visible name stays "Cancel"; the description names the
+               booking, so each row's button is distinguishable to assistive
+               technology without changing the text. -->
+          <button
+            *ngIf="canCancel(b)"
+            type="button"
+            [attr.data-testid]="'cancel-' + b.id"
+            [attr.aria-describedby]="'booking-' + b.id + '-hotel booking-' + b.id + '-check-in booking-' + b.id + '-check-out'"
+            [disabled]="cancelPending()"
+            (click)="cancel(b)"
+          >Cancel</button>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</ng-container>

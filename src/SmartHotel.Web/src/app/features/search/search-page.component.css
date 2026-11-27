@@ -1,0 +1,86 @@
+/* Search page: the criteria form and the hotel result cards. */
+:host {
+  display: block;
+}
+
+/* One row on wide screens; fields and the button wrap on narrow ones. */
+form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem 1rem;
+  margin-block-end: 1rem;
+}
+
+.field {
+  display: flex;
+  flex: 1 1 10rem;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-inline-size: 10rem;
+}
+
+label {
+  font-weight: 600;
+  margin-block-end: 0.125rem;
+}
+
+/* One 44px height for every control; date inputs are otherwise 2px taller. */
+input,
+button {
+  min-block-size: 2.75rem;
+}
+
+/* The list's gap, not item margins, spaces the cards. */
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-block: 1rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.results li {
+  padding: 1rem;
+  border: 1px solid var(--sh-color-rule);
+  border-radius: var(--sh-radius);
+}
+
+.results h2 {
+  font-size: 1.125rem;
+  margin-block: 0 0.25rem;
+}
+
+.results p {
+  margin-block: 0 0.5rem;
+}
+
+.price {
+  font-weight: 600;
+  color: var(--sh-color-text);
+}
+
+/* Block padding gives the link a 44px-tall target. */
+.results a {
+  display: inline-block;
+  padding-block: 0.625rem;
+  font-weight: 600;
+  text-underline-offset: 0.2em;
+}
+
+/* #52606d on white is 6.4:1. */
+.empty {
+  margin-block: 1rem 0;
+  color: #52606d;
+}
+
+/* Chrome's date-picker button takes focus inside the input, where the
+   input itself no longer matches :focus-visible. */
+a:focus-visible,
+input:focus-visible,
+input[type="date"]:focus-within,
+button:focus-visible {
+  outline: 2px solid var(--sh-color-accent);
+  outline-offset: 2px;
+}
