@@ -3,6 +3,7 @@ import { HttpClient, HttpParams } from '@angular/common/http';
 import type { Observable } from 'rxjs';
 
 import { API_CONFIG } from '../config/runtime-config';
+import { withRequestDeadline } from '../http/problem-details';
 import type { HotelDetail, HotelSearchQuery, HotelSummary, StayQuery } from './models';
 
 /**
@@ -26,10 +27,16 @@ function withStayParams(params: HttpParams, q: StayQuery): HttpParams {
  * nothing here trims, defaults, reformats or validates them, so the server
  * alone applies the date, stay-length, city and party-size rules, and its 400
  * and 404 problems reach the page inline. `HttpParams` percent-encodes each
- * value. The returned observables are the raw `HttpClient` requests: pages map
- * their errors through `toUiError`, and nothing here retries, caches,
- * transforms or logs them. Availability changes with every booking and
- * cancellation, so each call sends a new request.
+ * value.
+ *
+ * Each request is bounded by `REQUEST_DEADLINE_MS` through
+ * {@link withRequestDeadline}: one with no response by then is aborted and
+ * fails as a status-0 `HttpErrorResponse`, which `toUiError` shows as "The
+ * service is unreachable.". Apart from that deadline the returned observables
+ * are the `HttpClient` requests unchanged: pages map their errors through
+ * `toUiError`, and nothing here retries, caches, transforms or logs them.
+ * Availability changes with every booking and cancellation, so each call sends
+ * a new request.
  */
 @Injectable({ providedIn: 'root' })
 export class HotelsApiService {
@@ -49,7 +56,8 @@ export class HotelsApiService {
    * when a date is missing or is not an exact `yyyy-MM-dd` calendar date,
    * `checkOut` is not after `checkIn`, `checkIn` is before today (UTC), the
    * stay is longer than 30 nights, `city` is missing, blank or longer than 100
-   * characters, or `guests` is not an integer of at least 1.
+   * characters, or `guests` is not an integer of at least 1. A request with no
+   * response within `REQUEST_DEADLINE_MS` is aborted and fails with status 0.
    *
    * @param q - The city and stay as the page holds them. Every parameter is
    *   sent, an empty string included, so the server answers it with 400; the
@@ -58,7 +66,8 @@ export class HotelsApiService {
    */
   search(q: HotelSearchQuery): Observable<HotelSummary[]> {
     const params = withStayParams(new HttpParams().set('city', q.city), q);
-    return this.http.get<HotelSummary[]>(`${this.config.apiBaseUrl}/hotels`, { params });
+    const url = `${this.config.apiBaseUrl}/hotels`;
+    return this.http.get<HotelSummary[]>(url, { params }).pipe(withRequestDeadline(url));
   }
 
   /**
@@ -76,6 +85,9 @@ export class HotelsApiService {
    * - 404 when no hotel has `id`. A non-integer id, such as `NaN`, matches no
    *   API route, and the server answers it with 404 as well.
    *
+   * A request with no response within `REQUEST_DEADLINE_MS` is aborted and
+   * fails with status 0.
+   *
    * @param id - The hotel's id, as the page's route holds it.
    * @param q - The stay as the page holds it, sent unchanged like the search
    *   criteria.
@@ -83,6 +95,7 @@ export class HotelsApiService {
    */
   getHotel(id: number, q: StayQuery): Observable<HotelDetail> {
     const params = withStayParams(new HttpParams(), q);
-    return this.http.get<HotelDetail>(`${this.config.apiBaseUrl}/hotels/${id}`, { params });
+    const url = `${this.config.apiBaseUrl}/hotels/${id}`;
+    return this.http.get<HotelDetail>(url, { params }).pipe(withRequestDeadline(url));
   }
 }

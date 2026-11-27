@@ -153,10 +153,34 @@ builder.Services.AddAuthorization();
 
 WebApplication app = builder.Build();
 
-// Reading Value runs the options validation, after any test registrations and before any database work, so an
-// invalid key or origin stops the process with a non-zero exit. The validators' messages never contain the key.
-_ = app.Services.GetRequiredService<IOptions<JwtOptions>>().Value;
-_ = app.Services.GetRequiredService<IOptions<ApiCorsOptions>>().Value;
+// Reading the connection string runs the secret source's database checks and reading Value runs the options
+// validation, after any test registrations and before any database work. Every check runs even when an earlier one
+// fails, so one start names every missing or invalid setting before the process stops with a non-zero exit. The
+// messages name settings only and never contain a secret.
+List<Exception> startupFailures = [];
+CollectStartupFailure(startupFailures, () => app.Services.GetRequiredService<ISecretSource>().DatabaseConnectionString);
+CollectStartupFailure(startupFailures, () => app.Services.GetRequiredService<IOptions<JwtOptions>>().Value);
+CollectStartupFailure(startupFailures, () => app.Services.GetRequiredService<IOptions<ApiCorsOptions>>().Value);
+if (startupFailures.Count > 0)
+{
+    throw new AggregateException("The API configuration is invalid.", startupFailures);
+}
+
+static void CollectStartupFailure(List<Exception> failures, Func<object?> read)
+{
+    try
+    {
+        _ = read();
+    }
+    catch (InvalidOperationException exception)
+    {
+        failures.Add(exception);
+    }
+    catch (OptionsValidationException exception)
+    {
+        failures.Add(exception);
+    }
+}
 
 // The exception handler is the first middleware added here, so it catches an exception before the Development
 // exception page that WebApplication wraps around the pipeline, and no stack trace reaches the response.

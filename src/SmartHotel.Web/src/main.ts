@@ -6,7 +6,13 @@
  * be fetched or is rejected, Angular is never bootstrapped: the static
  * `boot-loading` element from `index.html` is replaced with a static
  * `boot-error` alert instead. The same alert covers a bootstrap that fails.
+ *
+ * Neither failure writes to the browser console: the boot-error alert is the
+ * whole report. A configuration rejection can describe values from
+ * `/config.json`, and a bootstrap error can carry provider or initialization
+ * details, so neither is printed, by this file or by Angular's `ErrorHandler`.
  */
+import { ErrorHandler } from '@angular/core';
 import { bootstrapApplication } from '@angular/platform-browser';
 
 import { AppComponent } from './app/app.component';
@@ -52,31 +58,85 @@ function showBootError(): void {
 }
 
 /**
+ * The application's `ErrorHandler`, which keeps the browser console silent when
+ * bootstrap fails.
+ *
+ * Angular reports a bootstrap failure to its `ErrorHandler` before it rejects,
+ * and the default handler prints the raw error. While bootstrap is pending this
+ * handler holds every reported error in memory instead. Once
+ * {@link StartupErrorHandler.bootstrapSucceeded} is called it hands the held
+ * errors, and every later one, to the default handling. Once
+ * {@link StartupErrorHandler.bootstrapFailed} is called it drops them and stays
+ * silent, because the boot-error alert reports that outcome.
+ */
+class StartupErrorHandler extends ErrorHandler {
+  private state: 'pending' | 'running' | 'failed' = 'pending';
+  private readonly held: unknown[] = [];
+
+  /** Reports, holds or drops `error` according to the bootstrap outcome. */
+  override handleError(error: unknown): void {
+    if (this.state === 'running') {
+      super.handleError(error);
+    } else if (this.state === 'pending') {
+      this.held.push(error);
+    }
+  }
+
+  /** Reports the held errors and switches to Angular's default handling. */
+  bootstrapSucceeded(): void {
+    if (this.state !== 'pending') {
+      return;
+    }
+    this.state = 'running';
+    for (const error of this.held.splice(0)) {
+      super.handleError(error);
+    }
+  }
+
+  /** Discards the held errors and ignores every later one. */
+  bootstrapFailed(): void {
+    if (this.state !== 'pending') {
+      return;
+    }
+    this.state = 'failed';
+    this.held.length = 0;
+  }
+}
+
+/**
  * Loads the runtime configuration, then bootstraps the application with it.
  *
- * Either failure ends in the boot-error state. The configuration failure is
- * logged as a fixed message only, because the rejection can describe values
- * from `/config.json`.
+ * Either failure ends in the boot-error state, and neither writes to the
+ * console: the alert is the whole report. The configuration rejection can
+ * describe values from `/config.json`, and a bootstrap error can carry provider
+ * or initialization details, which {@link StartupErrorHandler} keeps Angular
+ * from printing.
  */
 async function start(): Promise<void> {
   let config: ApiConfig;
   try {
     config = await loadRuntimeConfig();
   } catch {
-    console.error('SmartHotel: runtime configuration is unavailable or invalid.');
     showBootError();
     return;
   }
 
+  const errorHandler = new StartupErrorHandler();
   try {
     await bootstrapApplication(AppComponent, {
       ...appConfig,
-      providers: [...appConfig.providers, { provide: API_CONFIG, useValue: config }],
+      providers: [
+        ...appConfig.providers,
+        { provide: API_CONFIG, useValue: config },
+        { provide: ErrorHandler, useValue: errorHandler },
+      ],
     });
-  } catch (error: unknown) {
-    console.error('SmartHotel: application bootstrap failed.', error);
+  } catch {
+    errorHandler.bootstrapFailed();
     showBootError();
+    return;
   }
+  errorHandler.bootstrapSucceeded();
 }
 
 void start();

@@ -11,13 +11,55 @@
  * is empty or only whitespace counts as absent. The response status, not the
  * body's `status`, is authoritative, and `type` and `traceId` are never shown.
  *
+ * Status `0` covers every request that got no response: a network failure, a
+ * CORS rejection, the service down, or a request that passed its
+ * {@link REQUEST_DEADLINE_MS} deadline. `HotelsApiService` and
+ * `BookingsApiService` bound each of their requests with
+ * {@link withRequestDeadline}, which turns an expired wait into such a status-0
+ * error, so a peer that never answers ends in the same inline error.
+ *
  * Nothing here logs: an error body can echo user input. The result is plain
  * text that consumers render through interpolation only, never as HTML.
  */
 import { HttpErrorResponse } from '@angular/common/http';
+import { throwError, timeout } from 'rxjs';
+import type { MonoTypeOperatorFunction } from 'rxjs';
 
 const UNREACHABLE_TITLE = 'The service is unreachable.';
 const PROBLEM_MEDIA_TYPE = 'application/problem+json';
+const DEADLINE_STATUS_TEXT = 'Request deadline exceeded';
+
+/**
+ * How long, in milliseconds, a request bounded by {@link withRequestDeadline}
+ * may wait for its response before the operator aborts it: 30 seconds. That is
+ * far above the API's one-second search latency target, so only a peer that
+ * has stopped answering reaches it.
+ */
+export const REQUEST_DEADLINE_MS = 30_000;
+
+/**
+ * Bounds an `HttpClient` request by {@link REQUEST_DEADLINE_MS}.
+ *
+ * When the response has not arrived within the deadline, the operator
+ * unsubscribes from the request, which aborts it and lets every interceptor's
+ * `finalize` run, so the loading indicator is lowered. It then fails with an
+ * `HttpErrorResponse` of status `0`, statusText "Request deadline exceeded"
+ * and no body, which {@link toUiError} maps to "The service is unreachable.".
+ * A response that arrives in time passes through unchanged, and so does any
+ * other error.
+ *
+ * The operator never retries. Aborting stops only the wait: the server may
+ * still have received and applied the request.
+ *
+ * @param url - The request's URL, recorded on the deadline error.
+ * @returns An operator that mirrors the request until its deadline.
+ */
+export function withRequestDeadline<T>(url: string): MonoTypeOperatorFunction<T> {
+  return timeout({
+    first: REQUEST_DEADLINE_MS,
+    with: () => throwError(() => new HttpErrorResponse({ status: 0, statusText: DEADLINE_STATUS_TEXT, url })),
+  });
+}
 
 /**
  * The single shape every inline error renders from. `ErrorMessageComponent`
@@ -45,8 +87,10 @@ export interface UiError {
  * Converts a failed `HttpClient` response into a {@link UiError}.
  *
  * The rules apply in this order, and the first that matches decides:
- * 1. Status `0` (network failure, CORS rejection or the service down) gives the
- *    title "The service is unreachable." with no detail and no field errors.
+ * 1. Status `0` (network failure, CORS rejection, the service down, or a
+ *    request that passed its deadline under {@link withRequestDeadline}) gives
+ *    the title "The service is unreachable." with no detail and no field
+ *    errors.
  * 2. A response whose `Content-Type` media type, without parameters and
  *    ignoring case, is `application/problem+json` and whose body is a JSON
  *    object is read as ProblemDetails: a string `title` with non-whitespace

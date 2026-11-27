@@ -18,13 +18,17 @@
 #       Each file holds exactly the secret, with no trailing newline, made
 #       only of the characters A-Z a-z 0-9 . _ ~ + / = -
 #   DB_PASSWORD, Jwt__SigningKey
-#                            Kept as they are when already set and non-empty;
-#                            the matching file is then not read.
+#                            Kept exactly as they are whenever set, even to an
+#                            empty value; the matching file is then not read.
+#                            The API's startup validation rejects an empty
+#                            Jwt__SigningKey, and an empty DB_PASSWORD
+#                            whenever the connection string is assembled from
+#                            the DB_* parts.
 #   "$@"                     Arguments passed on to the API.
 #
 # Outputs
 #   DB_PASSWORD and Jwt__SigningKey, exported from the files when they were
-#   unset or empty. Then `exec dotnet SmartHotel.Api.dll "$@"` from the
+#   unset. Then `exec dotnet SmartHotel.Api.dll "$@"` from the
 #   image's working directory, /app: exec makes the API the container's main
 #   process, so `docker stop` signals reach it.
 #
@@ -90,10 +94,10 @@ export_secret_file() {
 }
 
 if [ -n "${SMARTHOTEL_SECRETS_DIR:-}" ]; then
-    if [ -z "${DB_PASSWORD:-}" ]; then
+    if [ -z "${DB_PASSWORD+set}" ]; then
         export_secret_file db_password DB_PASSWORD
     fi
-    if [ -z "${Jwt__SigningKey:-}" ]; then
+    if [ -z "${Jwt__SigningKey+set}" ]; then
         export_secret_file jwt_signing_key Jwt__SigningKey
     fi
 fi

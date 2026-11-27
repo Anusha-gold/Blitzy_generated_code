@@ -53,7 +53,8 @@ services:
       context: .
       dockerfile: src/SmartHotel.Api/Dockerfile
     # DB_PASSWORD and Jwt__SigningKey are deliberately absent: the image's
-    # entrypoint exports them from the secret files only when they are unset.
+    # entrypoint exports each from its secret file only when the variable is
+    # unset, and keeps a value set here, even an empty one.
     # Jwt__Issuer and Jwt__Audience come from appsettings.json.
     environment:
       ASPNETCORE_ENVIRONMENT: Development

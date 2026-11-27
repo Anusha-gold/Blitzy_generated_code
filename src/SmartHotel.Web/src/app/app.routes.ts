@@ -1,10 +1,6 @@
 import { Routes } from '@angular/router';
 
 import { authGuard } from './core/auth/auth.guard';
-import { LoginPageComponent } from './features/auth/login-page.component';
-import { RegisterPageComponent } from './features/auth/register-page.component';
-import { BookingsPageComponent } from './features/bookings/bookings-page.component';
-import { HotelDetailPageComponent } from './features/hotel-detail/hotel-detail-page.component';
 import { SearchPageComponent } from './features/search/search-page.component';
 
 /**
@@ -22,18 +18,40 @@ import { SearchPageComponent } from './features/search/search-page.component';
  * - `**`: every unknown URL redirects to `search`.
  *
  * Query parameters are not declared here: each page reads its own through
- * `ActivatedRoute`. Components are referenced eagerly, so the app ships as
- * one bundle.
+ * `ActivatedRoute`.
+ *
+ * Only the search page, the entry screen, is bundled eagerly. The other four
+ * pages are loaded through `loadComponent` on their first navigation, each as
+ * its own chunk. The router runs `authGuard` before it fetches the bookings
+ * chunk, so a guest without a live session never downloads that page.
  */
 export const routes: Routes = [
   { path: '', redirectTo: 'search', pathMatch: 'full' },
   { path: 'search', component: SearchPageComponent, title: 'Search · SmartHotel' },
-  { path: 'hotels/:id', component: HotelDetailPageComponent, title: 'Hotel · SmartHotel' },
-  { path: 'login', component: LoginPageComponent, title: 'Log in · SmartHotel' },
-  { path: 'register', component: RegisterPageComponent, title: 'Register · SmartHotel' },
+  {
+    path: 'hotels/:id',
+    loadComponent: () =>
+      import('./features/hotel-detail/hotel-detail-page.component').then(
+        (m) => m.HotelDetailPageComponent,
+      ),
+    title: 'Hotel · SmartHotel',
+  },
+  {
+    path: 'login',
+    loadComponent: () =>
+      import('./features/auth/login-page.component').then((m) => m.LoginPageComponent),
+    title: 'Log in · SmartHotel',
+  },
+  {
+    path: 'register',
+    loadComponent: () =>
+      import('./features/auth/register-page.component').then((m) => m.RegisterPageComponent),
+    title: 'Register · SmartHotel',
+  },
   {
     path: 'bookings',
-    component: BookingsPageComponent,
+    loadComponent: () =>
+      import('./features/bookings/bookings-page.component').then((m) => m.BookingsPageComponent),
     canActivate: [authGuard],
     title: 'My bookings · SmartHotel',
   },

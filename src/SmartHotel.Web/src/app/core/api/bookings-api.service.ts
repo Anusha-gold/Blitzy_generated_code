@@ -3,6 +3,7 @@ import { HttpClient } from '@angular/common/http';
 import type { Observable } from 'rxjs';
 
 import { API_CONFIG } from '../config/runtime-config';
+import { withRequestDeadline } from '../http/problem-details';
 import type { Booking, CreateBookingRequest } from './models';
 
 /**
@@ -23,10 +24,17 @@ import type { Booking, CreateBookingRequest } from './models';
  * ({@link BookingsApiService.cancel}) stay on their page and show the 401
  * inline with a "Log in again" link.
  *
- * The returned observables are the raw `HttpClient` requests: pages map their
- * errors through `toUiError`, and nothing here retries, caches, transforms or
- * logs them. `create` above all is never retried, because a repeated POST
- * could book a second room, and the server's 409 must reach the guest.
+ * Each request is bounded by `REQUEST_DEADLINE_MS` through
+ * {@link withRequestDeadline}: one with no response by then is aborted and
+ * fails as a status-0 `HttpErrorResponse`, which `toUiError` shows as "The
+ * service is unreachable.". Apart from that deadline the returned observables
+ * are the `HttpClient` requests unchanged: pages map their errors through
+ * `toUiError`, and nothing here retries, caches, transforms or logs them.
+ * `create` above all is never retried, because a repeated POST could book a
+ * second room, and the server's 409 must reach the guest. A timed-out `create`
+ * or `cancel` is never re-sent either: aborting stops only the wait, so the
+ * server may already have applied it, and {@link BookingsApiService.list}
+ * reports the actual outcome.
  */
 @Injectable({ providedIn: 'root' })
 export class BookingsApiService {
@@ -52,6 +60,10 @@ export class BookingsApiService {
    *   to another hotel;
    * - 409 when no room of that type is free for the dates.
    *
+   * A request with no response within `REQUEST_DEADLINE_MS` is aborted and
+   * fails with status 0. The booking may still have been created, and the
+   * request is not re-sent.
+   *
    * @param req - The hotel, room type, stay and party size, as the page holds
    *   them. Only these five members are copied into the body, so a caller's
    *   wider object never adds a field. The body carries no amount: the server
@@ -67,7 +79,8 @@ export class BookingsApiService {
       checkOut: req.checkOut,
       guests: req.guests,
     };
-    return this.http.post<Booking>(`${this.config.apiBaseUrl}/bookings`, body);
+    const url = `${this.config.apiBaseUrl}/bookings`;
+    return this.http.post<Booking>(url, body).pipe(withRequestDeadline(url));
   }
 
   /**
@@ -79,12 +92,14 @@ export class BookingsApiService {
    * guest has no bookings.
    *
    * Error: 401, as `application/problem+json`, when the bearer token is
-   * missing, invalid or expired.
+   * missing, invalid or expired. A request with no response within
+   * `REQUEST_DEADLINE_MS` is aborted and fails with status 0.
    *
    * @returns The 200 body: the caller's bookings, in server order.
    */
   list(): Observable<Booking[]> {
-    return this.http.get<Booking[]>(`${this.config.apiBaseUrl}/bookings`);
+    const url = `${this.config.apiBaseUrl}/bookings`;
+    return this.http.get<Booking[]>(url).pipe(withRequestDeadline(url));
   }
 
   /**
@@ -102,10 +117,15 @@ export class BookingsApiService {
    * - 409 when the booking is already cancelled, or its check-in date is
    *   before today (UTC).
    *
+   * A request with no response within `REQUEST_DEADLINE_MS` is aborted and
+   * fails with status 0. The booking may still have been cancelled, and the
+   * request is not re-sent.
+   *
    * @param id - The booking's id, {@link Booking.id}.
    * @returns Emits once when the 204 arrives, carrying no body, then completes.
    */
   cancel(id: number): Observable<void> {
-    return this.http.delete<void>(`${this.config.apiBaseUrl}/bookings/${id}`);
+    const url = `${this.config.apiBaseUrl}/bookings/${id}`;
+    return this.http.delete<void>(url).pipe(withRequestDeadline(url));
   }
 }

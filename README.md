@@ -391,7 +391,7 @@ The API reads secrets only from process environment variables, never from `appse
 | API | `Kestrel__Certificates__Default__Path` | Path of the TLS certificate file | No |
 | API | `Kestrel__Certificates__Default__Password` | The certificate's password | Yes |
 | API | `ConnectionStrings__SmartHotel` | A full Npgsql connection string, used whole when set | Yes, it holds the password |
-| API | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | The connection string's parts, used when `ConnectionStrings__SmartHotel` is unset. `DB_PORT` defaults to `5432`. | `DB_PASSWORD` only |
+| API | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | The connection string's parts, used when `ConnectionStrings__SmartHotel` is unset. `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASSWORD` must then be set and not blank; `DB_PORT` defaults to `5432`. The assembled string caps the connection pool at 50. | `DB_PASSWORD` only |
 | API | `Jwt__SigningKey` | At least 32 bytes in UTF-8 | Yes |
 | API | `Cors__AllowedOrigin` | `https://<web origin>`, a bare origin with no path and no trailing slash | No |
 | API | `Jwt__Issuer`, `Jwt__Audience` | Optional. The defaults are `SmartHotel.Api` and `SmartHotel.Web`, from `appsettings.json`. | No |
