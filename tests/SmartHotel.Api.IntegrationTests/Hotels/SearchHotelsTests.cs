@@ -63,6 +63,8 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
     [InlineData("stay-31-nights", "checkOut")]
     [InlineData("city-missing", "city")]
     [InlineData("city-blank", "city")]
+    [InlineData("city-feff-blank", "city")]
+    [InlineData("city-white-space-and-feff-blank", "city")]
     [InlineData("city-too-long", "city")]
     [InlineData("city-too-long-outside-bmp", "city")]
     [InlineData("guests-zero", "guests")]
@@ -117,6 +119,17 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
         Assert.True(
             forTwo.SequenceEqual(lowerCase),
             "Expected the lower-case search to list the same hotels, in the same order, as the stored-case search.");
+
+        // White space and U+FEFF around the city are padding in any mix, so the padded city finds the same hotels.
+        // string.Trim cannot derive this city: it keeps U+FEFF, which char.IsWhiteSpace does not count, and the
+        // \uFEFFSeattle\uFEFF it would leave matches no stored city.
+        IReadOnlyList<ApiTestClient.HotelSummary> padded =
+            await SearchOkAsync(" \uFEFFSeattle\uFEFF ", checkIn, checkOut, 2, cancellationToken);
+        AssertSeattleHotels(padded, downtownId, downtownAddress, 129.00m, waterfrontId, waterfrontAddress, 139.00m);
+        Assert.True(
+            forTwo.SequenceEqual(padded),
+            "Expected the search padded with white space and U+FEFF to list the same hotels, in the same order, as the "
+            + "unpadded search.");
     }
 
     [Fact]
@@ -410,6 +423,11 @@ public sealed class SearchHotelsTests : IClassFixture<SmartHotelApiFactory>
                 BaselineGuests),
             "city-missing" => (null, checkIn, checkOut, BaselineGuests),
             "city-blank" => ("   ", checkIn, checkOut, BaselineGuests),
+
+            // Sent as %EF%BB%BF. U+FEFF is not white space to string.IsNullOrWhiteSpace or string.Trim, but a browser's
+            // String.prototype.trim strips it, so a city of U+FEFF alone, or of U+FEFF and white space, is blank too.
+            "city-feff-blank" => ("\uFEFF", checkIn, checkOut, BaselineGuests),
+            "city-white-space-and-feff-blank" => (" \uFEFF ", checkIn, checkOut, BaselineGuests),
             "city-too-long" => (new string('a', 101), checkIn, checkOut, BaselineGuests),
             "city-too-long-outside-bmp" => (OutsideBmpCity(101), checkIn, checkOut, BaselineGuests),
             "guests-zero" => (BaselineCity, checkIn, checkOut, "0"),

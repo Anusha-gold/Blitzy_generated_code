@@ -63,8 +63,8 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
     /// </description></item>
     /// <item><description>
     /// 400 <see cref="ValidationProblemDetails"/>, from MVC before the action runs, keyed <c>city</c> when it is
-    /// missing, blank or longer than 100 characters, or <c>guests</c> when it is supplied but is blank, is not an
-    /// integer or is below 1.
+    /// missing, blank (only white space or U+FEFF) or longer than 100 characters, or <c>guests</c> when it is
+    /// supplied but is blank, is not an integer or is below 1.
     /// </description></item>
     /// <item><description>
     /// 400 <see cref="ValidationProblemDetails"/> keyed <c>checkIn</c> or <c>checkOut</c> when a date is missing or
@@ -74,9 +74,10 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
     /// </list>
     /// </remarks>
     /// <param name="city">
-    /// The city to search: required, not blank, at most 100 characters. Surrounding white space is ignored. The limit
-    /// counts Unicode scalar values, the characters PostgreSQL counts for <c>varchar(100)</c>, so a character outside
-    /// the Basic Multilingual Plane counts once.
+    /// The city to search: required, not blank, at most 100 characters. A city holding only white space or U+FEFF
+    /// (zero width no-break space) is blank, and surrounding white space and U+FEFF are ignored. The limit counts
+    /// Unicode scalar values, the characters PostgreSQL counts for <c>varchar(100)</c>, so a character outside the
+    /// Basic Multilingual Plane counts once.
     /// </param>
     /// <param name="checkIn">The check-in date, exactly <c>yyyy-MM-dd</c>, today (UTC) or later.</param>
     /// <param name="checkOut">
@@ -91,7 +92,7 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
     [HttpGet]
     public async Task<ActionResult<IReadOnlyList<HotelSummaryResponse>>> Search(
         [FromQuery]
-        [Required(ErrorMessage = "A value is required.")]
+        [RequiredCity(ErrorMessage = "A value is required.")]
         [MaxCharacters(100, ErrorMessage = "The value can be at most 100 characters.")]
         string? city,
         [FromQuery] string? checkIn,
@@ -110,10 +111,10 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
             return this.BadRequestProblem(errors);
         }
 
-        // [Required] has already rejected a missing or blank city. Only the surrounding white space is removed here:
-        // the availability query folds the city with the database's lower(), the function the lower("City") index is
-        // built on, so the requested and the stored city are folded by the same rules.
-        string normalizedCity = city!.Trim();
+        // [RequiredCity] has already rejected a missing or blank city. Only the surrounding white space and U+FEFF are
+        // removed here: the availability query folds the city with the database's lower(), the function the
+        // lower("City") index is built on, so the requested and the stored city are folded by the same rules.
+        string normalizedCity = TrimCity(city!);
         IReadOnlyList<HotelSummaryResponse> hotels = await hotelQueryService.SearchAsync(
             new HotelSearchQuery(normalizedCity, period, guests ?? DefaultGuests),
             cancellationToken);
@@ -180,6 +181,46 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
         return detail is null
             ? this.NotFoundProblem("Hotel not found", "No hotel matches the requested id.")
             : Ok(detail);
+    }
+
+    /// <summary>
+    /// Trims a city into the form the search looks up: every leading and trailing white-space character and U+FEFF
+    /// (zero width no-break space) removed, in any mix. The characters between them are kept as supplied.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="string.Trim()"/> keeps U+FEFF, because <see cref="char.IsWhiteSpace(char)"/> does not count it, but a
+    /// browser client's <c>String.prototype.trim</c> strips it, so a city made only of such characters reads as empty
+    /// there. The rule is the one the API applies when it decides whether problem text is blank.
+    /// </remarks>
+    /// <param name="city">The city as supplied.</param>
+    /// <returns>
+    /// <paramref name="city"/> without its leading and trailing padding; empty when it holds nothing else.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="city"/> is <see langword="null"/>.</exception>
+    private static string TrimCity(string city)
+    {
+        ArgumentNullException.ThrowIfNull(city);
+
+        int start = 0;
+        while (start < city.Length && IsCityPadding(city[start]))
+        {
+            start++;
+        }
+
+        int end = city.Length;
+        while (end > start && IsCityPadding(city[end - 1]))
+        {
+            end--;
+        }
+
+        return city[start..end];
+    }
+
+    // Neither test matches half of a surrogate pair, so trimming never splits a character outside the Basic
+    // Multilingual Plane.
+    private static bool IsCityPadding(char character)
+    {
+        return char.IsWhiteSpace(character) || character == '\uFEFF';
     }
 
     /// <summary>
@@ -259,6 +300,33 @@ public sealed class HotelsController(HotelQueryService hotelQueryService, TimePr
             }
 
             return !value.IsEmpty && !value.ContainsAnyExceptInRange('0', '9');
+        }
+    }
+
+    /// <summary>
+    /// Requires a city that is not blank: <see langword="null"/> is invalid, and so is a string that is empty once
+    /// <see cref="TrimCity(string)"/> removes its surrounding white space and U+FEFF.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RequiredAttribute"/> alone counts only white space as blank: <see cref="char.IsWhiteSpace(char)"/>
+    /// does not count U+FEFF, so a city made of white space and U+FEFF alone, a lone U+FEFF included, would pass it
+    /// and be searched as a city that matches nothing, although a browser client's <c>String.prototype.trim</c> strips
+    /// U+FEFF and reads such a city as empty. Deriving from <see cref="RequiredAttribute"/> keeps the parameter marked
+    /// required in MVC's metadata, so an omitted city is still validated, and a blank city gets this attribute's one
+    /// message.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Parameter)]
+    private sealed class RequiredCityAttribute : RequiredAttribute
+    {
+        public override bool IsValid(object? value)
+        {
+            return value switch
+            {
+                null => false,
+                string text => TrimCity(text).Length != 0,
+                _ => throw new InvalidOperationException(
+                    $"{nameof(RequiredCityAttribute)} validates only strings, not {value.GetType().Name}."),
+            };
         }
     }
 

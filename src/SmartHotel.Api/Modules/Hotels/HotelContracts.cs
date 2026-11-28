@@ -10,7 +10,7 @@ namespace SmartHotel.Api.Modules.Hotels;
 /// parameter has passed its checks.
 /// </summary>
 /// <param name="NormalizedCity">
-/// The requested city, trimmed of surrounding white space and not case-folded. A hotel matches when
+/// The requested city, trimmed of surrounding white space and U+FEFF and not case-folded. A hotel matches when
 /// <c>lower("City")</c> equals the database's <c>lower</c> of this value, so both are folded by the same function
 /// under the database's collation and the search ignores letter case.
 /// </param>
