@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json.Serialization;
@@ -37,9 +39,13 @@ WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 // every other key keeps its usual precedence. A password therefore comes from Kestrel__Certificates__Default__Password
 // or its endpoint forms alone, and no application code looks it up. The delegate runs when Kestrel's options are
 // created after Build(), replaces the default configuration loader, and leaves loading the certificate to Kestrel.
-builder.WebHost.ConfigureKestrel(static (context, kestrel) => kestrel.Configure(
-    KestrelConfigurationView.Create(context.Configuration),
-    reloadOnChange: true));
+// No response carries a Server header, not even the server's own rejections: the header would name the implementation
+// to every client and tell none of them anything it needs.
+builder.WebHost.ConfigureKestrel(static (context, kestrel) =>
+{
+    kestrel.AddServerHeader = false;
+    kestrel.Configure(KestrelConfigurationView.Create(context.Configuration), reloadOnChange: true);
+});
 
 // The one clock: today's UTC date, CreatedAt and the token times all come from it.
 builder.Services.AddSingleton(TimeProvider.System);
@@ -218,6 +224,18 @@ CollectStartupFailure(startupFailures, () =>
 });
 CollectStartupFailure(startupFailures, () => app.Services.GetRequiredService<IOptions<JwtOptions>>().Value);
 CollectStartupFailure(startupFailures, () => app.Services.GetRequiredService<IOptions<ApiCorsOptions>>().Value);
+
+// Outside Development, the hosts a plaintext request may be redirected to HTTPS from. Development serves plain HTTP
+// and never redirects, so it neither reads nor checks the setting.
+const string RedirectHostsSetting = "HttpsRedirection:AllowedHosts";
+HashSet<string> redirectHosts = [];
+if (!app.Environment.IsDevelopment())
+{
+    CollectStartupFailure(
+        startupFailures,
+        () => redirectHosts = ReadRedirectHosts(app.Configuration[RedirectHostsSetting]));
+}
+
 if (startupFailures.Count > 0)
 {
     throw new AggregateException("The API configuration is invalid.", startupFailures);
@@ -239,6 +257,57 @@ static void CollectStartupFailure(List<Exception> failures, Func<object?> read)
     }
 }
 
+// HttpsRedirection:AllowedHosts lists exact host names or IP addresses separated by ';', compared without regard to
+// case with the host of a request's Host header, which keeps an IPv6 address in its brackets. Entries are trimmed and
+// empty ones ignored, so an unset or blank value lists none. An entry is a host alone: Uri.CheckHostName rejects one
+// that carries a wildcard, a scheme, a port or a path, and an IPv6 entry must be a bracketed address literal, as
+// IsBracketedIPv6Address checks, because Uri.CheckHostName also takes a prefix length or a zone after the address and
+// an IPv6 address without brackets would never equal a request's host. The message names the setting and never its
+// value.
+static HashSet<string> ReadRedirectHosts(string? value)
+{
+    HashSet<string> hosts = new(StringComparer.OrdinalIgnoreCase);
+    string[] entries = (value ?? string.Empty).Split(
+        ';',
+        StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    foreach (string entry in entries)
+    {
+        bool isHost = Uri.CheckHostName(entry) switch
+        {
+            UriHostNameType.Dns or UriHostNameType.IPv4 => true,
+            UriHostNameType.IPv6 => IsBracketedIPv6Address(entry),
+            _ => false,
+        };
+        if (!isHost)
+        {
+            throw new InvalidOperationException(
+                "HttpsRedirection__AllowedHosts (HttpsRedirection:AllowedHosts) must list host names or IP addresses "
+                + "separated by ';', each without a scheme, a port, a path or a wildcard, and an IPv6 address in "
+                + "brackets.");
+        }
+
+        hosts.Add(entry);
+    }
+
+    return hosts;
+}
+
+// An IPv6 entry is '[', a complete IPv6 address and ']', and nothing else, which is how a Host header writes one. The
+// address holds only hexadecimal digits, ':' and the '.' of an embedded IPv4 tail, because IPAddress.TryParse would
+// also take a zone such as '%eth0' after it, which a Host header never carries.
+static bool IsBracketedIPv6Address(string entry)
+{
+    if (entry.Length < 2 || entry[0] != '[' || entry[^1] != ']')
+    {
+        return false;
+    }
+
+    string address = entry[1..^1];
+    return address.All(static character => char.IsAsciiHexDigit(character) || character is ':' or '.')
+        && IPAddress.TryParse(address, out IPAddress? parsed)
+        && parsed.AddressFamily == AddressFamily.InterNetworkV6;
+}
+
 // The exception handler is the first middleware added here, so it catches an exception before the Development
 // exception page that WebApplication wraps around the pipeline, and no stack trace reaches the response. Routing is
 // added explicitly after it and the status-code pages: left implicit, WebApplication would run endpoint matching
@@ -246,35 +315,51 @@ static void CollectStartupFailure(List<Exception> failures, Func<object?> read)
 app.UseExceptionHandler();
 app.UseStatusCodePages();
 
+// Every response tells the browser not to read its body as another media type and not to render it in a frame. The
+// fields are set as the response starts, so they also reach a failed response that the exception handler reset and
+// the problems the status-code pages write, and they sit beside every other field, WWW-Authenticate, Allow and the
+// CORS grant included. The server's own rejections never reach this pipeline and get the same fields where they are
+// rewritten.
+app.Use(static (context, next) =>
+{
+    context.Response.OnStarting(
+        static state =>
+        {
+            IHeaderDictionary headers = ((HttpResponse)state).Headers;
+            foreach (KeyValuePair<string, string> header in ProblemDetailsSetup.ResponseSecurityHeaders)
+            {
+                headers[header.Key] = header.Value;
+            }
+
+            return Task.CompletedTask;
+        },
+        context.Response);
+    return next(context);
+});
+
 if (!app.Environment.IsDevelopment())
 {
     app.UseHsts();
+
+    // HTTPS redirection builds its Location from the request's own Host header, which any client chooses, so it is
+    // reached only by a plaintext request whose host HttpsRedirection:AllowedHosts lists; the port is not compared,
+    // because redirection replaces it. Every other plaintext request is refused here and never redirected, so no
+    // Location ever points at a host the operator did not name.
+    app.Use((context, next) =>
+        context.Request.IsHttps || redirectHosts.Contains(context.Request.Host.Host)
+            ? next(context)
+            : RefusePlaintextAsync(context));
     app.UseHttpsRedirection();
 
     // UseHttpsRedirection only logs a warning and passes a request on when it finds no HTTPS port to redirect to, so a
-    // plaintext request that reaches this point is one it could not redirect. It is refused here, before CORS and
-    // authentication, so a password or a bearer token sent over cleartext is never processed. (With several HTTPS
-    // ports and no HTTPS_PORT setting, redirection throws instead, and the exception handler answers 500 before
-    // anything else runs.) The writer adds the shared problem defaults; nothing from the request is copied into the
-    // body.
-    app.Use(static async (context, next) =>
-    {
-        if (context.Request.IsHttps)
-        {
-            await next(context);
-            return;
-        }
+    // plaintext request that reaches this point is one from a listed host it could not redirect. It is refused as
+    // well. Both refusals come before CORS and authentication, so a password or a bearer token sent over cleartext is
+    // never processed. (With several HTTPS ports and no HTTPS_PORT setting, redirection throws instead, and the
+    // exception handler answers 500 before anything else runs.)
+    app.Use(static (context, next) => context.Request.IsHttps ? next(context) : RefusePlaintextAsync(context));
 
-        context.Response.StatusCode = StatusCodes.Status403Forbidden;
-        await context.RequestServices.GetRequiredService<IProblemDetailsService>().WriteAsync(new ProblemDetailsContext
-        {
-            HttpContext = context,
-            ProblemDetails = { Detail = "This API accepts HTTPS requests only." },
-        });
-    });
-
-    // Kestrel publishes the addresses it bound once it listens. With no HTTPS address among them the guard above would
-    // refuse every request, so the process stops with exit code 1 and names the settings to supply, never their
+    // Kestrel publishes the addresses it bound once it listens. With no HTTPS address among them the refusals above
+    // would answer every request, so the process stops with exit code 1 and names the settings to supply, never their
     // values. A server without network listeners, such as the in-process test server, publishes no addresses and is
     // not checked.
     app.Lifetime.ApplicationStarted.Register(() =>
@@ -297,6 +382,18 @@ if (!app.Environment.IsDevelopment())
             + "for an endpoint's own certificate.");
         Environment.ExitCode = 1;
         app.Lifetime.StopApplication();
+    });
+}
+
+// The answer to a plaintext request outside Development: a 403 problem with a fixed detail. The writer adds the shared
+// problem defaults; nothing from the request, its host included, is copied into the body or a header.
+static async Task RefusePlaintextAsync(HttpContext context)
+{
+    context.Response.StatusCode = StatusCodes.Status403Forbidden;
+    await context.RequestServices.GetRequiredService<IProblemDetailsService>().WriteAsync(new ProblemDetailsContext
+    {
+        HttpContext = context,
+        ProblemDetails = { Detail = "This API accepts HTTPS requests only." },
     });
 }
 

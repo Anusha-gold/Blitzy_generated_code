@@ -7,8 +7,11 @@
  * - `playwright.config.ts` resolves the target with {@link resolveStackTarget},
  *   sets `use.baseURL` and writes the pair into `E2E_BASE_URL` and
  *   `E2E_API_URL`, so every spec and worker reads the same target.
- * - `e2e/global-setup.ts` builds the stack with {@link composeArgs} and
- *   {@link composeEnvironment}, from the root {@link findRepositoryRoot} finds.
+ * - `e2e/global-setup.ts` asks the docker CLI which Docker daemon it selects
+ *   with {@link DOCKER_ENDPOINT_QUERY_ARGS}, then builds the stack with
+ *   {@link composeArgs}, which accepts only the local endpoint
+ *   {@link localDockerEndpoint} validates, and {@link composeEnvironment},
+ *   from the root {@link findRepositoryRoot} finds.
  * - `e2e/support/helpers.ts` falls back to {@link resolveStackTarget} for the
  *   API URL.
  *
@@ -192,11 +195,11 @@ function canonicalReuseUrl(
  * Tells whether the run reuses an already running stack instead of building
  * the acceptance stack.
  *
- * `E2E_REUSE_STACK` accepts exactly the string `1`. Every other value is
- * rejected rather than read as "not reuse mode", because a fresh run removes
- * and rebuilds the acceptance stack: a mistyped value such as `true`, `yes`,
- * ` 1` or `0` must stop the run before any Compose call instead of silently
- * selecting that destructive path.
+ * Unset or empty `E2E_REUSE_STACK` selects fresh mode; exactly `1` selects
+ * reuse mode. Any other value, such as `true`, `yes`, ` 1` or `0`, throws
+ * before any Compose call rather than being read as fresh mode, because a
+ * fresh run removes and rebuilds the acceptance stack: a mistyped value must
+ * stop the run, never silently select that destructive path.
  *
  * @param env - The environment to read; defaults to `process.env`.
  * @returns `true` when `E2E_REUSE_STACK` is exactly `1`; `false` when it is
@@ -299,9 +302,128 @@ export function findRepositoryRoot(startDir: string = __dirname): string {
 }
 
 /**
+ * The `docker` arguments that ask the CLI which Docker daemon it selects.
+ * `docker context inspect` with no context name inspects the context the CLI
+ * selects: the endpoint `DOCKER_HOST` names when it is set, else the context
+ * `DOCKER_CONTEXT` names, else the configured current context. With this
+ * format it prints only that context's Docker endpoint, such as
+ * `unix:///var/run/docker.sock`, on one line. It reads the CLI's
+ * configuration only and contacts no daemon.
+ */
+export const DOCKER_ENDPOINT_QUERY_ARGS = ['context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'];
+
+/** The longest unix socket path, in characters, {@link localDockerEndpoint} accepts. */
+const MAX_SOCKET_PATH_LENGTH = 4096;
+
+/**
+ * A unix socket endpoint whose path, captured, is absolute and holds no
+ * control character (C0, DEL or C1). {@link localDockerEndpoint} bounds the
+ * path's length separately, in UTF-16 code units.
+ */
+const UNIX_SOCKET_ENDPOINT = /^unix:\/\/(\/\P{Cc}+)$/u;
+
+/**
+ * A named pipe on this computer (`.`), whose name is ASCII letters, digits,
+ * `_`, `.` and `-`, such as Docker Desktop's `npipe:////./pipe/docker_engine`.
+ */
+const LOCAL_NAMED_PIPE_ENDPOINT = /^npipe:\/\/\/\/\.\/pipe\/[A-Za-z0-9_.-]+$/;
+
+/**
+ * Names, in fixed words, the kind of Docker endpoint {@link localDockerEndpoint}
+ * refuses, so its message never repeats the endpoint, which can carry a user
+ * name or a host.
+ *
+ * @param endpoint - The refused endpoint, without its trailing line break.
+ * @returns A phrase such as `a TCP endpoint, which can be another machine`.
+ */
+function describeRefusedEndpoint(endpoint: string): string {
+  if (endpoint === '') {
+    return 'no endpoint';
+  }
+  if (/[\r\n]/.test(endpoint)) {
+    return 'more than one line instead of one endpoint';
+  }
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(endpoint)?.[1].toLowerCase();
+  switch (scheme) {
+    case 'tcp':
+      return 'a TCP endpoint, which can be another machine';
+    case 'http':
+    case 'https':
+      return 'an HTTP endpoint, which can be another machine';
+    case 'ssh':
+      return 'an SSH endpoint, which is another machine';
+    case 'fd':
+      return 'an inherited socket endpoint (fd://), which cannot be shown to be on this machine';
+    case 'npipe':
+      return 'a named pipe on another computer, or not in the local form npipe:////./pipe/<name>';
+    case 'unix':
+      return `a unix socket whose path is not an absolute path of at most ${MAX_SOCKET_PATH_LENGTH} characters without control characters`;
+    default:
+      return 'an endpoint that is neither a local unix socket nor a local Windows named pipe';
+  }
+}
+
+/**
+ * Validates the Docker endpoint the docker CLI reported for
+ * {@link DOCKER_ENDPOINT_QUERY_ARGS} and returns it when it is a daemon on
+ * this machine. One trailing line break (LF or CR LF) is removed first; the
+ * rest must be one line and one of:
+ *
+ * - `unix://` followed by an absolute path (starting with `/`) of at most
+ *   4096 characters with no control character (C0, DEL or C1);
+ * - a local Windows named pipe, `npipe:////./pipe/<name>`, whose name is ASCII
+ *   letters, digits, `_`, `.` and `-`.
+ *
+ * Everything else is refused, failing closed: `tcp://`, `http://`, `https://`,
+ * `ssh://` and `fd://` endpoints, a named pipe on another computer such as
+ * `npipe:////server/pipe/docker_engine`, a relative socket path, an empty
+ * reply, several lines and anything unrecognized. The acceptance run removes
+ * and rebuilds the `smarthotel-acceptance` project with its volumes and
+ * reaches the stack on this machine's `127.0.0.1` ports, so it runs only
+ * against this machine's Docker daemon.
+ *
+ * Trust boundary: no API proves where a daemon runs, so a unix socket or
+ * named pipe on this machine is trusted as this machine's Docker daemon,
+ * Docker Engine's, rootless Docker's or Docker Desktop's, whose published
+ * `127.0.0.1` ports reach this host. This check cannot tell whether such a
+ * socket forwards to another machine, as an SSH-forwarded socket does, so
+ * `DOCKER_HOST` or a context must never point at one.
+ *
+ * @param reported - What the docker CLI printed on stdout.
+ * @returns The accepted endpoint, without its trailing line break.
+ * @throws Error naming the kind of endpoint refused, why the run needs a local
+ *   daemon and how to select one. The message never holds the endpoint or any
+ *   part of it, because it can carry a user name or a host.
+ */
+export function localDockerEndpoint(reported: string): string {
+  const endpoint = reported.replace(/\r?\n$/, '');
+  const socketPath = UNIX_SOCKET_ENDPOINT.exec(endpoint)?.[1];
+  if (
+    (socketPath !== undefined && socketPath.length <= MAX_SOCKET_PATH_LENGTH) ||
+    LOCAL_NAMED_PIPE_ENDPOINT.test(endpoint)
+  ) {
+    return endpoint;
+  }
+  throw new Error(
+    `Refusing the Docker daemon the docker CLI selects: it reports ${describeRefusedEndpoint(endpoint)}. ` +
+      `The acceptance run removes and rebuilds the ${ACCEPTANCE_PROJECT} project and its volumes and reaches the stack on this machine's 127.0.0.1 ports, ` +
+      'so it runs only against this machine\'s Docker daemon, through a local unix socket (unix:///<path>) or a local Windows named pipe (npipe:////./pipe/<name>). ' +
+      'Unset DOCKER_HOST or DOCKER_CONTEXT, or switch with `docker context use` to a local context such as `default` or Docker Desktop\'s, then run the tests again. ' +
+      'The endpoint is not shown.',
+  );
+}
+
+/**
  * Builds the `docker` arguments for a Compose command on the acceptance
  * project, with the global options ahead of the subcommand:
  *
+ * - `--host <endpoint>`, a `docker` option placed before `compose`, names the
+ *   Docker daemon: the endpoint the CLI reported for
+ *   {@link DOCKER_ENDPOINT_QUERY_ARGS}, validated here by
+ *   {@link localDockerEndpoint}, so no argument list for a daemon that is not
+ *   local can be built. The CLI ranks `--host` above `DOCKER_HOST`,
+ *   `DOCKER_CONTEXT` and the current context, so every Compose call of a run
+ *   acts on the same daemon.
  * - `-p smarthotel-acceptance` selects the dedicated project.
  * - `-f <root>/docker-compose.yml` names the file explicitly, which also stops
  *   Compose from merging a `docker-compose.override.yml`.
@@ -312,14 +434,21 @@ export function findRepositoryRoot(startDir: string = __dirname): string {
  *   lookup with an intentionally empty file, so a developer's `.env` and its
  *   `SMARTHOTEL_*` overrides are never read.
  *
- * Example: `composeArgs(root, 'up', '-d', '--build', '--force-recreate', '--wait')`.
+ * Example:
+ * `composeArgs('unix:///var/run/docker.sock', root, 'up', '-d', '--build', '--force-recreate', '--wait')`.
  *
+ * @param endpoint - The Docker endpoint the docker CLI reported for
+ *   {@link DOCKER_ENDPOINT_QUERY_ARGS}.
  * @param root - The repository root, as {@link findRepositoryRoot} returns it.
  * @param args - The Compose subcommand and its own arguments.
  * @returns The full argument list for `docker`.
+ * @throws Error when `endpoint` is not a local unix socket or local Windows
+ *   named pipe, as {@link localDockerEndpoint} reports it.
  */
-export function composeArgs(root: string, ...args: string[]): string[] {
+export function composeArgs(endpoint: string, root: string, ...args: string[]): string[] {
   return [
+    '--host',
+    localDockerEndpoint(endpoint),
     'compose',
     '-p',
     ACCEPTANCE_PROJECT,
@@ -343,8 +472,12 @@ export function composeArgs(root: string, ...args: string[]): string[] {
  * As a result no profile is enabled, so `db-test` never starts; no first-start
  * override (`SMARTHOTEL_DB_PASSWORD`, `SMARTHOTEL_JWT_SIGNING_KEY`) leaks in,
  * so the stack generates fresh secrets; and nothing selects another project or
- * file. Every other variable, `PATH` and `DOCKER_HOST` included, passes
- * through unchanged, so the Docker CLI still works.
+ * file. Every other variable, `PATH`, `DOCKER_HOST` and `DOCKER_CONTEXT`
+ * included, passes through unchanged, so the Docker CLI still works.
+ * `DOCKER_HOST` and `DOCKER_CONTEXT` only decide which endpoint
+ * {@link DOCKER_ENDPOINT_QUERY_ARGS} reports: every Compose call then names
+ * that endpoint with `--host` ({@link composeArgs}), which the CLI ranks above
+ * both.
  *
  * @param env - The environment to start from; defaults to `process.env`.
  * @returns The filtered environment with the two acceptance ports set.

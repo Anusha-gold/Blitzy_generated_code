@@ -28,18 +28,17 @@ import { SearchPageComponent } from './features/search/search-page.component';
  *   a same-URL one included, so nav "My bookings" clicked on the open page
  *   after the session ended redirects to login, and with a live session the
  *   page reloads its list.
- * - `**`: every unknown URL redirects to `search`.
+ * - `**`: every unknown URL redirects to `search`. No route has a named
+ *   outlet, so the app's URL serializer reads parentheses in a path as path
+ *   data, and `/search(x)` is an unknown URL too.
  *
  * Query parameters are not declared here: each page reads its own through
  * `ActivatedRoute`.
  *
- * Only the search page, the entry screen, is bundled eagerly. The other four
- * pages are loaded through `loadComponent` on their first navigation. The
- * router runs `authGuard` before it activates the bookings route, so a guest
- * without a live session never sees that page. The guard does not keep the
- * bookings page's code from loading: the hotel detail page imports its
- * confirmation handoff helper, `bookingConfirmationState`, from the bookings
- * page module, so that module also loads with the hotel detail page.
+ * Search, the entry screen, is eager; the other routes use `loadComponent`.
+ * Hotel detail may also load the bookings page module, for its confirmation
+ * helper `bookingConfirmationState`. `authGuard` controls activation of the
+ * bookings route, not the download of its code.
  */
 export const routes: Routes = [
   { path: '', redirectTo: 'search', pathMatch: 'full' },

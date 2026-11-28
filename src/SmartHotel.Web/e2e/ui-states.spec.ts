@@ -11,10 +11,11 @@
  * notice, or, when the browser throws on that redirect's history update,
  * stays open with the 401 inline and a "Log in again" back to the list. An
  * action, "Book" or "Cancel", stays on its page with the 401 inline. The
- * remaining tests cover related page states, such as the auth pages, URL
- * criteria, late answers, the request deadline, a request that fails with
- * no HTTP response, a 5xx problem body shown only as generic text, and
- * unusable response bodies and success statuses.
+ * remaining tests cover related page states, such as the auth pages and the
+ * return URLs the login page refuses or keeps, URL criteria, late answers,
+ * the request deadline, a request that fails with no HTTP response, a 5xx
+ * problem body shown only as generic text, and unusable response bodies and
+ * success statuses.
  *
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory. Every guest is registered
@@ -411,11 +412,40 @@ const GUESTS_INTEGER_MESSAGE = 'The value must be a whole number of at least 1.'
 const BARE_SEARCH_LINKS: readonly string[] = ['nav-brand', 'nav-search'];
 
 /**
- * Return URLs whose primary route is the login page itself, each written a
- * different way, one test each. A login must land on `/search` for every one,
- * never on the login page again.
+ * Return URLs the login page refuses, one test each: a login must land on
+ * `/search` for every one. The first four lead to the login page itself, each
+ * written a different way, which a guest now signed in must never see again.
+ * The rest are unsafe, or read differently by the router and a browser: an
+ * encoded leading `//`, `/` or `\`, which a decoding reader would take for a
+ * URL to another host; an encoded `//` and a raw `\` inside a hotel id; a raw
+ * tab, which a browser strips; an empty segment, where the router stops
+ * reading and drops the rest; a malformed percent escape, which the router
+ * cannot parse; a matrix parameter and a query parameter with an empty name,
+ * where the router also stops reading and drops the rest, so each would
+ * otherwise open My bookings; and an encoded and a raw dot segment as a hotel
+ * id, `%2e%2e` and `..`, which the router routes as segments but a browser
+ * resolves when the address is written, so the address bar would show another
+ * path than the one routed. Each hotel path would open a hotel page if it were
+ * followed.
  */
-const LOGIN_RETURN_URLS: readonly string[] = ['/login', '/login?reason=session-expired', '/login;a=1', '/%6Cogin'];
+const REFUSED_RETURN_URLS: readonly string[] = [
+  '/login',
+  '/login?reason=session-expired',
+  '/login;a=1',
+  '/%6Cogin',
+  '/%2F%2Fevil.example',
+  '/%2Fevil.example',
+  '/%5Cevil.example',
+  '/hotels/%2F%2Fevil.example',
+  '/hotels/1\\evil.example',
+  '/hotels/\t1',
+  '/hotels/1//evil.example',
+  '/%E0%A4%A',
+  '/bookings;=%ZZ',
+  '/bookings?=x',
+  '/hotels/%2e%2e',
+  '/hotels/..',
+];
 
 /**
  * Records, from now on, every request the page sends to a hotel detail path,
@@ -1549,7 +1579,8 @@ test('the hotel id NUL from the login return URL shows an inline 404 without a r
   const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
 
   // nginx rejects /hotels/%00 on a direct load, so the in-app navigation
-  // after login, which accepts any same-app path, is the way to reach it.
+  // after login, which keeps encoded path data that is no separator, is the
+  // way to reach it.
   const detailRequests = recordDetailRequests(page);
   await test.step('log in with a return URL to the hotel id %00', async () => {
     const [checkIn, checkOut] = utcDates(30, 32);
@@ -2203,11 +2234,14 @@ test('Back after logging in from a Book redirect does not show the login form', 
   });
 });
 
-for (const returnUrl of LOGIN_RETURN_URLS) {
-  test(`logging in with the return URL ${returnUrl} lands on the search page`, async ({ page }) => {
+for (const returnUrl of REFUSED_RETURN_URLS) {
+  // Quoted as a JSON string, so the tab and the backslash read plainly in the title.
+  test(`logging in with the refused return URL ${JSON.stringify(returnUrl)} lands on the search page`, async ({
+    page,
+  }) => {
     const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
 
-    await test.step('log in from a login URL whose return URL is the login page', async () => {
+    await test.step('log in from a login URL carrying the refused return URL', async () => {
       await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
       await logIn(page, email, password);
       await expect(page).toHaveURL('/search');
@@ -2216,6 +2250,31 @@ for (const returnUrl of LOGIN_RETURN_URLS) {
     });
   });
 }
+
+test('logging in with a return URL whose query holds encoded values lands there with the query intact', async ({
+  page,
+}) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+  // An encoded space, a non-ASCII letter and an encoded `/` and `\`: in a
+  // query value they are data, which the login page keeps as given.
+  const city = 'São Paulo/\\';
+  const [checkIn, checkOut] = utcDates(30, 32);
+  const returnUrl = `/search?city=${encodeURIComponent(city)}&checkIn=${checkIn}&checkOut=${checkOut}&guests=1`;
+
+  await test.step('log in from a login URL carrying that return URL', async () => {
+    await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(returnUrl);
+    expect(new URL(page.url()).searchParams.get('city')).toBe(city);
+  });
+
+  await test.step('the search runs for the decoded city and shows it in the form', async () => {
+    await expect(page.getByTestId('search-empty')).toHaveText(
+      `No hotels with available rooms in ${city} for these dates.`,
+    );
+    await expectControlValue(page, 'search-city', city);
+  });
+});
 
 test('Back to a login entry whose return URL is the login page moves on to search', async ({ page }) => {
   const { email, password } = await test.step('register a guest', () => registerNewGuest(page));

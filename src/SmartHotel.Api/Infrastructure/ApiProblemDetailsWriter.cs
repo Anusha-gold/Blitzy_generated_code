@@ -94,14 +94,15 @@ public sealed class ApiProblemDetailsWriter : IProblemDetailsWriter
     /// <remarks>
     /// <para>
     /// Kestrel answers such a request itself, with a status line and the header fields <c>Content-Length: 0</c>,
-    /// <c>Connection: close</c>, <c>Date</c> and <c>Server</c>, written in one flush, and it offers no hook for the
-    /// body. Before it writes that response, it reports the rejection as the diagnostic event
+    /// <c>Connection: close</c> and <c>Date</c>, written in one flush, and it offers no hook for the body. Before it
+    /// writes that response, it reports the rejection as the diagnostic event
     /// <c>Microsoft.AspNetCore.Server.Kestrel.BadRequest</c> on the host's <see cref="DiagnosticListener"/>, whose
     /// payload is the rejected request's features: the method the server parsed, if it parsed the request line, and
     /// the server's trace identifier for the request. The middleware subscribes to that one event and wraps the
     /// connection's transport. Each report arms the connection's writer, which holds back what the server writes next
     /// until the server flushes it. A recognized rejection is then replaced by the same status line, a
-    /// <c>Content-Type</c> and a <c>Content-Length</c> for the problem body, the other original header fields in their
+    /// <c>Content-Type</c> and a <c>Content-Length</c> for the problem body, the header fields every API response
+    /// carries (<see cref="ProblemDetailsSetup.ResponseSecurityHeaders"/>), the other original header fields in their
     /// order, and the body that <see cref="IProblemDetailsService"/> writes for that status and trace identifier,
     /// exactly as for any other error. The body is left out when the rejected request is a <c>HEAD</c> request.
     /// Anything else is sent exactly as written.
@@ -913,8 +914,9 @@ public sealed class ApiProblemDetailsWriter : IProblemDetailsWriter
             return status is >= 400 and <= 599;
         }
 
-        // The status line as written, then Content-Type and Content-Length for the problem, the kept fields in their
-        // order, the blank line and, unless the rejected request is a HEAD request, the body.
+        // The status line as written, then Content-Type and Content-Length for the problem, the fields every API
+        // response carries, the kept fields in their order, the blank line and, unless the rejected request is a HEAD
+        // request, the body.
         private static ReadOnlyMemory<byte> Compose(
             ReadOnlySpan<byte> written,
             int statusLineLength,
@@ -931,6 +933,18 @@ public sealed class ApiProblemDetailsWriter : IProblemDetailsWriter
             response.Write("Content-Length: "u8);
             WriteAscii(response, problem.Body.Length.ToString(CultureInfo.InvariantCulture));
             response.Write(LineEnd);
+
+            // The request pipeline sets these fields on each of its responses, and the server answers this request
+            // before any middleware runs, so they are written here, where the rejection is recomposed. The problem
+            // writer stays out of it: it sets only Content-Type and writes the body, so the protocol fields of every
+            // response it completes survive as they are.
+            foreach (KeyValuePair<string, string> header in ProblemDetailsSetup.ResponseSecurityHeaders)
+            {
+                WriteAscii(response, header.Key);
+                response.Write(": "u8);
+                WriteAscii(response, header.Value);
+                response.Write(LineEnd);
+            }
 
             foreach (Range header in keptHeaders)
             {

@@ -28,7 +28,11 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// <see cref="InitializeAsync"/> describes. A blank value counts as unset. Otherwise the fixture starts the
 /// repository's <c>db-test</c> Compose service, a passwordless server without TLS published on host loopback port
 /// 55432, in its own Compose project <c>smarthotel-test</c>, and leaves it running: its data lives on tmpfs and the
-/// next run reuses it. The server user must be a superuser, or have <c>CREATEDB</c> and
+/// next run reuses it. It starts the service only on this machine's Docker daemon: before the Compose call it asks
+/// the <c>docker</c> CLI which daemon it selects (the endpoint <c>DOCKER_HOST</c> names, else the context
+/// <c>DOCKER_CONTEXT</c> names, else the current context), refuses any endpoint but a local unix socket or a local
+/// Windows named pipe, and names the accepted endpoint with <c>--host</c> on the Compose call, which the CLI ranks
+/// above all three. The server user must be a superuser, or have <c>CREATEDB</c> and
 /// <c>CREATEROLE</c> and, for each server log setting that could record the statement that sets a test role's
 /// password, either the <c>SET</c> privilege on it or a server value that keeps statement text out of the log; the
 /// remarks on <see cref="CreateDatabaseAsync"/> list those settings and values.
@@ -139,6 +143,30 @@ public sealed partial class TestPostgres : IAsyncLifetime
     // How long Compose's output streams may take to close once the process has exited or been killed.
     private static readonly TimeSpan OutputDrainTimeout = TimeSpan.FromSeconds(10);
 
+    // Asks the docker CLI which Docker daemon it selects. With no context name, docker context inspect inspects the
+    // context the CLI selects: the endpoint DOCKER_HOST names when it is set, else the context DOCKER_CONTEXT names,
+    // else the configured current context. This format prints only that context's Docker endpoint, on one line. The
+    // call reads the CLI's configuration only and contacts no daemon.
+    private static readonly string[] DockerEndpointQuery =
+        ["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"];
+
+    private const string DockerEndpointHint =
+        "Check DOCKER_HOST, DOCKER_CONTEXT and `docker context ls`, then run the tests again.";
+
+    // The kinds of Docker endpoint LocalDockerEndpoint refuses, by scheme, compared ignoring case, each named in fixed
+    // words written here, so a refusal never repeats the endpoint, which can carry a user name or a host.
+    private static readonly (string Scheme, string Kind)[] RefusedEndpointKinds =
+    [
+        ("tcp://", "a TCP endpoint, which can be another machine"),
+        ("http://", "an HTTP endpoint, which can be another machine"),
+        ("https://", "an HTTP endpoint, which can be another machine"),
+        ("ssh://", "an SSH endpoint, which is another machine"),
+        ("fd://", "an inherited socket endpoint (fd://), which cannot be shown to be on this machine"),
+        ("npipe://", "a named pipe on another computer, or not in the local form npipe:////./pipe/<name>"),
+        ("unix://",
+            "a unix socket whose path is not an absolute path of at most 4096 characters without control characters"),
+    ];
+
     // Well-known Docker and Compose phrases, each mapped to a fixed cause written here. A failure message names only
     // the cause, never the output it was found in. The first cause with a matching phrase wins.
     private static readonly (string Cause, string[] Phrases)[] ComposeFailureCauses =
@@ -234,7 +262,9 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <c>SMARTHOTEL_TEST_POSTGRES</c> is not a valid connection string, sets no <c>Host</c>, or names a host that is
     /// neither <c>localhost</c>, a loopback address nor a Unix-domain socket without setting
     /// <c>SSL Mode=VerifyFull</c>, which ends the run before any connection to the server; the repository root cannot
-    /// be found; the <c>docker</c> CLI cannot be started, or <c>docker compose up</c> fails or times out; Npgsql would
+    /// be found; the <c>docker</c> CLI cannot be started, cannot report which Docker daemon it selects, or selects one
+    /// that is not on this machine (anything but a local unix socket or a local Windows named pipe), which ends the run
+    /// before any Compose call; <c>docker compose up</c> fails or times out; Npgsql would
     /// present an ambient client certificate on the test databases' connections, which ends the run before any
     /// connection to the server; the server rejects the login (SQLSTATE class 28), which ends the wait at once; a
     /// connection attempt fails in a way no retry changes; or the server does not accept connections within 15
@@ -766,10 +796,31 @@ public sealed partial class TestPostgres : IAsyncLifetime
     // Concurrent cold starts race to create the one db-test container, and every run but the winner then fails on the
     // container name. A non-zero exit therefore issues the identical command again, up to ComposeAttempts calls in all:
     // a later up --wait adopts the container another run created and waits until it is healthy. db-test is never
-    // stopped, so the next run reuses it.
+    // stopped, so the next run reuses it. Before the first Compose call the docker CLI is asked which Docker daemon it
+    // selects, and only a daemon on this machine is accepted: db-test publishes a passwordless server on its daemon
+    // host's loopback port, so DOCKER_HOST, DOCKER_CONTEXT or the current context must never start it on another
+    // machine. One deadline bounds that query and every Compose attempt.
     private static async Task StartComposeServiceAsync(CancellationToken cancellationToken)
     {
         string root = FindRepositoryRoot();
+
+        using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(ComposeTimeout);
+
+        string endpoint;
+        try
+        {
+            endpoint = await ResolveDockerEndpointAsync(deadline.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // The runner's cancellation stays a cancellation; only the deadline becomes a failure.
+            cancellationToken.ThrowIfCancellationRequested();
+
+            throw new InvalidOperationException(
+                "docker context inspect did not report which Docker daemon the docker CLI selects within 5 minutes."
+                + $"{Environment.NewLine}{Hint}");
+        }
 
         ProcessStartInfo startInfo = new("docker")
         {
@@ -779,10 +830,12 @@ public sealed partial class TestPostgres : IAsyncLifetime
             CreateNoWindow = true,
         };
 
-        // One item per argument and no shell, so a root path with spaces reaches Compose intact. The empty env file
-        // keeps Compose from reading a developer's .env.
+        // One item per argument and no shell, so a root path with spaces reaches Compose intact. --host, a docker
+        // option placed before compose, names the local daemon the query reported; the CLI ranks it above DOCKER_HOST,
+        // DOCKER_CONTEXT and the current context. The empty env file keeps Compose from reading a developer's .env.
         string[] arguments =
         [
+            "--host", endpoint,
             "compose",
             "-p", ComposeProject,
             "-f", Path.Combine(root, "docker-compose.yml"),
@@ -797,9 +850,6 @@ public sealed partial class TestPostgres : IAsyncLifetime
         }
 
         NeutralizeComposeEnvironment(startInfo.Environment);
-
-        using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        deadline.CancelAfter(ComposeTimeout);
 
         for (int attempt = 1; ; attempt++)
         {
@@ -869,6 +919,127 @@ public sealed partial class TestPostgres : IAsyncLifetime
         // values, paths and registry responses into it. A failure names only a fixed cause found in it.
         string? output = await DrainOutputAsync(standardOutput, standardError);
         return process.ExitCode == 0 ? (0, null) : (process.ExitCode, FindComposeFailureCause(output));
+    }
+
+    // Runs DockerEndpointQuery as the Compose call runs: no shell, the same neutralized environment, both streams
+    // drained concurrently from the start and the process tree killed when the deadline passes, which then propagates
+    // as a cancellation. Neither stream is ever reported, not even in part, because they can hold paths, user names and
+    // hosts; a failure names only the exit code. Returns the endpoint once LocalDockerEndpoint has accepted it.
+    private static async Task<string> ResolveDockerEndpointAsync(CancellationToken deadline)
+    {
+        ProcessStartInfo startInfo = new("docker")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (string argument in DockerEndpointQuery)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        NeutralizeComposeEnvironment(startInfo.Environment);
+
+        using Process process = new() { StartInfo = startInfo };
+        try
+        {
+            process.Start();
+        }
+        catch (Win32Exception exception)
+        {
+            throw new InvalidOperationException(
+                DescribeFailure("The docker CLI could not be started.", exception) + " " + Hint);
+        }
+
+        Task<string> standardOutput = process.StandardOutput.ReadToEndAsync(deadline);
+        Task<string> standardError = process.StandardError.ReadToEndAsync(deadline);
+        try
+        {
+            await process.WaitForExitAsync(deadline);
+        }
+        catch (OperationCanceledException)
+        {
+            KillProcessTree(process);
+            _ = await DrainOutputAsync(standardOutput, standardError);
+            throw;
+        }
+
+        // The combined text DrainOutputAsync returns only shows that both streams closed; stdout alone holds the reply.
+        bool drained = await DrainOutputAsync(standardOutput, standardError) is not null;
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException(
+                "The docker CLI could not report which Docker daemon it selects (docker context inspect exited with "
+                + $"code {process.ExitCode}). {DockerEndpointHint}{Environment.NewLine}{Hint}");
+        }
+
+        deadline.ThrowIfCancellationRequested();
+        if (!drained)
+        {
+            throw new InvalidOperationException(
+                "The docker CLI exited, but its report of which Docker daemon it selects did not close within 10 "
+                + $"seconds. {DockerEndpointHint}{Environment.NewLine}{Hint}");
+        }
+
+        return LocalDockerEndpoint(await standardOutput);
+    }
+
+    // Accepts the endpoint the docker CLI reported only when it is a Docker daemon on this machine. One trailing line
+    // break (LF or CR LF) is removed first; the rest must be unix:// with an absolute path of at most 4096 characters
+    // and no control character (C0, DEL or C1), or a named pipe on this computer, npipe:////./pipe/<name>, whose name
+    // is ASCII letters, digits, _, . and -. Everything else fails closed: tcp://, http(s)://, ssh:// and fd://
+    // endpoints, a pipe on another computer, a relative socket path, an empty reply and several lines. The message
+    // names only the kind of endpoint refused, never the endpoint.
+    // Trust boundary: no API proves where a daemon runs, so a unix socket or named pipe on this machine is trusted as
+    // this machine's Docker daemon, Docker Engine's, rootless Docker's or Docker Desktop's, whose published 127.0.0.1
+    // ports reach this host. This check cannot tell whether such a socket forwards to another machine, as an
+    // SSH-forwarded socket does, so DOCKER_HOST or a context must never point at one.
+    private static string LocalDockerEndpoint(string reported)
+    {
+        string endpoint = reported;
+        if (endpoint.EndsWith('\n'))
+        {
+            endpoint = endpoint.EndsWith("\r\n", StringComparison.Ordinal) ? endpoint[..^2] : endpoint[..^1];
+        }
+
+        if (LocalUnixSocketEndpointPattern().IsMatch(endpoint) || LocalNamedPipeEndpointPattern().IsMatch(endpoint))
+        {
+            return endpoint;
+        }
+
+        throw new InvalidOperationException(
+            $"Refusing the Docker daemon the docker CLI selects: it reports {DescribeRefusedEndpoint(endpoint)}. "
+            + $"The {ComposeService} service publishes a passwordless PostgreSQL server on its Docker daemon host's "
+            + $"loopback port 55432, which the fixture reaches as 127.0.0.1, so it starts {ComposeService} only on "
+            + "this machine's Docker daemon, through a local unix socket (unix:///<path>) or a local Windows named "
+            + "pipe (npipe:////./pipe/<name>). Unset DOCKER_HOST or DOCKER_CONTEXT, or switch with `docker context "
+            + "use` to a local context such as `default` or Docker Desktop's, or set SMARTHOTEL_TEST_POSTGRES to a "
+            + "PostgreSQL 16 server connection string. The endpoint is not shown.");
+    }
+
+    // Names the kind of Docker endpoint LocalDockerEndpoint refuses in fixed words, never any part of the endpoint.
+    private static string DescribeRefusedEndpoint(string endpoint)
+    {
+        if (endpoint.Length == 0)
+        {
+            return "no endpoint";
+        }
+
+        if (endpoint.Contains('\n') || endpoint.Contains('\r'))
+        {
+            return "more than one line instead of one endpoint";
+        }
+
+        foreach ((string scheme, string kind) in RefusedEndpointKinds)
+        {
+            if (endpoint.StartsWith(scheme, StringComparison.OrdinalIgnoreCase))
+            {
+                return kind;
+            }
+        }
+
+        return "an endpoint that is neither a local unix socket nor a local Windows named pipe";
     }
 
     private static string FindRepositoryRoot()
@@ -1459,4 +1630,12 @@ public sealed partial class TestPostgres : IAsyncLifetime
 
     [GeneratedRegex(@"^[0-9a-f]{64}\z", RegexOptions.CultureInvariant)]
     private static partial Regex PasswordPattern();
+
+    // unix:// and an absolute path of 2 to 4096 characters, none of them a control character (C0, DEL or C1).
+    [GeneratedRegex(@"^unix:///[^\p{Cc}]{1,4095}\z", RegexOptions.CultureInvariant)]
+    private static partial Regex LocalUnixSocketEndpointPattern();
+
+    // A named pipe on this computer (.), whose name is ASCII letters, digits, _, . and -.
+    [GeneratedRegex(@"^npipe:////\./pipe/[A-Za-z0-9_.-]+\z", RegexOptions.CultureInvariant)]
+    private static partial Regex LocalNamedPipeEndpointPattern();
 }

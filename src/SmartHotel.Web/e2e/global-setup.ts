@@ -34,6 +34,11 @@
  *   ports; every other variable passes through unchanged, so the Docker CLI
  *   keeps working. The stack's secrets are generated inside the `db`
  *   container and are never supplied here.
+ * - Before its first Compose call it asks the docker CLI which Docker daemon
+ *   it selects (`docker context inspect`), refuses anything but a local unix
+ *   socket or a local Windows named pipe, and passes that endpoint as
+ *   `--host` to every Compose call, so `DOCKER_HOST`, `DOCKER_CONTEXT` or the
+ *   current context can never point the removal at another machine's daemon.
  * - Its own messages never print a raw `E2E_*` setting or the text of a
  *   caught error. They hold only fixed text, the project name, the acceptance
  *   and lock ports, the target URLs in the canonical form
@@ -41,27 +46,37 @@
  *   path, never a user name, password, query or fragment), the web app's
  *   `/config.json` URL built from that canonical origin, HTTP statuses,
  *   fixed-text reasons why `/config.json` does not name the target API (never
- *   the value it serves), validated error codes such as `ECONNREFUSED`, the
- *   Compose deadlines, the manual removal command with this checkout's
- *   paths, and the process id, start time and checkout path the run owning
- *   the lock reports, with control characters removed.
+ *   the value it serves), validated error codes such as `ECONNREFUSED` and
+ *   exit codes, the Compose deadlines, the local Docker endpoint the docker
+ *   CLI reported (a refused endpoint is never shown), the manual removal
+ *   command with this checkout's paths and that endpoint, and the process
+ *   id, start time and checkout path the run owning the lock reports, with
+ *   control characters removed.
  * - Only the last 1 MiB of characters of a Compose command's output is kept,
  *   from the first line that starts within it; a line that limit cuts is
  *   dropped whole, the part of it written later included, so no line's end
  *   is kept without its start. When a Compose command fails or times out,
- *   that output is printed filtered, limited to the last 200 lines of at most
- *   500 characters, after a marker when earlier output was dropped, and with
- *   every line prefixed `  compose | ` so it cannot pass for a message of
- *   this setup.
- *   The filter removes control characters and escape sequences and redacts
- *   what its patterns recognize: credential headers and key-value pairs,
- *   connection strings, bearer and basic credentials, JWTs, URL user
- *   information, queries and fragments, email addresses, long mixed-case
- *   tokens and the values of the child's credential-named environment
- *   variables. Because it is pattern-based, that output can still contain
- *   sensitive text it does not recognize.
+ *   only the lines of that output that are one of this setup's canonical
+ *   Compose and BuildKit messages are printed, with control characters and
+ *   escape sequences removed: Compose's events for the stack's own
+ *   containers, networks, volumes and built images, with at most a duration
+ *   or one of Compose's own dependency-failure details, any other details
+ *   replaced by `[details withheld]`; Compose's not-started,
+ *   dependency-failure, exited and unhealthy messages for the stack's own
+ *   containers and services; and BuildKit's step markers for the
+ *   repository's own build stages, without the instruction's arguments or the
+ *   error's text. Names appear only as the project's own, and numbers only as
+ *   exit codes, container indexes, step numbers and counters, unnamed-stage
+ *   numbers and durations. Every other line, base-image pulls, tool output
+ *   and Docker, registry and build messages included, is withheld and only
+ *   counted, because it can carry credentials no pattern recognizes. At most
+ *   the last 200 recognized lines of at most 500 characters are printed,
+ *   after a marker when earlier output was dropped, every one prefixed
+ *   `  compose | ` so it cannot pass for a message of this setup. Fixed-text
+ *   likely causes follow, such as a host port already in use, found from
+ *   phrases anywhere in the kept output.
  */
-import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { type ChildProcess, execFile, spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 
@@ -70,11 +85,13 @@ import {
   ACCEPTANCE_LOCK_PORT,
   ACCEPTANCE_PROJECT,
   ACCEPTANCE_WEB_PORT,
+  DOCKER_ENDPOINT_QUERY_ARGS,
   type StackTarget,
   composeArgs,
   composeEnvironment,
   findRepositoryRoot,
   isReuseMode,
+  localDockerEndpoint,
   resolveStackTarget,
 } from './support/stack-target';
 
@@ -185,7 +202,10 @@ const PROBE_REQUEST_TIMEOUT_MS = 10_000;
 /** Upper bound for one TCP connection attempt of the port check. */
 const PORT_CHECK_TIMEOUT_MS = 1_000;
 
-/** The most lines of a failed command's output that are printed: its last ones. */
+/**
+ * The most lines of a failed command's output that are printed: the last of
+ * the lines {@link filterComposeOutput} recognizes.
+ */
 const COMPOSE_OUTPUT_MAX_LINES = 200;
 
 /** The most characters of one output line that are printed. */
@@ -197,21 +217,12 @@ const COMPOSE_OUTPUT_MAX_LINE_LENGTH = 500;
  */
 const COMPOSE_OUTPUT_PREFIX = '  compose | ';
 
-/** What a redacted piece of output is replaced with. */
-const REDACTED = '<redacted>';
-
 /**
- * Names of the Compose child's environment variables whose values are
- * redacted wherever they appear in printed output, outside the project's own
- * Compose names.
+ * What replaces the details of a Compose resource event that are neither a
+ * duration nor one of Compose's own dependency-failure details
+ * ({@link COMPOSE_EVENT_DETAILS}), such as the daemon's message after `Error`.
  */
-const SENSITIVE_VARIABLE_NAME = /PASS|SECRET|TOKEN|KEY|CRED|AUTH/i;
-
-/**
- * The shortest environment value redacted by its exact text; a shorter one
- * would also match ordinary words.
- */
-const MIN_REDACTED_VALUE_LENGTH = 6;
+const DETAILS_WITHHELD = '[details withheld]';
 
 /** Resolves after `ms` milliseconds. */
 function delay(ms: number): Promise<void> {
@@ -400,250 +411,242 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Pattern source for the stack's service names: db, api and web. */
+const SERVICE_NAME_SOURCE = 'db|api|web';
+
 /**
  * Pattern source for the acceptance project name and the names Compose
- * derives from it: containers `<project>-<service>-<n>`, images
- * `<project>-<service>`, volumes `<project>_<volume>` and networks such as
- * `<project>_default`. Compose writes them in lower case.
+ * derives from it: containers `<project>-<service>-<n>`, the images it builds
+ * `<project>-<service>`, and volumes and networks `<project>_<name>`, such as
+ * `<project>_db-data` or `<project>_default`, whose name is a short
+ * lower-case word. Compose writes them in lower case.
  */
-const PROJECT_NAME_SOURCE = String.raw`${escapeRegExp(ACCEPTANCE_PROJECT)}(?:[-_][a-z0-9]+)*(?![A-Za-z0-9_-])`;
+const PROJECT_NAME_SOURCE = String.raw`${escapeRegExp(ACCEPTANCE_PROJECT)}(?:-(?:${SERVICE_NAME_SOURCE})(?:-\d{1,3})?|_[a-z][a-z0-9-]{0,15})?`;
 
 /**
- * The Compose names this setup itself determines: the project name and the
- * names derived from it ({@link PROJECT_NAME_SOURCE}), and the service names
- * db, api and web where they stand as words of their own, as in
- * `service "db"` or `[api build 3/9]`.
+ * Wraps a pattern source so it matches the name bare or, as older Compose v2
+ * releases write volume names, in double quotes.
  */
-const COMPOSE_IDENTIFIER_PATTERN = new RegExp(
-  String.raw`(?<![A-Za-z0-9_.-])${PROJECT_NAME_SOURCE}|(?<=^|[\s"'[(])(?:db|api|web)(?=$|[\s"'\]):,])`,
-  'g',
+function bareOrQuoted(source: string): string {
+  return String.raw`(?:"(?:${source})"|(?:${source}))`;
+}
+
+/** Pattern source for one of the project's own names ({@link PROJECT_NAME_SOURCE}), bare or quoted. */
+const OWN_NAME_SOURCE = bareOrQuoted(PROJECT_NAME_SOURCE);
+
+/**
+ * Pattern source for the names of the images the stack builds,
+ * `<project>-api` and `<project>-web`, bare or quoted. The base images it
+ * pulls, such as `postgres`, are not the project's own names, so their
+ * events are withheld.
+ */
+const OWN_IMAGE_SOURCE = bareOrQuoted(String.raw`${escapeRegExp(ACCEPTANCE_PROJECT)}-(?:api|web)`);
+
+/**
+ * Pattern source for a duration as Compose and BuildKit print one, such as
+ * `0.5s` or `123.4s`.
+ */
+const DURATION_SOURCE = String.raw`\d{1,5}(?:\.\d{1,3})?s`;
+
+/**
+ * Pattern source for Compose's report that one of the project's containers
+ * ended its start-up: `container <name> exited (<code>)` or
+ * `container <name> is unhealthy`.
+ */
+const CONTAINER_END_SOURCE = String.raw`container ${OWN_NAME_SOURCE} (?:exited \(\d{1,3}\)|is unhealthy)`;
+
+/**
+ * Pattern source for Compose's report that a dependency of a service did not
+ * start: `dependency failed to start: ` and a {@link CONTAINER_END_SOURCE}.
+ */
+const DEPENDENCY_FAILURE_SOURCE = `dependency failed to start: ${CONTAINER_END_SOURCE}`;
+
+/**
+ * The one-word statuses a Compose resource event reports, as Compose writes
+ * them, as in `Container <project>-db-1 Healthy`.
+ */
+const COMPOSE_EVENT_STATUSES = [
+  'Creating',
+  'Created',
+  'Recreate',
+  'Recreating',
+  'Recreated',
+  'Starting',
+  'Started',
+  'Waiting',
+  'Healthy',
+  'Unhealthy',
+  'Running',
+  'Restarting',
+  'Restarted',
+  'Stopping',
+  'Stopped',
+  'Killing',
+  'Killed',
+  'Removing',
+  'Removed',
+  'Building',
+  'Built',
+  'Pulling',
+  'Pulled',
+  'Skipped',
+  'Exited',
+  'Error',
+  'Warning',
+  'Interrupted',
+  'Canceled',
+  'Done',
+];
+
+/**
+ * The start of a Compose resource event, `<Kind> <name> <Status>`, as Compose
+ * writes it: `Container`, `Network`, `Volume` or `Service` with one of the
+ * project's own names ({@link OWN_NAME_SOURCE}), or `Image` with the name of
+ * an image the stack builds ({@link OWN_IMAGE_SOURCE}), then one of
+ * {@link COMPOSE_EVENT_STATUSES} as a whole word. The event's details, if
+ * any, follow the match.
+ */
+const COMPOSE_EVENT = new RegExp(
+  String.raw`^(?:(?:Container|Network|Volume|Service) ${OWN_NAME_SOURCE}|Image ${OWN_IMAGE_SOURCE}) (?:${COMPOSE_EVENT_STATUSES.join('|')})(?= |$)`,
 );
 
 /**
- * Collects the exact values to redact from printed output: the values of the
- * credential-named variables ({@link SENSITIVE_VARIABLE_NAME}) in the
- * environment the Compose child receives, as {@link composeEnvironment}
- * builds it. A variable this process holds but the child never receives,
- * such as a dropped `SMARTHOTEL_*` first-start override, cannot appear in the
- * child's output and is not collected. Each value contributes every one of
- * its display lines, as {@link splitDisplayLines} prints them, trimmed; a
- * piece shorter than {@link MIN_REDACTED_VALUE_LENGTH} is left out. The
- * longest come first, so a value that contains another is replaced whole.
+ * The details of a Compose resource event that are printed, from the space
+ * after its status: one duration ({@link DURATION_SOURCE}), as in
+ * `Container <project>-db-1 Healthy 0.5s`; `dependency <service> failed to
+ * start`; or a {@link DEPENDENCY_FAILURE_SOURCE} report. Nothing else may
+ * follow.
  */
-function sensitiveEnvironmentValues(): string[] {
-  const values = new Set<string>();
-  for (const [name, value] of Object.entries(composeEnvironment())) {
-    if (!SENSITIVE_VARIABLE_NAME.test(name)) {
-      continue;
-    }
-    for (const piece of splitDisplayLines(value)) {
-      const trimmed = piece.trim();
-      if (trimmed.length >= MIN_REDACTED_VALUE_LENGTH) {
-        values.add(trimmed);
-      }
-    }
-  }
-  return [...values].sort((a, b) => b.length - a.length);
-}
-
-/** Replaces every occurrence of each of `values` in `text`. */
-function redactValues(text: string, values: string[]): string {
-  let result = text;
-  for (const value of values) {
-    result = result.split(value).join(REDACTED);
-  }
-  return result;
-}
-
-/**
- * Replaces every occurrence of each of `values` in one display line, outside
- * the {@link COMPOSE_IDENTIFIER_PATTERN} matches: the line is split around
- * them and only the text between them is searched, so a value that equals
- * the project name, or part of a container, volume or network name, never
- * masks that name. A value anywhere else is still replaced.
- */
-function redactValuesOutsideIdentifiers(line: string, values: string[]): string {
-  if (values.length === 0) {
-    return line;
-  }
-  let result = '';
-  let segmentStart = 0;
-  for (const match of line.matchAll(COMPOSE_IDENTIFIER_PATTERN)) {
-    const start = match.index ?? segmentStart;
-    result += `${redactValues(line.slice(segmentStart, start), values)}${match[0]}`;
-    segmentStart = start + match[0].length;
-  }
-  return `${result}${redactValues(line.slice(segmentStart), values)}`;
-}
-
-/**
- * Removes the user information, query and fragment of one URL, keeping its
- * scheme, host, port and path.
- */
-function redactUrl(url: string): string {
-  const authorityStart = url.indexOf('://') + 3;
-  let rest = url.slice(authorityStart);
-  const authorityEnd = rest.search(/[/?#]/);
-  const authority = authorityEnd === -1 ? rest : rest.slice(0, authorityEnd);
-  const userInfoEnd = authority.lastIndexOf('@');
-  if (userInfoEnd !== -1) {
-    rest = `${REDACTED}${rest.slice(userInfoEnd)}`;
-  }
-  const queryStart = rest.search(/[?#]/);
-  if (queryStart !== -1) {
-    rest = `${rest.slice(0, queryStart + 1)}${REDACTED}`;
-  }
-  return `${url.slice(0, authorityStart)}${rest}`;
-}
-
-/**
- * Pattern source for a key that marks its value as a credential: it contains
- * `auth` (as in Authorization, Proxy-Authorization, X-Registry-Auth,
- * X-Auth-Token or WWW-Authenticate), `token`, `secret`, `passw`, `pwd`,
- * `credential`, `cookie` or `session`, or names an API, access, private or
- * signing key, with `-`, `_`, a space or nothing before `key`. One of the
- * project's own Compose names is never such a key, so the text after a volume
- * such as `smarthotel-acceptance_secrets:` stays readable.
- */
-const CREDENTIAL_KEY_SOURCE = String.raw`(?!${PROJECT_NAME_SOURCE}["']?\s*[:=])(?:(?=[A-Za-z0-9_.-]*(?:auth|token|secret|passw|pwd|credential|cookie|session|(?:api|access|private|signing)[-_]?key))[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]*(?:api|access|private|signing) key)`;
-
-/**
- * Pattern source for the start of a `key: value` or `key=value` pair with a
- * credential key, which may be quoted (`"key": "value"`, `'key'='value'`).
- * It starts only where a token starts.
- */
-const CREDENTIAL_LABEL_SOURCE = String.raw`(?<![A-Za-z0-9_.-])(["']?${CREDENTIAL_KEY_SOURCE}["']?\s*[:=]\s*)`;
-
-/**
- * An `Authorization` header, or one whose name ends in it such as
- * `Proxy-Authorization`, with an unquoted value, which is redacted to the end
- * of the line.
- */
-const AUTHORIZATION_HEADER = /(?<![A-Za-z0-9_.-])(["']?[A-Za-z0-9_.-]*authorization["']?\s*[:=]\s*)(?!["'\s])\S.*$/gi;
-
-/**
- * A credential pair whose unquoted value is an authentication scheme followed
- * by a credential, such as `X-Auth: Bearer …` or `X-Registry-Auth: Token …`,
- * which is redacted to the end of the line.
- */
-const SCHEME_CREDENTIAL = new RegExp(
-  String.raw`${CREDENTIAL_LABEL_SOURCE}(?:basic|bearer|digest|negotiate|ntlm|kerberos|oauth|token|dpop|gnap|hoba|mutual|privatetoken|concealed|vapid|scram-sha-\d+|aws4-hmac-sha256)\s+\S.*$`,
-  'gi',
+const COMPOSE_EVENT_DETAILS = new RegExp(
+  String.raw`^ (?:${DURATION_SOURCE}|dependency (?:${SERVICE_NAME_SOURCE}) failed to start|${DEPENDENCY_FAILURE_SOURCE})$`,
 );
 
 /**
- * A credential pair and its value: a quoted value to its closing quote, or to
- * the end of the line when it has none, with backslash escapes; otherwise one
- * run of non-space characters. Groups: the label, the opening quote, the
- * quoted text and the closing quote.
+ * Compose's own messages about the project's containers and services, each a
+ * whole line, that are printed as they stand:
+ *
+ * - `Container <name> not started: condition "<condition>" of service
+ *   "<service>" not met` or `… not reached`, the condition `service_healthy`,
+ *   `service_started` or `service_completed_successfully`, optionally
+ *   followed by `: interrupted by the failure of Container <name>`;
+ * - a {@link DEPENDENCY_FAILURE_SOURCE} report, or the
+ *   {@link CONTAINER_END_SOURCE} report on its own;
+ * - `service "<service>" didn't complete successfully: exit <code>`.
+ *
+ * Every name is one of the project's own ({@link OWN_NAME_SOURCE}), every
+ * service db, api or web, and every exit code at most 3 digits.
  */
-const CREDENTIAL_PAIR = new RegExp(
-  String.raw`${CREDENTIAL_LABEL_SOURCE}(?:(["'])((?:(?!\2)[^\\]|\\.)*)(\2?)|\S+)`,
-  'gi',
+const COMPOSE_MESSAGE = new RegExp(
+  `^(?:${[
+    `Container ${OWN_NAME_SOURCE} not started: condition "service_(?:healthy|started|completed_successfully)" of service "(?:${SERVICE_NAME_SOURCE})" not (?:met|reached)(?:: interrupted by the failure of Container ${OWN_NAME_SOURCE})?`,
+    DEPENDENCY_FAILURE_SOURCE,
+    CONTAINER_END_SOURCE,
+    String.raw`service "(?:${SERVICE_NAME_SOURCE})" didn't complete successfully: exit \d{1,3}`,
+  ].join('|')})$`,
 );
 
 /**
- * A run of two or more `key=value` pairs separated by `;`, the shape of an
- * ADO.NET, Npgsql or ODBC connection string. A key after a `;` may hold
- * spaces; the first one may be `Data Source`, `User Id` or `Initial Catalog`
- * or a single word, so the words before a connection string stay out of it.
- * The first value is bounded and holds no `=` but trailing base64 padding,
- * so text with many `=` and no `;` is scanned in linear time.
+ * Recognizes a Compose resource event of the project's own resources
+ * ({@link COMPOSE_EVENT}) and gives its printable form: the line as it stands
+ * when it ends at its status or its details are {@link COMPOSE_EVENT_DETAILS},
+ * and otherwise `<Kind> <name> <Status>` followed by
+ * {@link DETAILS_WITHHELD}.
+ *
+ * @param line - One display line, trimmed, its whitespace runs collapsed.
+ * @returns The printable form of the event, or `undefined` when the line is
+ *   no event this setup recognizes.
  */
-const KEY_VALUE_RUN = /(?<![A-Za-z0-9_.-])(?:data\s+source|user\s+id|initial\s+catalog|[A-Za-z][\w.-]{0,63})\s*=[^;=]{0,256}=*(?:;\s*[A-Za-z][\w\s.-]{0,63}=[^;]*)+;?/gi;
+function recognizeResourceEvent(line: string): string | undefined {
+  const event = COMPOSE_EVENT.exec(line);
+  if (event === null) {
+    return undefined;
+  }
+  const details = line.slice(event[0].length);
+  return details === '' || COMPOSE_EVENT_DETAILS.test(details) ? line : `${event[0]} ${DETAILS_WITHHELD}`;
+}
 
-/**
- * The keys, lower-cased with single spaces, that make a {@link KEY_VALUE_RUN}
- * a connection string.
- */
-const CONNECTION_STRING_KEYS = new Set([
-  'host',
-  'server',
-  'data source',
-  'address',
-  'user id',
-  'user',
-  'username',
-  'uid',
-  'password',
-  'pwd',
-  'database',
-  'initial catalog',
-  'port',
+/** The Dockerfile instructions a BuildKit step header can start with, in upper case. */
+const DOCKERFILE_INSTRUCTIONS = new Set([
+  'FROM',
+  'RUN',
+  'COPY',
+  'ADD',
+  'WORKDIR',
+  'ENV',
+  'ARG',
+  'USER',
+  'EXPOSE',
+  'ENTRYPOINT',
+  'CMD',
+  'HEALTHCHECK',
+  'LABEL',
+  'VOLUME',
+  'SHELL',
+  'STOPSIGNAL',
+  'ONBUILD',
 ]);
 
-/** What a recognized connection string is replaced with, whole. */
-const REDACTED_CONNECTION_STRING = '<redacted connection string>';
-
 /**
- * A run of at least 24 characters of the base64 and base64url alphabets,
- * delimited by any other character, such as `/`, `.`, `:`, `@` or a space.
+ * Pattern source for the build stages a BuildKit step header names: the
+ * stages the repository's Dockerfiles name, `build` (api and web) and
+ * `runtime` (api), and `stage-<n>`, BuildKit's name for an unnamed stage,
+ * such as web's final nginx stage, `stage-1`.
  */
-const TOKEN_RUN = /(?<![A-Za-z0-9+=_-])[A-Za-z0-9+=_-]{24,}(?![A-Za-z0-9+=_-])/g;
+const BUILD_STAGE_SOURCE = String.raw`build|runtime|stage-\d{1,2}`;
 
 /**
- * Replaces a {@link KEY_VALUE_RUN} whole when any of its keys is in
- * {@link CONNECTION_STRING_KEYS}, and leaves it unchanged otherwise.
+ * A BuildKit step header, `#<n> [<step>] <description>`, with its whitespace
+ * runs collapsed, whose step is one of the repository's own builds:
+ * `internal`, a service (`api`), a service's internal step (`api internal`),
+ * or a stage's step `<i>/<n>`, after the service and the stage
+ * ({@link BUILD_STAGE_SOURCE}) when the build names them (`api build 6/10`,
+ * `web stage-1 1/6`, `web 1/3`, `2/2`). Groups: the step number, the step and
+ * the first word of the description.
  */
-function redactConnectionString(run: string): string {
-  const isConnectionString = run.split(';').some((pair) => {
-    const key = pair.split('=', 1)[0].trim().replace(/\s+/g, ' ').toLowerCase();
-    return CONNECTION_STRING_KEYS.has(key);
-  });
-  return isConnectionString ? REDACTED_CONNECTION_STRING : run;
-}
+const BUILDKIT_STEP_HEADER = new RegExp(
+  String.raw`^#(\d{1,6}) \[(internal|(?:${SERVICE_NAME_SOURCE})(?: internal)?|(?:(?:${SERVICE_NAME_SOURCE}) )?(?:(?:${BUILD_STAGE_SOURCE}) )?\d{1,4}/\d{1,4})\](?: (\S+))?`,
+);
 
 /**
- * Replaces a {@link TOKEN_RUN} that mixes upper-case letters, lower-case
- * letters and digits, the shape of a generated key, token or encoded
- * credential. Lower-case hexadecimal, such as a container id or a `sha256`
- * digest, and ordinary words are kept.
+ * BuildKit's markers for the end of a step, each a whole line:
+ * `#<n> DONE <duration>` ({@link DURATION_SOURCE}), `#<n> CACHED` and
+ * `#<n> CANCELED`.
  */
-function redactTokenRun(run: string): string {
-  return /[A-Z]/.test(run) && /[a-z]/.test(run) && /[0-9]/.test(run) ? REDACTED : run;
-}
+const BUILDKIT_STEP_END = new RegExp(String.raw`^#\d{1,6} (?:DONE ${DURATION_SOURCE}|CACHED|CANCELED)$`);
+
+/** BuildKit's marker for a failed step, `#<n> ERROR…`. Group: the step number. */
+const BUILDKIT_STEP_ERROR = /^#(\d{1,6}) ERROR(?![\w-])/;
 
 /**
- * Redacts the credential-shaped parts of one display line, in this order.
- * Every pattern starts only where a token starts, and a redacted value keeps
- * the key, scheme or URL part in front of it that shows what was removed:
+ * Recognizes a BuildKit marker line: a step header
+ * ({@link BUILDKIT_STEP_HEADER}), printed as `#<n> [<step>] <INSTRUCTION>`
+ * with the instruction's arguments dropped, or as `#<n> [<step>]` when its
+ * description starts with no Dockerfile instruction; a step end
+ * ({@link BUILDKIT_STEP_END}), printed as it stands; or a failed step,
+ * printed as `#<n> ERROR` with its message dropped. A header whose step is
+ * not one of the repository's own builds, and tool output, which BuildKit
+ * writes as `#<n> <seconds> <text>`, are none of these.
  *
- * - an unquoted `Authorization` or `Proxy-Authorization` value, and an
- *   unquoted credential-key value that starts with an authentication scheme,
- *   to the end of the line;
- * - URL user information, query and fragment;
- * - connection strings, replaced whole;
- * - `Bearer` and `Basic` credentials;
- * - JWT-shaped strings;
- * - the value of every other `key: value` or `key=value` pair with a
- *   credential key, quoted or not ({@link CREDENTIAL_KEY_SOURCE});
- * - email addresses. An image reference such as `postgres:16@sha256:…` has no
- *   dotted domain after its `@` and is kept;
- * - runs of 24 or more base64 or base64url characters that mix upper-case
- *   letters, lower-case letters and digits.
- *
- * Every pattern is bounded to run in time linear in the line's length, so an
- * arbitrarily long line is filtered before it is cut. Text that matches none
- * of them is kept.
+ * @param line - One display line, trimmed, its whitespace runs collapsed.
+ * @returns The printable form of the marker, or `undefined` when the line is
+ *   no marker this setup recognizes.
  */
-function redactLine(line: string): string {
-  return line
-    .replace(AUTHORIZATION_HEADER, `$1${REDACTED}`)
-    .replace(SCHEME_CREDENTIAL, `$1${REDACTED}`)
-    .replace(/(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/\S*/gi, (url) => redactUrl(url))
-    .replace(KEY_VALUE_RUN, (run) => redactConnectionString(run))
-    .replace(/\b(bearer|basic)(\s+)[A-Za-z0-9._~+/-]+=*/gi, `$1$2${REDACTED}`)
-    .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, REDACTED)
-    .replace(
-      CREDENTIAL_PAIR,
-      (_pair: string, label: string, quote?: string, _text?: string, closing?: string) =>
-        quote === undefined ? `${label}${REDACTED}` : `${label}${quote}${REDACTED}${closing ?? ''}`,
-    )
-    .replace(
-      /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g,
-      REDACTED,
-    )
-    .replace(TOKEN_RUN, (run) => redactTokenRun(run));
+function recognizeBuildKitMarker(line: string): string | undefined {
+  if (BUILDKIT_STEP_END.test(line)) {
+    return line;
+  }
+  const error = BUILDKIT_STEP_ERROR.exec(line);
+  if (error !== null) {
+    return `#${error[1]} ERROR`;
+  }
+  const header = BUILDKIT_STEP_HEADER.exec(line);
+  if (header === null) {
+    return undefined;
+  }
+  const instruction = (header[3] ?? '').toUpperCase();
+  return DOCKERFILE_INSTRUCTIONS.has(instruction)
+    ? `#${header[1]} [${header[2]}] ${instruction}`
+    : `#${header[1]} [${header[2]}]`;
 }
 
 /** Shortens a line to {@link COMPOSE_OUTPUT_MAX_LINE_LENGTH} characters, marking the cut. */
@@ -665,32 +668,136 @@ function displayText(text: string): string {
 }
 
 /**
- * Filters a Compose command's output for printing, line by line:
- * {@link splitDisplayLines} removes control characters and escape sequences;
- * {@link redactValuesOutsideIdentifiers} replaces the exact values
- * {@link sensitiveEnvironmentValues} collects from the child's environment,
- * everywhere but inside the project's own Compose names; {@link redactLine}
- * redacts credential-shaped text; and only the last
- * {@link COMPOSE_OUTPUT_MAX_LINES} lines are kept, each cut to
- * {@link COMPOSE_OUTPUT_MAX_LINE_LENGTH} characters after it is redacted.
+ * Selects, by allowlist, what of a Compose command's output is printed. Each
+ * display line ({@link splitDisplayLines}, which removes control characters
+ * and escape sequences) is trimmed and its whitespace runs collapsed, and a
+ * line is kept only when it is one of this setup's canonical messages:
  *
- * Every line is kept, redacted where a rule matches, because a failed command
- * is diagnosed from its output. The filter is pattern-based, so that output
- * can still hold sensitive text no rule recognizes.
+ * - one of Compose's own messages about the project's containers and
+ *   services ({@link COMPOSE_MESSAGE}), such as
+ *   `dependency failed to start: container <project>-api-1 exited (1)`, as
+ *   it stands;
+ * - a resource event of the project's own containers, networks, volumes and
+ *   built images ({@link recognizeResourceEvent}), its details withheld
+ *   unless they are a duration or one of Compose's own dependency-failure
+ *   details;
+ * - a BuildKit marker of the repository's own builds
+ *   ({@link recognizeBuildKitMarker}), the arguments of its instruction and
+ *   the text of its error dropped.
  *
- * @returns The printable lines and the count of earlier lines left out.
+ * Names in them are only the project's own and numbers only exit codes,
+ * container indexes, step numbers and counters, unnamed-stage numbers and
+ * durations. Every other non-blank line, base-image pulls, tool output,
+ * Dockerfile excerpts and the daemon's, a registry's and BuildKit's own
+ * messages included, is withheld, because it can carry credentials that no
+ * pattern recognizes, and only counted. Of the kept lines, the last
+ * {@link COMPOSE_OUTPUT_MAX_LINES} are returned, each cut by
+ * {@link truncateLine}.
+ *
+ * @param output - The kept output of one Compose command.
+ * @returns The printable lines, the count of earlier kept lines left out and
+ *   the count of lines withheld.
  */
-function filterComposeOutput(output: string): { lines: string[]; omitted: number } {
-  const values = sensitiveEnvironmentValues();
-  const all = splitDisplayLines(output);
-  while (all.length > 0 && all[all.length - 1].trim() === '') {
-    all.pop();
+function filterComposeOutput(output: string): { lines: string[]; omitted: number; withheld: number } {
+  const recognized: string[] = [];
+  let withheld = 0;
+  for (const displayLine of splitDisplayLines(output)) {
+    const line = displayLine.trim().replace(/\s+/g, ' ');
+    if (line === '') {
+      continue;
+    }
+    const printable = COMPOSE_MESSAGE.test(line)
+      ? line
+      : recognizeResourceEvent(line) ?? recognizeBuildKitMarker(line);
+    if (printable === undefined) {
+      withheld += 1;
+    } else {
+      recognized.push(printable);
+    }
   }
-  const kept = all.slice(-COMPOSE_OUTPUT_MAX_LINES);
+  const kept = recognized.slice(-COMPOSE_OUTPUT_MAX_LINES);
   return {
-    lines: kept.map((line) => truncateLine(redactLine(redactValuesOutsideIdentifiers(line, values)))),
-    omitted: all.length - kept.length,
+    lines: kept.map((line) => truncateLine(line)),
+    omitted: recognized.length - kept.length,
+    withheld,
   };
+}
+
+/**
+ * The likely causes of a failed Compose command this setup recognizes, in
+ * the order they are reported, each with the phrases, matched without regard
+ * to case, that Docker, Compose or BuildKit report it with. Only a cause's
+ * own fixed text is ever printed, never the output that matched it.
+ */
+const COMPOSE_FAILURE_CAUSES: { cause: string; phrases: string[] }[] = [
+  {
+    cause: 'the Docker daemon is not reachable, or this user may not use it',
+    phrases: [
+      'failed to connect to the docker api',
+      'cannot connect to the docker daemon',
+      'error during connect',
+      'permission denied while trying to connect to the docker',
+      'is the docker daemon running',
+    ],
+  },
+  {
+    cause: 'the docker CLI has no Compose v2 plugin, or one older than v2.1.1, which up --wait needs',
+    phrases: ['unknown command: docker compose', "'compose' is not a docker command", 'unknown flag: --wait'],
+  },
+  {
+    cause: `host port ${ACCEPTANCE_API_PORT} or ${ACCEPTANCE_WEB_PORT}, which the stack publishes, is already in use`,
+    phrases: [
+      'port is already allocated',
+      'address already in use',
+      'ports are not available',
+      'only one usage of each socket address',
+    ],
+  },
+  {
+    cause: 'a container name of the stack is already taken by another container',
+    phrases: ['is already in use by container'],
+  },
+  {
+    cause: 'a base image could not be pulled',
+    phrases: [
+      'pull access denied',
+      'manifest unknown',
+      'failed to resolve reference',
+      'toomanyrequests',
+      'failed to authorize',
+    ],
+  },
+  { cause: 'an image build step failed', phrases: ['failed to solve', 'did not complete successfully'] },
+  { cause: 'a container did not become healthy', phrases: ['is unhealthy'] },
+  { cause: 'a container exited during start-up', phrases: ['exited (', "didn't complete successfully"] },
+  { cause: 'the disk Docker stores its data on is full', phrases: ['no space left on device'] },
+  {
+    cause: 'a network or volume of the project is still in use',
+    phrases: ['has active endpoints', 'volume is in use'],
+  },
+  {
+    cause: 'a request to the Docker daemon or a registry timed out',
+    phrases: ['i/o timeout', 'tls handshake timeout', 'context deadline exceeded'],
+  },
+  {
+    cause: 'the Compose file, or a variable it interpolates, is invalid',
+    phrases: ['invalid interpolation format', 'yaml:'],
+  },
+];
+
+/**
+ * Finds the likely causes of a failed Compose command in its kept output,
+ * withheld lines included: each {@link COMPOSE_FAILURE_CAUSES} entry one of
+ * whose phrases occurs in it, at most once each, in that list's order.
+ *
+ * @param output - The kept output of the command.
+ * @returns The fixed text of each cause found, and none of the output.
+ */
+function findComposeFailureCauses(output: string): string[] {
+  const text = output.toLowerCase();
+  return COMPOSE_FAILURE_CAUSES.filter(({ phrases }) => phrases.some((phrase) => text.includes(phrase))).map(
+    ({ cause }) => cause,
+  );
 }
 
 /**
@@ -707,11 +814,16 @@ function describeDuration(ms: number): string {
 
 /**
  * Prints a failed Compose command: a header naming the operation, how it
- * failed (its exit code, or the deadline it outlived) and the project, then
- * the command's output as {@link filterComposeOutput} leaves it, every line
- * prefixed with {@link COMPOSE_OUTPUT_PREFIX}. Marker lines say when output
- * was dropped while it was collected ({@link ComposeResult.outputDropped})
- * and when earlier lines of what was kept are not printed.
+ * failed (its exit code, or the deadline it outlived) and the project, and
+ * saying that only the status lines this setup recognizes are printed; then
+ * those lines as {@link filterComposeOutput} selects them, every one prefixed
+ * with {@link COMPOSE_OUTPUT_PREFIX}; then the likely causes
+ * {@link findComposeFailureCauses} finds, as fixed text, and a hint that the
+ * same command run by hand shows its full output. Marker lines say when
+ * output was dropped while it was collected
+ * ({@link ComposeResult.outputDropped}), when earlier recognized lines are
+ * not printed and how many other lines were withheld. No other text of the
+ * output is printed.
  *
  * @param operation - The Compose subcommand and its arguments, as run.
  * @param result - The command's outcome.
@@ -719,12 +831,12 @@ function describeDuration(ms: number): string {
  *   names when the command outlived it.
  */
 function printComposeFailure(operation: string, result: ComposeResult, deadlineMs: number): void {
-  const { lines, omitted } = filterComposeOutput(result.output);
+  const { lines, omitted, withheld } = filterComposeOutput(result.output);
   const outcome = result.timedOut
     ? `for project ${ACCEPTANCE_PROJECT} timed out after ${describeDuration(deadlineMs)} and was stopped`
     : `exited with code ${result.code} for project ${ACCEPTANCE_PROJECT}`;
   const report = [
-    `docker compose ${operation} ${outcome}; its output follows, filtered by pattern (recognized credentials, tokens, connection strings, URL queries and email addresses redacted; control characters removed):`,
+    `docker compose ${operation} ${outcome}. Only the Compose status lines this setup recognizes are printed; other Docker, registry and build output is withheld, because it can carry credentials:`,
   ];
   if (result.outputDropped) {
     report.push(
@@ -732,14 +844,29 @@ function printComposeFailure(operation: string, result: ComposeResult, deadlineM
     );
   }
   if (omitted > 0) {
-    report.push(`${COMPOSE_OUTPUT_PREFIX}[${omitted} earlier line${omitted === 1 ? '' : 's'} omitted]`);
+    report.push(
+      `${COMPOSE_OUTPUT_PREFIX}[${omitted} earlier recognized line${omitted === 1 ? '' : 's'} omitted]`,
+    );
   }
-  if (lines.length === 0 && !result.outputDropped) {
+  if (lines.length === 0 && withheld === 0 && !result.outputDropped) {
     report.push(`${COMPOSE_OUTPUT_PREFIX}[no output]`);
   }
   for (const line of lines) {
     report.push(`${COMPOSE_OUTPUT_PREFIX}${line}`);
   }
+  if (withheld > 0) {
+    report.push(`${COMPOSE_OUTPUT_PREFIX}[${withheld} other line${withheld === 1 ? '' : 's'} withheld]`);
+  }
+  const causes = findComposeFailureCauses(result.output);
+  if (causes.length === 0) {
+    report.push('Likely cause: none this setup recognizes in the Compose output.');
+  }
+  for (const cause of causes) {
+    report.push(`Likely cause: ${cause}.`);
+  }
+  report.push(
+    `Running the same docker compose ${operation} command by hand for project ${ACCEPTANCE_PROJECT} shows its full output.`,
+  );
   console.error(report.join('\n'));
 }
 
@@ -764,9 +891,9 @@ const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
 /**
  * Keeps the end of a command's output within
  * {@link COMPOSE_OUTPUT_MAX_CHARACTERS}, from the first line that starts
- * within it. The line the cut falls in is dropped whole, so no fragment is
- * printed and no credential key is cut away from its value, which the
- * redaction patterns recognize only together. When no line break follows the
+ * within it. The line the cut falls in is dropped whole, so no fragment of a
+ * line is kept, whose end could otherwise be read, and printed, as a whole
+ * line {@link filterComposeOutput} recognizes. When no line break follows the
  * cut, that line is still open, and what the command writes next continues
  * it; {@link createOutputCollector} then drops that as well, up to the line's
  * end.
@@ -805,8 +932,8 @@ function keepOutputTail(text: string): { tail: string; insideLine: boolean } {
  * cut leaves it open, every chunk that follows is discarded up to the next
  * line break as {@link splitDisplayLines} reads one (LF, CR, CR LF, U+2028 or
  * U+2029; the LF of a CR LF split across two chunks included), and none of it
- * is held, so the end of a line, such as a credential's value without the
- * label its redaction needs, is never kept without the line's start.
+ * is held, so the end of a line, which could pass for a whole line, is never
+ * kept without the line's start.
  * Collection resumes with the next line, and the drop stays reported.
  *
  * @returns `append`, the listener for decoded output chunks, and `read`,
@@ -1160,6 +1287,188 @@ function stopWindowsProcessTree(child: ChildProcess): void {
 }
 
 /**
+ * Upper bound for the `docker context inspect` call that reports which Docker
+ * daemon the CLI selects: 30 seconds. The call reads the CLI's configuration
+ * only and contacts no daemon, so only a stalled CLI reaches it. At the bound
+ * the CLI is sent SIGKILL; the query fails then, or at the latest
+ * {@link DOCKER_ENDPOINT_QUERY_SETTLE_GRACE_MS} later.
+ */
+const DOCKER_ENDPOINT_QUERY_TIMEOUT_MS = 30_000;
+
+/**
+ * How long after {@link DOCKER_ENDPOINT_QUERY_TIMEOUT_MS} the query waits for
+ * the killed CLI to be reported as ended: 5 seconds. Node reports a child's
+ * end only once it has exited and its output pipes have closed, which a CLI
+ * that survives SIGKILL, or a process it started that still holds the pipes,
+ * can postpone indefinitely. When the grace ends first, the query kills the
+ * CLI again, closes the pipes from this side and fails without waiting for
+ * it, so the run, and the acceptance lock it holds, wait at most the bound
+ * plus this grace.
+ */
+const DOCKER_ENDPOINT_QUERY_SETTLE_GRACE_MS = 5_000;
+
+/**
+ * Upper bound, in bytes, for each output stream of that call: 64 KiB, far
+ * more than the one endpoint line it prints.
+ */
+const DOCKER_ENDPOINT_QUERY_MAX_BYTES = 64 * 1_024;
+
+/** What the run tells the user to check when the docker CLI cannot report its daemon. */
+const DOCKER_ENDPOINT_QUERY_HINT =
+  'Check DOCKER_HOST, DOCKER_CONTEXT and `docker context ls`, then run the tests again.';
+
+/**
+ * Asks the docker CLI which Docker daemon it selects and returns that
+ * endpoint once {@link localDockerEndpoint} has accepted it as a daemon on
+ * this machine, a local unix socket or a local Windows named pipe. Every
+ * Compose call of the run then names it with `--host` ({@link composeArgs}).
+ *
+ * The call is `docker` with {@link DOCKER_ENDPOINT_QUERY_ARGS}, run without a
+ * shell, in the neutralized Compose environment ({@link composeEnvironment}),
+ * within {@link DOCKER_ENDPOINT_QUERY_TIMEOUT_MS} and with each output stream
+ * capped at {@link DOCKER_ENDPOINT_QUERY_MAX_BYTES}. Its stderr, its stdout
+ * when it fails and the system's own error message are never printed or
+ * attached, because they can hold paths, user names and hosts.
+ *
+ * At the bound, or past the cap, `execFile` sends the CLI SIGKILL, which it
+ * cannot ignore. `execFile` reports the CLI's end only once it has exited and
+ * its output pipes have closed, so the promise does not rely on that report
+ * alone: a timer of its own, the bound plus
+ * {@link DOCKER_ENDPOINT_QUERY_SETTLE_GRACE_MS}, kills the CLI again (SIGKILL;
+ * on Windows `child.kill()`, which terminates it), closes its output pipes
+ * from this side, stops it keeping Node's event loop alive and fails with the
+ * same timeout text. The promise settles exactly once, on whichever comes
+ * first, and the timer is cleared when the report comes first.
+ *
+ * @returns The local endpoint, such as `unix:///var/run/docker.sock`.
+ * @throws Error with fixed text when `docker` is not on PATH or cannot be
+ *   started (with at most a validated error code), does not finish within
+ *   the bound, prints more than the cap, ends on a signal or exits non-zero
+ *   (naming only the exit code); or the error of {@link localDockerEndpoint}
+ *   when the endpoint it reports is not local.
+ */
+function resolveDockerEndpoint(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    // Settles once, on execFile's report or on settleTimer, whichever runs
+    // first, and clears the timer.
+    const settle = (outcome: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (settleTimer !== undefined) {
+        clearTimeout(settleTimer);
+        settleTimer = undefined;
+      }
+      outcome();
+    };
+    const fail = (message: string, code?: string) =>
+      settle(() => reject(Object.assign(new Error(message), { code })));
+    const query = 'docker context inspect';
+    const timedOut = () =>
+      fail(
+        `The docker CLI did not report which Docker daemon it selects within ${DOCKER_ENDPOINT_QUERY_TIMEOUT_MS / 1_000} s (${query}) and was stopped. ${DOCKER_ENDPOINT_QUERY_HINT}`,
+      );
+    // The system's message can quote the arguments or the environment, so
+    // only the validated code is kept.
+    const startFailure = (err: unknown) => {
+      const validated = validatedErrorCode(err);
+      fail(
+        `Could not run "${query}" to find which Docker daemon the docker CLI selects${validated === undefined ? '' : ` (${validated})`}.`,
+        validated,
+      );
+    };
+    let child: ChildProcess;
+    try {
+      child = execFile(
+        'docker',
+        DOCKER_ENDPOINT_QUERY_ARGS,
+        {
+          env: composeEnvironment(),
+          timeout: DOCKER_ENDPOINT_QUERY_TIMEOUT_MS,
+          killSignal: 'SIGKILL',
+          maxBuffer: DOCKER_ENDPOINT_QUERY_MAX_BYTES,
+          encoding: 'utf8',
+          windowsHide: true,
+        },
+        (err: unknown, stdout: string) => {
+          if (err === null) {
+            let endpoint: string;
+            try {
+              endpoint = localDockerEndpoint(stdout);
+            } catch (refused) {
+              settle(() => reject(refused));
+              return;
+            }
+            settle(() => resolve(endpoint));
+            return;
+          }
+          const code = errorCode(err);
+          const signal = typeof err === 'object' && err !== null && 'signal' in err
+            ? (err as { signal: unknown }).signal
+            : undefined;
+          const killed = typeof err === 'object' && err !== null && 'killed' in err
+            && (err as { killed: unknown }).killed === true;
+          if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+            fail(
+              `The docker CLI printed more than ${DOCKER_ENDPOINT_QUERY_MAX_BYTES / 1_024} KiB when asked which Docker daemon it selects (${query}), which is not one endpoint. ${DOCKER_ENDPOINT_QUERY_HINT}`,
+            );
+          } else if (code === 'ENOENT') {
+            fail(
+              'The docker CLI was not found on PATH. The acceptance stack needs Docker Engine 28.0 or later with Docker Compose v2.1.1 or later.',
+              code,
+            );
+          } else if (typeof code === 'string') {
+            startFailure(err);
+          } else if (killed) {
+            timedOut();
+          } else if (typeof code === 'number' && Number.isInteger(code)) {
+            fail(
+              `The docker CLI could not report which Docker daemon it selects (${query} exited with code ${code}). ${DOCKER_ENDPOINT_QUERY_HINT}`,
+            );
+          } else if (typeof signal === 'string' && /^SIG[A-Z0-9]{1,16}$/.test(signal)) {
+            fail(
+              `The docker CLI could not report which Docker daemon it selects (${query} ended on ${signal}). ${DOCKER_ENDPOINT_QUERY_HINT}`,
+            );
+          } else {
+            fail(`The docker CLI could not report which Docker daemon it selects (${query} failed). ${DOCKER_ENDPOINT_QUERY_HINT}`);
+          }
+        },
+      );
+    } catch (err) {
+      // execFile throws synchronously on an invalid argument or environment
+      // entry.
+      startFailure(err);
+      return;
+    }
+    // execFile reports only once the CLI has exited and its pipes have
+    // closed. This timer settles the query without waiting for either.
+    settleTimer = setTimeout(() => {
+      settleTimer = undefined;
+      if (settled) {
+        return;
+      }
+      try {
+        if (process.platform === 'win32') {
+          child.kill();
+        } else {
+          child.kill('SIGKILL');
+        }
+      } catch {
+        // Deliberately ignored: the query fails below whether or not the
+        // CLI could be signalled.
+      }
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+      timedOut();
+    }, DOCKER_ENDPOINT_QUERY_TIMEOUT_MS + DOCKER_ENDPOINT_QUERY_SETTLE_GRACE_MS);
+  });
+}
+
+/**
  * Runs one Compose command on the acceptance project, from the repository
  * root, with the neutralized Compose environment, within a deadline. Output
  * is collected, not streamed, so it is printed once, filtered by
@@ -1191,6 +1500,8 @@ function stopWindowsProcessTree(child: ChildProcess): void {
  * command started.
  *
  * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint {@link resolveDockerEndpoint}
+ *   returned, passed as `--host` so the command acts on that daemon only.
  * @param args - The Compose subcommand and its arguments.
  * @param deadlineMs - How long the command may run before it is stopped.
  * @returns The exit code, whether the command timed out, the kept output and
@@ -1199,7 +1510,7 @@ function stopWindowsProcessTree(child: ChildProcess): void {
  *   text with at most a validated error code, such as `EACCES`, never the
  *   system's own message.
  */
-function runCompose(root: string, args: string[], deadlineMs: number): Promise<ComposeResult> {
+function runCompose(root: string, endpoint: string, args: string[], deadlineMs: number): Promise<ComposeResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1218,7 +1529,7 @@ function runCompose(root: string, args: string[], deadlineMs: number): Promise<C
       finish();
     };
     try {
-      const child = spawn('docker', composeArgs(root, ...args), {
+      const child = spawn('docker', composeArgs(endpoint, root, ...args), {
         cwd: root,
         env: composeEnvironment(),
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1594,26 +1905,34 @@ function portableCommandLine(argv: string[]): string | undefined {
  * removal has failed.
  *
  * The command shown is the one setup runs, built from {@link composeArgs} and
- * {@link DOWN_ARGS}: it names the project, the Compose file, the project
+ * {@link DOWN_ARGS}: it names the same Docker daemon this run used with
+ * `--host`, so `DOCKER_HOST`, `DOCKER_CONTEXT` or the current context cannot
+ * send it to another daemon, and the project, the Compose file, the project
  * directory and the empty env file with absolute paths, so it works from any
  * directory and never reads a developer's `.env` or override file. A pasted
  * command cannot carry setup's neutralized environment, so the text names the
  * variables to unset; it never shows a variable's value. Running the tests
  * again in fresh mode is offered as well, and is the only route offered when
- * the repository path cannot be quoted for every shell.
+ * the repository path cannot be quoted for every shell. A rerun is not
+ * pinned: it checks the daemon again and removes the stack only from the
+ * daemon the docker CLI selects then, so the text names this run's endpoint,
+ * already validated as local by {@link composeArgs}, as the one the CLI must
+ * still select.
  *
  * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint this run's Compose calls used.
  * @returns One or more lines of instructions, without a trailing newline.
  */
-function manualRemovalHint(root: string): string {
+function manualRemovalHint(root: string, endpoint: string): string {
+  const command = portableCommandLine(['docker', ...composeArgs(endpoint, root, ...DOWN_ARGS)]);
   const rerun =
-    'running the tests again in fresh mode (E2E_REUSE_STACK unset), which starts with this same removal';
-  const command = portableCommandLine(['docker', ...composeArgs(root, ...DOWN_ARGS)]);
+    `running the tests again in fresh mode (E2E_REUSE_STACK unset) while the docker CLI still selects this run's Docker daemon, ${endpoint}: ` +
+    'a fresh run checks the daemon again and removes the stack only from the daemon the docker CLI selects then';
   if (command === undefined) {
     return `Remove it by ${rerun}. No command is shown, because the repository path holds a character that POSIX shells, PowerShell and cmd do not all read the same way.`;
   }
   return [
-    'Remove it from any directory, in a shell where COMPOSE_PROJECT_NAME, COMPOSE_FILE, COMPOSE_PROFILES, COMPOSE_ENV_FILES and every SMARTHOTEL_* variable are unset, with:',
+    'Remove it from any directory, in a shell where COMPOSE_PROJECT_NAME, COMPOSE_FILE, COMPOSE_PROFILES, COMPOSE_ENV_FILES and every SMARTHOTEL_* variable are unset, with this command, which names this run\'s Docker daemon with --host:',
     `  ${command}`,
     `or by ${rerun}.`,
   ].join('\n');
@@ -1628,22 +1947,25 @@ function manualRemovalHint(root: string): string {
  * same {@link manualRemovalHint}.
  *
  * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint the failed `up` used.
  */
-async function removeFailedStack(root: string): Promise<void> {
+async function removeFailedStack(root: string, endpoint: string): Promise<void> {
   try {
-    const result = await runCompose(root, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
+    const result = await runCompose(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
     if (result.timedOut || result.code !== 0) {
       printComposeFailure(DOWN_ARGS.join(' '), result, COMPOSE_DOWN_TIMEOUT_MS);
       const note = result.timedOut
         ? ` (it did not finish within ${describeDuration(COMPOSE_DOWN_TIMEOUT_MS)} and was stopped)`
         : '';
-      console.error(`Removing the failed ${ACCEPTANCE_PROJECT} stack also failed${note}. ${manualRemovalHint(root)}`);
+      console.error(
+        `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed${note}. ${manualRemovalHint(root, endpoint)}`,
+      );
     }
   } catch (err) {
     // runCompose rejects with fixed text; only its validated code is repeated.
     const code = validatedErrorCode(err);
     console.error(
-      `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed (docker compose could not be started${code === undefined ? '' : `, ${code}`}). ${manualRemovalHint(root)}`,
+      `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed (docker compose could not be started${code === undefined ? '' : `, ${code}`}). ${manualRemovalHint(root, endpoint)}`,
     );
   }
 }
@@ -1853,13 +2175,22 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * starts db, api and web from fresh volumes with generated secrets, waiting
  * until all three are healthy. It then requires the web app's `/config.json`
  * to name `http://localhost:18080/api` as its API, so the browser specs and
- * the direct API requests reach the same stack and database. Every Compose
- * call names the project, the repository's `docker-compose.yml` and the empty
- * `deploy/acceptance.env` explicitly and runs with the Compose and
- * `SMARTHOTEL_*` variables neutralized, so a developer's stack, `.env` and
- * overrides are never touched or read. It never switches to other ports. The
- * stack is left running after the run; remove it with
- * `docker compose -p smarthotel-acceptance down -v`.
+ * the direct API requests reach the same stack and database. Before its first
+ * Compose call it asks the docker CLI which Docker daemon it selects
+ * (`DOCKER_HOST`, else `DOCKER_CONTEXT`, else the current context) and fails
+ * unless that is a local unix socket or a local Windows named pipe, because
+ * the run removes the project's volumes and reaches the stack on this
+ * machine's `127.0.0.1` ports; every Compose call then names that daemon with
+ * `--host`, so no other daemon's project of the same name is ever removed.
+ * Every Compose call also names the project, the repository's
+ * `docker-compose.yml` and the empty `deploy/acceptance.env` explicitly and
+ * runs with the Compose and `SMARTHOTEL_*` variables neutralized, so a
+ * developer's stack, `.env` and overrides are never touched or read. It never
+ * switches to other ports. The stack is left running after the run; the next
+ * fresh run removes it, and so does
+ * `docker --host <endpoint> compose -p smarthotel-acceptance -f <root>/docker-compose.yml --project-directory <root> --env-file <root>/deploy/acceptance.env down -v --remove-orphans`,
+ * with the local endpoint the run printed, in a shell without the Compose
+ * selection and `SMARTHOTEL_*` variables.
  *
  * One fresh run at a time owns the acceptance project on a host. Before its
  * first Compose call a fresh run listens on `127.0.0.1` port
@@ -1892,12 +2223,13 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  *   suite: it releases the lock and leaves the stack running. In reuse mode,
  *   nothing.
  * @throws Error when another fresh run owns the acceptance stack, another
- *   program holds the lock port or it cannot be listened on, Docker or
- *   Compose is unavailable, fails or outlives its deadline, an acceptance
- *   port is taken, the target does not answer, or in fresh mode the web
- *   app's `/config.json` does not name the acceptance API; the message says
- *   which. A failed or timed-out Compose command's filtered output is printed
- *   before the throw.
+ *   program holds the lock port or it cannot be listened on, the docker CLI
+ *   selects a Docker daemon that is not local or cannot say which it
+ *   selects, Docker or Compose is unavailable, fails or outlives its
+ *   deadline, an acceptance port is taken, the target does not answer, or in
+ *   fresh mode the web app's `/config.json` does not name the acceptance API;
+ *   the message says which. A failed or timed-out Compose command's
+ *   recognized status lines and likely causes are printed before the throw.
  */
 export default async function globalSetup(): Promise<(() => Promise<void>) | void> {
   const target = resolveStackTarget();
@@ -1925,22 +2257,29 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
 
 /**
  * The fresh path of {@link globalSetup}, run while this run holds the lock:
- * removes the acceptance project, checks the acceptance ports, starts the
- * stack, probes `target` and requires the web app's `/config.json` to name
+ * resolves the local Docker daemon every Compose call names, removes the
+ * acceptance project, checks the acceptance ports, starts the stack, probes
+ * `target` and requires the web app's `/config.json` to name
  * `target.apiUrl`.
  *
  * @param root - The repository root.
  * @param target - The fresh target, the stack this run builds.
- * @throws Error when a Compose command fails or outlives its deadline, an
- *   acceptance port is taken, the target does not answer or the web app's
- *   `/config.json` does not name the acceptance API.
+ * @throws Error when the docker CLI selects a Docker daemon that is not local
+ *   or cannot say which it selects ({@link resolveDockerEndpoint}), a Compose
+ *   command fails or outlives its deadline, an acceptance port is taken, the
+ *   target does not answer or the web app's `/config.json` does not name the
+ *   acceptance API.
  */
 async function buildAcceptanceStack(root: string, target: StackTarget): Promise<void> {
+  // First, before any Compose call: the removal below must reach this
+  // machine's Docker daemon and no other.
+  const endpoint = await resolveDockerEndpoint();
+  console.log(`Docker daemon: ${endpoint} (local).`);
   console.log(
     `Building the ${ACCEPTANCE_PROJECT} stack (web :${ACCEPTANCE_WEB_PORT}, API :${ACCEPTANCE_API_PORT})…`,
   );
 
-  const down = await runCompose(root, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
+  const down = await runCompose(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
   if (down.timedOut) {
     printComposeFailure(DOWN_ARGS.join(' '), down, COMPOSE_DOWN_TIMEOUT_MS);
     throw new Error(
@@ -1972,10 +2311,10 @@ async function buildAcceptanceStack(root: string, target: StackTarget): Promise<
   }
 
   console.log('Building images and starting db, api and web; a first build can take several minutes.');
-  const up = await runCompose(root, UP_ARGS, COMPOSE_UP_TIMEOUT_MS);
+  const up = await runCompose(root, endpoint, UP_ARGS, COMPOSE_UP_TIMEOUT_MS);
   if (up.timedOut || up.code !== 0) {
     printComposeFailure(UP_ARGS.join(' '), up, COMPOSE_UP_TIMEOUT_MS);
-    await removeFailedStack(root);
+    await removeFailedStack(root, endpoint);
     throw new Error(
       up.timedOut
         ? `docker compose up --wait did not finish within ${describeDuration(COMPOSE_UP_TIMEOUT_MS)} for project ${ACCEPTANCE_PROJECT} and was stopped; see the Compose output above.`

@@ -77,7 +77,7 @@ These are the combinations that every prerequisite supports: Playwright 1.60.0's
 - Docker Engine 28.0 or later, with Docker Compose v2.1.1 or later (`docker compose up --wait` needs 2.1.1). Docker Desktop releases that bundle those versions qualify. Engine 28.0 is also the first release that stops other hosts on the LAN from reaching ports published on `127.0.0.1`.
   - On a Linux host that runs firewalld, use Docker Engine 28.3.3 or later. Engines 28.2.0 through 28.3.2 do not restore that protection after firewalld reloads (CVE-2025-54388), so other hosts with a route to the Docker host could then reach ports published on `127.0.0.1`, including the passwordless `db-test`. `docker version --format '{{.Server.Version}}'` prints the engine version, and `systemctl is-active firewalld` prints `active` when firewalld runs. A firewalld host that must keep an earlier engine needs host firewall rules of its own that block forwarded traffic to the Docker networks, verified before the test fixture starts `db-test`; otherwise point `SMARTHOTEL_TEST_POSTGRES` at another server. Docker Desktop and rootless mode are not affected.
 - .NET SDK 8.0.428 exactly. `global.json` pins it with roll-forward disabled, so `dotnet` commands in this repository fail unless that exact SDK is installed.
-- Node.js 20.20.2 with npm, for the web workspace and its tests.
+- Node.js 20.20.2 with npm, for the web workspace and its tests. The web image installs with npm 11.21.3, and hosts that want the same installer can use it too (`npm install -g npm@11.21.3`).
 - Playwright's Chromium 148.0.7778.96, installed per machine with `npx playwright install chromium` (see [Web tests](#web-tests)).
 
 ### Line endings
@@ -228,7 +228,7 @@ dotnet test
 
 This runs `SmartHotel.sln`: the unit tests in `tests/SmartHotel.Api.UnitTests` and the integration tests in `tests/SmartHotel.Api.IntegrationTests`, which drive the real API pipeline in-process against a real PostgreSQL 16 server.
 
-- By default the test fixture starts the `db-test` Compose service itself, in its own Compose project `smarthotel-test` with `--profile test`. The service is published on `127.0.0.1:55432`, accepts passwordless connections (trust authentication), sits alone on its own `testdb` network and keeps its data on tmpfs; its server log, like `db`'s, leaves out constraint DETAIL, the failing statement of any error below PANIC, and bind parameters. Docker must therefore be running. The service's loopback-only publishing relies on the Docker Engine requirement under [Tools](#tools): 28.0 or later, and 28.3.3 or later on a Linux host that runs firewalld. The fixture leaves the service running for the next run.
+- By default the test fixture starts the `db-test` Compose service itself, in its own Compose project `smarthotel-test` with `--profile test`. The service is published on `127.0.0.1:55432`, accepts passwordless connections (trust authentication), sits alone on its own `testdb` network and keeps its data on tmpfs; its server log, like `db`'s, leaves out constraint DETAIL, the failing statement of any error below PANIC, and bind parameters. Docker must therefore be running. The service's loopback-only publishing relies on the Docker Engine requirement under [Tools](#tools): 28.0 or later, and 28.3.3 or later on a Linux host that runs firewalld. The fixture leaves the service running for the next run. It starts `db-test` only on this machine's Docker daemon: it first asks the docker CLI which daemon it selects (`DOCKER_HOST` when set, else `DOCKER_CONTEXT`, else the current context) and passes that endpoint to Compose as `--host`, and it refuses anything but a local unix socket or a local Windows named pipe, such as a TCP or SSH endpoint, with a message that names the kind of endpoint but not its value. To fix that, unset `DOCKER_HOST` or `DOCKER_CONTEXT`, switch with `docker context use` to a local context such as `default` or Docker Desktop's, or set `SMARTHOTEL_TEST_POSTGRES`. A unix socket or named pipe on this machine is trusted as this machine's Docker daemon (Docker Engine's, rootless Docker's or Docker Desktop's, whose published `127.0.0.1` ports reach this host); the fixture cannot tell whether such a socket forwards to another machine, as an SSH-forwarded socket does, so never point `DOCKER_HOST` or a context at one.
 - <a name="alternate-test-server"></a>To use another server instead, set `SMARTHOTEL_TEST_POSTGRES` to its connection string. That server must meet every prerequisite below:
   - **Selection.** A blank or whitespace-only value counts as unset. Unset, the fixture starts `db-test` and connects with `Host=127.0.0.1;Port=55432;Username=postgres` and `SSL Mode=Disable`, because `db-test` offers no TLS. Set, the value selects the server and no Compose call is made.
   - **Connection string.** A valid Npgsql connection string that sets `Host`, for a PostgreSQL 16 server.
@@ -259,11 +259,7 @@ dotnet test --filter "FullyQualifiedName~SmartHotel.Api.IntegrationTests"
 dotnet test --filter "FullyQualifiedName~ListBookingsTests|FullyQualifiedName~CancelBookingTests"
 ```
 
-Stop the test database:
-
-```bash
-docker compose -p smarthotel-test --profile test down
-```
+To stop the test database, see [Removing the test stacks](#removing-the-test-stacks).
 
 ### Web tests
 
@@ -293,7 +289,7 @@ ng test
 
 `npx ng test` is equivalent. No globally installed Angular CLI is assumed, and `npm test` is not supported, because `package.json` defines no `test` script.
 
-`ng test` runs Playwright Test, the web app's only test framework, through the in-repo Angular builder in `tools/playwright-builder`. Karma and Jasmine are not used. The suite runs in Chromium, one test at a time, with no retries, and Docker must be running.
+`ng test` runs Playwright Test, the web app's only test framework, through the in-repo Angular builder in `tools/playwright-builder`. Karma and Jasmine are not used. The suite runs in Chromium, one test at a time, with no retries. Docker must be running: a fresh run, the default, builds its stack with Compose, and in either mode the production Content-Security-Policy tests in `e2e/stack.spec.ts` render the web image's nginx template with `docker run`. In [reuse mode](#reuse-mode) setup itself makes no Docker call and builds, resets or removes no stack.
 
 #### Acceptance stack
 
@@ -302,16 +298,14 @@ Unless reuse mode is on, every `ng test` or `npx playwright test` run first buil
 - It removes and rebuilds the Compose project `smarthotel-acceptance`: `down -v --remove-orphans`, then `up -d --build --force-recreate --wait`. The images are built from the current sources, and the volumes and secrets are fresh.
 - It publishes the API on host port 18080 and the web app on host port 14200. The tests target `http://localhost:14200` and `http://localhost:18080/api`.
 - Once both answer, setup requires the web app's `http://localhost:14200/config.json` to name `http://localhost:18080/api` as its API, in the canonical form the SPA uses, so the browser tests and the tests' direct API requests reach the same stack and database. A missing, invalid or different API base URL fails the run with a message that names the expected API and never prints the served value.
-- Every Compose call names the project, the repository's `docker-compose.yml` and `--env-file deploy/acceptance.env`, an intentionally empty file. The Compose child process runs in a neutralized environment, without `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `COMPOSE_PROFILES`, `COMPOSE_ENV_FILES` or any `SMARTHOTEL_*` variable. Your own stack, its volumes and data, your `.env` and your overrides are never touched or read.
+- Every Compose call is `docker --host <endpoint> compose -p smarthotel-acceptance -f <root>/docker-compose.yml --project-directory <root> --env-file <root>/deploy/acceptance.env …`, where `<root>` is the repository root and `<endpoint>` is the local Docker daemon described in the next bullet. `-f` names the repository's Compose file, which also keeps a `docker-compose.override.yml` out; `--project-directory` resolves the file's relative paths from the root; and `deploy/acceptance.env` is intentionally empty, so no `.env` is read. The Compose child process's environment first loses `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `COMPOSE_PROFILES`, `COMPOSE_ENV_FILES` and every `SMARTHOTEL_*` variable, then gets `SMARTHOTEL_API_PORT=18080` and `SMARTHOTEL_WEB_PORT=14200`. Compose derives the API's `Cors__AllowedOrigin` (`http://localhost:14200`) and the web app's `API_BASE_URL` (`http://localhost:18080/api`) from those two ports, which is why the web app, CORS and the tests agree. No profile is enabled, so `db-test` never starts. Every other variable passes through unchanged. Your own stack, its volumes and data, your `.env` and your overrides are never touched or read.
+- Before its first Compose call the run asks the docker CLI which Docker daemon it selects (`DOCKER_HOST` when set, else `DOCKER_CONTEXT`, else the current context), prints it, and passes that endpoint as `--host` to every Compose call, so every call acts on the same daemon. It accepts only this machine's daemon, through a local unix socket (`unix:///<path>`) or a local Windows named pipe (`npipe:////./pipe/<name>`), because it removes the project's volumes and reaches the stack on this machine's `127.0.0.1` ports. Any other endpoint, such as a TCP or SSH one, fails the run before any Compose call, with a message that names the kind of endpoint but not its value. To fix that, unset `DOCKER_HOST` or `DOCKER_CONTEXT`, or switch with `docker context use` to a local context such as `default` or Docker Desktop's. A unix socket or named pipe on this machine is trusted as this machine's Docker daemon (Docker Engine's, rootless Docker's or Docker Desktop's, whose published `127.0.0.1` ports reach this host); the run cannot tell whether such a socket forwards to another machine, as an SSH-forwarded socket does, so never point `DOCKER_HOST` or a context at one.
 - Each Compose command has a deadline: 5 minutes for each `down -v --remove-orphans` (the removal before the build and the one after a failed `up`) and 30 minutes for `up -d --build --force-recreate --wait`, which leaves room for a first image build on a clean machine. A command still running at its deadline is stopped together with its whole process tree, and nothing else: the `docker` CLI, the Compose plugin it runs and every process they started are sent SIGTERM, and whatever is left of them is frozen with SIGSTOP, so that it cannot start another process, and sent SIGKILL after 10 seconds (on Windows, `taskkill /T /F` ends the tree at once). Setup then waits up to 10 more seconds for that tree to be gone and the command's output pipes to close, and releases the run's lock only after that wait, so a later run cannot overlap the stopped command. The run then fails with a message saying the command timed out after its deadline, after printing the command's filtered output. A timed-out `up`, like a failed one, is followed by `down -v` of the acceptance project; if that removal also fails or times out, setup prints the command that removes the project by hand. At most the last 1 MiB of characters of a command's output is kept, from the first line that starts within it; a line that limit cuts through is dropped whole, including the part of it written later, so the end of a line is never printed without its start. The printed output says when earlier output was omitted.
+- When a Compose command fails or times out, setup prints a header naming the command, its exit code or deadline and the project, then only the lines that match one of its canonical Compose and BuildKit messages, each prefixed `compose |`. These are events of the stack's own containers, networks, volumes and built images, such as `Container smarthotel-acceptance-db-1 Healthy`, with at most a duration or one of Compose's own dependency-failure details, any other details replaced by `[details withheld]`; Compose's own not-started, dependency-failure, exited and unhealthy messages for the stack's containers and services, such as `dependency failed to start: container smarthotel-acceptance-api-1 exited (1)`; and BuildKit step markers of the repository's own build stages, such as `#12 [api build 6/10] RUN`, `#12 DONE 0.4s`, `#12 CACHED` or `#12 ERROR`, without the instruction's arguments or the error's text. Names appear only as the project's own, and numbers only as exit codes, container indexes, step numbers and counters, unnamed-stage numbers and durations. At most the last 200 of those lines are printed. Every other line, base-image pulls included, is withheld and only counted, as `[N other lines withheld]`, because Docker, registry and build output can carry credentials that no pattern recognizes. Fixed `Likely cause: …` lines follow, such as a host port already in use, and a reminder that running the same command by hand shows its full output.
 - If another process holds port 18080 or 14200 on `127.0.0.1` or `::1`, setup fails with a message naming the port. Both loopback addresses are checked because `localhost` can resolve to either; a host without IPv6 is checked on `127.0.0.1` alone. Setup never switches to other ports.
 - Only one fresh run per host owns the acceptance stack at a time. It does so by listening on `127.0.0.1:18079` from before its first Compose call until it ends, and the operating system frees that port however the run ends, even when it is killed. A second fresh run started meanwhile fails before touching the stack, with a message naming the run that owns it: its process id, start time and checkout. If another program holds port 18079, the run fails with a message naming that port.
 
-The stack stays up after the run. Remove it with:
-
-```bash
-docker compose -p smarthotel-acceptance down -v
-```
+The stack stays up after the run. To remove it, see [Removing the test stacks](#removing-the-test-stacks).
 
 #### Reuse mode
 
@@ -335,6 +329,46 @@ npx playwright test e2e/stack.spec.ts
 ```
 
 Each one builds the acceptance stack first, unless reuse mode is on.
+
+### Removing the test stacks
+
+The acceptance stack and `db-test` stay up after their runs. Remove them from the repository root in a POSIX shell (bash or zsh, including WSL 2 and Git Bash), with the same Compose selection and environment the runs use, on the same local Docker daemon.
+
+The acceptance stack, with its containers, networks and volumes:
+
+```bash
+endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')" &&
+case "$endpoint" in
+  unix:///?*|npipe:////./pipe/?*) echo "Docker daemon: $endpoint" ;;
+  *) echo "The docker CLI does not select a local Docker daemon; not removing anything." >&2; false ;;
+esac &&
+env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE -u COMPOSE_PROFILES -u COMPOSE_ENV_FILES \
+  -u SMARTHOTEL_DB_PASSWORD -u SMARTHOTEL_JWT_SIGNING_KEY \
+  SMARTHOTEL_API_PORT=18080 SMARTHOTEL_WEB_PORT=14200 \
+  docker --host "$endpoint" compose -p smarthotel-acceptance -f docker-compose.yml --project-directory . \
+    --env-file deploy/acceptance.env down -v --remove-orphans
+```
+
+The test database, as the API tests' fixture starts it:
+
+```bash
+endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')" &&
+case "$endpoint" in
+  unix:///?*|npipe:////./pipe/?*) echo "Docker daemon: $endpoint" ;;
+  *) echo "The docker CLI does not select a local Docker daemon; not removing anything." >&2; false ;;
+esac &&
+env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE -u COMPOSE_PROFILES -u COMPOSE_ENV_FILES \
+  -u SMARTHOTEL_API_PORT -u SMARTHOTEL_WEB_PORT -u SMARTHOTEL_DB_PASSWORD -u SMARTHOTEL_JWT_SIGNING_KEY \
+  docker --host "$endpoint" compose -p smarthotel-test -f docker-compose.yml --project-directory . \
+    --env-file deploy/acceptance.env --profile test down
+```
+
+- `docker-compose.yml` reads only four `SMARTHOTEL_*` variables: `SMARTHOTEL_API_PORT`, `SMARTHOTEL_WEB_PORT`, `SMARTHOTEL_DB_PASSWORD` and `SMARTHOTEL_JWT_SIGNING_KEY`. The first command unsets the two secret overrides and sets the two ports to the acceptance values, as the acceptance run does; the second unsets all four, as the fixture does. So no value in your shell changes or breaks the Compose file. The explicit `-p`, `-f`, `--project-directory` and `--env-file` take precedence over `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE` and `COMPOSE_ENV_FILES` and keep your `.env` and any `docker-compose.override.yml` out; `env -u` removes those variables too, and `COMPOSE_PROFILES`, so no other profile is enabled. Your own stack is not touched.
+- Remove the acceptance stack only when no test run is using it. A fresh run owns it while it listens on `127.0.0.1:18079` (see [Acceptance stack](#acceptance-stack)), and a reuse run aimed at ports 14200 and 18080 uses it too. Removing it under a run fails that run.
+- Stop `db-test` only when no `dotnet test` run is using it. Its data is on tmpfs and is lost, and the next `dotnet test` starts it again.
+- Each command first asks the docker CLI which Docker daemon it selects (`DOCKER_HOST` when set, else `DOCKER_CONTEXT`, else the current context) and accepts only a local unix socket (`unix:///<path>`) or a local Windows named pipe (`npipe:////./pipe/<name>`). Anything else, such as a TCP or SSH endpoint, stops it with a non-zero status before any Compose call, without showing the endpoint. It prints the accepted endpoint as `Docker daemon: <endpoint>` and pins Compose to it with `--host`. A fresh acceptance run printed its daemon as `Docker daemon: <endpoint> (local).`, and the `dotnet test` fixture used the one the CLI selected when it ran. Before you remove a stack, compare that with what `docker context inspect --format '{{.Endpoints.docker.Host}}'` prints now; if they differ, switch with `docker context use`, or set `DOCKER_HOST`, to the run's endpoint first. The removal command a failed fresh run prints already carries that run's `--host`. A unix socket or named pipe on this machine is trusted as this machine's Docker daemon (Docker Engine's, rootless Docker's or Docker Desktop's); nothing here can tell whether one forwards to another machine, as an SSH-forwarded socket does, so never point `DOCKER_HOST` or a context at such a socket.
+
+In PowerShell, run them in WSL 2 or Git Bash, or in a new PowerShell session that you close afterwards, so your own session keeps its settings. In it, read the endpoint with `$endpoint = docker context inspect --format '{{.Endpoints.docker.Host}}'` and go on only if that printed one line that starts with `npipe:////./pipe/` or `unix:///`. Then remove each variable the command unsets with `Remove-Item Env:<name> -ErrorAction SilentlyContinue`, set `$env:SMARTHOTEL_API_PORT = '18080'` and `$env:SMARTHOTEL_WEB_PORT = '14200'` for the acceptance stack, and run the command's `docker … compose …` part on one line, with `--host $endpoint` between `docker` and `compose`.
 
 ### Success criteria
 
@@ -421,30 +455,54 @@ The API reads secrets only from process environment variables, never from `appse
 
 ### Local Compose variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `SMARTHOTEL_API_PORT` | `8080` | Host port of the API: one port number from `1` to `65535`, in decimal without leading zeros. `0`, a range or a leading zero makes the `api` container exit at start with a message naming the variable, so `docker compose up --wait` fails ([port rules](#run-the-product)). Also sets the web app's `API_BASE_URL`. |
-| `SMARTHOTEL_WEB_PORT` | `4200` | Host port of the web app, in the same format and with the same check. Also sets the API's `Cors__AllowedOrigin`; port `80` gives the origin `http://localhost`. |
-| `SMARTHOTEL_DB_PASSWORD` | Blank, so generated | First-start override of the database password, in the [secret format](#secrets) |
-| `SMARTHOTEL_JWT_SIGNING_KEY` | Blank, so generated | First-start override of the JWT signing key, in the [secret format](#secrets) |
+Set these in the shell or in `.env`:
 
-[`docker-compose.yml`](docker-compose.yml) sets everything else for the local stack. The API gets `ASPNETCORE_ENVIRONMENT=Development`, `ASPNETCORE_HTTP_PORTS=8080`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `SMARTHOTEL_SECRETS_DIR`, `Cors__AllowedOrigin=http://localhost:<web port>`, and `SMARTHOTEL_API_PORT` and `SMARTHOTEL_WEB_PORT` themselves, which its entrypoint checks before the API starts; for web port `80` the entrypoint writes the origin as `http://localhost`. The web container gets `API_BASE_URL=http://localhost:<api port>/api` and `WEB_ENVIRONMENT=Development`, which it renders into `/config.json`.
+| Variable | Value or format | Default | Secret | Purpose |
+|----------|-----------------|---------|--------|---------|
+| `SMARTHOTEL_API_PORT` | One port number from `1` to `65535`, in decimal without leading zeros | `8080` | No | Host port of the API. `0`, a range or a leading zero makes the `api` container exit at start with a message naming the variable, so `docker compose up --wait` fails ([port rules](#run-the-product)). Also sets the web app's `API_BASE_URL`. |
+| `SMARTHOTEL_WEB_PORT` | The same format, with the same check | `4200` | No | Host port of the web app. Also sets the API's `Cors__AllowedOrigin`; port `80` gives the origin `http://localhost`. |
+| `SMARTHOTEL_DB_PASSWORD` | The [secret format](#secrets), 16–128 characters | Blank, so generated | Yes | First-start override of the database password |
+| `SMARTHOTEL_JWT_SIGNING_KEY` | The [secret format](#secrets), 32–256 characters | Blank, so generated | Yes | First-start override of the JWT signing key |
+
+[`docker-compose.yml`](docker-compose.yml) sets the containers' other variables itself:
+
+| Container | Variable | Value | Secret | Purpose |
+|-----------|----------|-------|--------|---------|
+| `db` | `POSTGRES_DB`, `POSTGRES_USER` | `smarthotel` | No | The database and the role PostgreSQL creates when it initializes an empty data directory |
+| `db` | `POSTGRES_PASSWORD` | Exported by the wrapper from `/run/smarthotel-secrets/db_password` | Yes | That role's password, applied only when PostgreSQL initializes an empty data directory |
+| `api` | `ASPNETCORE_ENVIRONMENT` | `Development` | No | Local development: plain HTTP, with no HSTS or HTTPS redirection |
+| `api` | `ASPNETCORE_HTTP_PORTS` | `8080` | No | The API's plain-HTTP listener inside the container |
+| `api` | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` | `db`, `5432`, `smarthotel`, `smarthotel` | No | The connection string's parts |
+| `api` | `DB_PASSWORD`, `Jwt__SigningKey` | Exported by the API's entrypoint from `db_password` and `jwt_signing_key` in `SMARTHOTEL_SECRETS_DIR`, each only when it is unset | Yes | The database password and the JWT signing key |
+| `api` | `SMARTHOTEL_SECRETS_DIR` | `/run/smarthotel-secrets` | No | The read-only mount of the `secrets` volume that holds those two files |
+| `api` | `Cors__AllowedOrigin` | `http://localhost:<web port>`; for web port `80` the entrypoint writes `http://localhost` | No | The single origin CORS admits |
+| `api` | `SMARTHOTEL_API_PORT`, `SMARTHOTEL_WEB_PORT` | The host ports above | No | Checked by the entrypoint before the API starts |
+| `web` | `API_BASE_URL` | `http://localhost:<api port>/api` | No | Rendered into `/config.json` as `apiBaseUrl` |
+| `web` | `WEB_ENVIRONMENT` | `Development` | No | Rendered into `/config.json` as `environment` |
+| `db-test` | `POSTGRES_HOST_AUTH_METHOD` | `trust` | No | Passwordless connections for the [API tests](#api-tests) |
 
 ### Outside local development
 
-| Component | Variable | Value | Secret |
-|-----------|----------|-------|--------|
-| API | `ASPNETCORE_ENVIRONMENT` | `Production`, ASP.NET Core's default when unset | No |
-| API | `ASPNETCORE_HTTPS_PORTS` or `ASPNETCORE_URLS` | For example `443` or `https://+:443` | No |
-| API | `Kestrel__Certificates__Default__Path` | Path of the TLS certificate file | No |
-| API | `Kestrel__Certificates__Default__Password` | The default certificate's password, read only from this environment variable | Yes |
-| API | `ConnectionStrings__SmartHotel` | A full Npgsql connection string, used whole when set | Yes, it holds the password |
-| API | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | The connection string's parts, used when `ConnectionStrings__SmartHotel` is unset. `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASSWORD` must then be set and not blank; `DB_PORT` defaults to `5432`. The assembled string caps the connection pool at 50. | `DB_PASSWORD` only |
-| API | `Jwt__SigningKey` | At least 32 bytes in UTF-8 | Yes |
-| API | `Cors__AllowedOrigin` | `https://<web origin>`, a bare origin with no path and no trailing slash | No |
-| API | `Jwt__Issuer`, `Jwt__Audience` | Optional. The defaults are `SmartHotel.Api` and `SmartHotel.Web`, from `appsettings.json`. | No |
-| Web | `API_BASE_URL` | `https://<api host>/api` | No |
-| Web | `WEB_ENVIRONMENT` | `Production` | No |
+| Component | Variable | Value or format | Default | Secret | Purpose |
+|-----------|----------|-----------------|---------|--------|---------|
+| API | `ASPNETCORE_ENVIRONMENT` | An environment name, such as `Production` | `Production`, ASP.NET Core's default when unset | No | Every value other than `Development` in any letter case enforces [HTTPS](#https-outside-local-development). `development`, for example, also counts as Development here, whereas `WEB_ENVIRONMENT` must be exactly `Development`. |
+| API | `ASPNETCORE_HTTPS_PORTS` or `ASPNETCORE_URLS` | Ports separated by `;`, for example `443`, or URLs separated by `;`, for example `https://+:443` | Unset | No | The addresses Kestrel listens on. At least one must be HTTPS, or the API stops at start. `ASPNETCORE_URLS`, when set, takes the place of `ASPNETCORE_HTTPS_PORTS` and of the API image's `ASPNETCORE_HTTP_PORTS=8080`, a plain-HTTP listener. |
+| API | `ASPNETCORE_HTTPS_PORT` | One port number | Unset: the port of Kestrel's one HTTPS address | No | The port HTTPS redirection sends a plaintext request to, not a listener. Set it when Kestrel listens on several HTTPS ports. |
+| API | `HttpsRedirection__AllowedHosts` (configuration key `HttpsRedirection:AllowedHosts`) | Host names or IP addresses separated by `;`, an IPv6 address in brackets, for example `api.example.com;[2001:db8::10]` | Unset or blank: no host | No | The hosts a plaintext request may be redirected to HTTPS from, compared with the host of the request's `Host` header without regard to case or port. An entry with a wildcard, a scheme, a port or a path, or an IPv6 address without brackets, stops the API at start with a message that names the setting, never its value. Read only outside `Development`. |
+| API | `Kestrel__Certificates__Default__Path` | Path of a certificate file | Unset | No | The certificate of every HTTPS listener without one of its own |
+| API | `Kestrel__Certificates__Default__Password` | That file's password | Unset | Yes | Read only from this environment variable |
+| API | `Kestrel__Endpoints__<name>__Url` | One URL, for example `https://+:443` | Unset | No | A named Kestrel endpoint. Configured endpoints take the place of `ASPNETCORE_URLS` and the port variables. |
+| API | `Kestrel__Endpoints__<name>__Certificate__Path` | Path of a certificate file | Unset | No | That endpoint's own certificate |
+| API | `Kestrel__Endpoints__<name>__Certificate__Password` | That file's password | Unset | Yes | Read only from this environment variable |
+| API | `ConnectionStrings__SmartHotel` | A full Npgsql connection string | Unset | Yes, it holds the password | When set, even to a blank value, it is the connection string and the `DB_*` variables are never consulted, so an invalid value stops the API instead of falling back to them. It must parse as an Npgsql connection string, set a non-blank `Password`, leave `Passfile` unset, and enable neither `Include Error Detail` nor `Log Parameters`. It is used whole and keeps its own `Maximum Pool Size`, or Npgsql's default. |
+| API | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `DB_PORT`: decimal digits for an integer from `1` to `65535`. The others: any value that is not blank. | `DB_PORT`: `5432` when unset or blank. The others: none. | `DB_PASSWORD` only | The connection string's parts, used only when `ConnectionStrings__SmartHotel` is unset. `DB_HOST`, `DB_NAME`, `DB_USER` and `DB_PASSWORD` must then be set and not blank, and are used unaltered; the connection string builder quotes them, so `DB_PASSWORD` needs no escaping. The assembled string caps the connection pool at 50. |
+| API | `Jwt__SigningKey` | Not blank, and at least 32 bytes in UTF-8 | None | Yes | The HS256 key that signs and validates bearer tokens |
+| API | `Cors__AllowedOrigin` | `https://<web origin>`, a bare origin with no path and no trailing slash | None | No | The single origin CORS admits |
+| API | `Jwt__Issuer`, `Jwt__Audience` | Not blank | `SmartHotel.Api` and `SmartHotel.Web`, from `appsettings.json` | No | Optional. The tokens' `iss` and `aud`. |
+| Web | `API_BASE_URL` | `https://<api host>/api` | None | No | The API base URL the SPA calls, rendered into `/config.json` as `apiBaseUrl` |
+| Web | `WEB_ENVIRONMENT` | `Production` | Unset or blank: `/config.json` gets `Production`, as it does for every value other than exactly `Development` | No | Rendered into `/config.json` as `environment` |
+
+An invalid database, JWT, CORS or redirect-host setting stops the API at start, before it connects to the database, with a message that names the invalid variables or settings, never a value.
 
 Supply the secrets through the hosting environment's secret mechanism, never in a committed file. Outside Compose, leave `SMARTHOTEL_SECRETS_DIR` unset: the API container's entrypoint then reads no secret files and uses the variables above as they are set.
 
@@ -452,19 +510,22 @@ Kestrel reads its `Kestrel` settings from the usual configuration sources, excep
 
 ### Host test runner variables
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `SMARTHOTEL_TEST_POSTGRES` | Unset or blank: the fixture starts `db-test` and connects with `Host=127.0.0.1;Port=55432;Username=postgres` and `SSL Mode=Disable` | Another PostgreSQL 16 server for the integration tests, as an Npgsql connection string that meets the [alternate test server prerequisites](#alternate-test-server). It can carry a password, and the fixture never prints it. |
-| `E2E_REUSE_STACK` | Unset | `1` selects reuse mode for the web tests. Unset or empty runs a fresh acceptance stack. Any other value fails the run before any Compose call. |
-| `E2E_BASE_URL` | `http://localhost:4200` | The web app to target, in reuse mode only |
-| `E2E_API_URL` | `http://localhost:8080/api` | The API base to target, in reuse mode only |
+| Variable | Value or format | Default | Secret | Purpose |
+|----------|-----------------|---------|--------|---------|
+| `SMARTHOTEL_TEST_POSTGRES` | A full Npgsql connection string | Unset or blank: the fixture starts `db-test` and connects with `Host=127.0.0.1;Port=55432;Username=postgres` and `SSL Mode=Disable` | When it carries a password | Another PostgreSQL 16 server for the integration tests, as an Npgsql connection string that meets the [alternate test server prerequisites](#alternate-test-server). It can carry a password, and the fixture never prints it. |
+| `PGSSLROOTCERT` | Path of a root certificate file | Unset: `root.crt` in `~/.postgresql` (`%APPDATA%\postgresql` on Windows) when that file exists, else the system's trust store | No | The root certificate that verifies the test server's certificate under `SSL Mode=VerifyCA` or `VerifyFull`. Npgsql takes it from the connection string's `Root Certificate`, then this variable, then the default, and the cancellation test case that reaches the server through a local TCP relay checks the server's certificate the same way. |
+| `DEBUG`, `DEBUG_FILE`, `NODE_DEBUG` | Logger names for `DEBUG` and `NODE_DEBUG`, a file path for `DEBUG_FILE` | Unset | No, but their loggers print request headers, bearer tokens included | Leave them unset. `ng test` removes all three, in any letter case, from Playwright's environment and says so when one of them held a non-blank value. A direct `npx playwright test` cannot turn those loggers off once it has started, so it refuses to run while `DEBUG` or `NODE_DEBUG` is set and not blank, with a message that names the ones set, never their values. |
+| `E2E_REUSE_STACK` | `1` | Unset | No | `1` selects reuse mode for the web tests. Unset or empty runs a fresh acceptance stack. Any other value fails the run before any Compose call. |
+| `E2E_BASE_URL` | An `http` or `https` origin, as set out under [Reuse mode](#reuse-mode) | `http://localhost:4200`, also when empty | No | The web app to target, in reuse mode only |
+| `E2E_API_URL` | An `http` or `https` URL whose path is `/api`, as set out under [Reuse mode](#reuse-mode) | `http://localhost:8080/api`, also when empty | No | The API base to target, in reuse mode only |
 
 ## HTTPS outside local development
 
 The local Compose stack runs as `Development` over plain HTTP on loopback-bound ports. Every other environment enforces HTTPS end to end:
 
 - The API turns on HSTS and HTTPS redirection, and Kestrel serves HTTPS with the listener and certificate variables above.
-- A plaintext request the API cannot redirect, because it finds no HTTPS port to redirect to, is answered `403` with an `application/problem+json` body whose `detail` is `This API accepts HTTPS requests only.` It is refused before CORS and authentication, so credentials and tokens sent over plain HTTP are never processed. When Kestrel listens on several HTTPS ports beside an HTTP one, set `ASPNETCORE_HTTPS_PORT` to the port to redirect to; without it ASP.NET Core's redirection fails and every plaintext request gets a generic `500` problem, again before anything else runs.
+- A plaintext request is redirected only when `HttpsRedirection__AllowedHosts` lists the host of its `Host` header and the API knows an HTTPS port to redirect to. The answer is then `307`, with a `Location` on `https://` at that port and the same path and query. Every other plaintext request, and every one while that setting is unset or blank, is answered `403` with an `application/problem+json` body whose `detail` is `This API accepts HTTPS requests only.` and no `Location`, so a redirect never points at a host the operator did not list. Both answers come before CORS and authentication, so credentials and tokens sent over plain HTTP are never processed.
+- When Kestrel listens on several HTTPS ports beside an HTTP one, set `ASPNETCORE_HTTPS_PORT` to the port to redirect to; without it ASP.NET Core's redirection fails and a plaintext request from a listed host gets a generic `500` problem, again before anything else runs.
 - When Kestrel binds no HTTPS address at all, the API logs a critical event that names `ASPNETCORE_HTTPS_PORTS`, `ASPNETCORE_URLS` and the certificate variables, never their values, and stops with exit code 1.
 - Kestrel reads a certificate password only from the environment: `Kestrel__Certificates__Default__Password` for the default certificate, or `Kestrel__Endpoints__<name>__Certificate__Password` for an endpoint's own certificate. A password in `appsettings*.json`, user secrets or on the command line is ignored, as described under [Outside local development](#outside-local-development).
 - When the host fails to start, for example because Kestrel cannot load the certificate, the API logs one critical event, `5202`, that names the exception types and the listener and certificate variables to check, never an exception message or a value, and exits with code 1.
@@ -511,8 +572,9 @@ Not part of this version:
 - .NET 8 reached end of support on 10 November 2026, Angular 17 left long-term support on 15 May 2025, and Node.js 20 reached end of life on 30 April 2026. None of them receives further fixes. The project pins each line's final patch.
 - Under `TreatWarningsAsErrors`, a NuGet audit advisory published later against a pinned package fails the build until it is addressed.
 - Playwright stays at 1.60.0, the newest release whose documentation lists Node.js 20 support. Later releases document only Node.js 22 and newer, which Angular 17 does not support.
+- The `overrides` in `src/SmartHotel.Web/package.json` pin exact patched versions of the transitive build, lint and CLI dependencies that the pinned Angular 17.3 and lint packages would otherwise resolve to vulnerable releases, among them piscina, PostCSS, esbuild, Vite, webpack, the webpack dev server and pacote with its tar. No transitive dependency in the lockfile is left unpatched. `npm audit` covers that lockfile only, and the advisories it still reports are the Angular 17.3.12 framework advisories, which have no 17.x fix: `npm audit --omit=dev` reports them against `@angular/common`, `@angular/compiler`, `@angular/core`, `@angular/forms`, `@angular/platform-browser` and `@angular/router`, and the full `npm audit` repeats them against `@angular/compiler-cli`, `@ngtools/webpack` and `@angular-devkit/build-angular`, which depend on `@angular/compiler`. npm's own bundled dependencies are not part of the lockfile, so they were checked separately against the npm advisory database. The web image's build stage installs with npm 11.21.3, because the npm 10.8.2 bundled with its `node` base image ships a vulnerable tar. The pinned npm 11.21.3 still bundles glob 13.0.6 (GHSA-3g3m-2fjr-6pw4) and minimatch 10.2.5 (GHSA-g3hv-75wg-m249), and npm 12 needs Node.js 22 or newer. The build stage first uses the base image's npm 10.8.2 once, to fetch the pinned npm 11.21.3 from the registry with integrity checking. Both risks stay in the build stage: neither Node nor npm is present in the nginx runtime image.
 - The search latency check measures the machine that runs the stack, so its result depends on the hardware.
 - `db-test` accepts passwordless connections. Only its own Compose network and host loopback can reach it, and other LAN hosts are blocked from loopback-published ports only on Docker Engine 28.0 or later. On a Linux host that runs firewalld, engines 28.2.0 through 28.3.2 lose that block whenever firewalld reloads (CVE-2025-54388), so such a host needs 28.3.3 or later, or verified host firewall rules of its own that block forwarded traffic to the Docker networks.
 - Startup migrations are safe only while a single API instance runs.
-- A fresh `ng test` run resets only its own `smarthotel-acceptance` project. That stack stays up on ports 18080 and 14200 until the next run or `docker compose -p smarthotel-acceptance down -v`.
+- A fresh `ng test` run resets only its own `smarthotel-acceptance` project. That stack stays up on ports 18080 and 14200 until the next run or until you remove it as described under [Removing the test stacks](#removing-the-test-stacks).
 - The token is kept in memory, so reloading the page or opening a new tab signs the guest out.

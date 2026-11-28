@@ -6,6 +6,10 @@
 FROM node:20.20.2-alpine3.23 AS build
 WORKDIR /app
 ENV NG_CLI_ANALYTICS=false PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# The npm bundled with the base image ships a vulnerable tar. The build stage
+# installs with this pinned npm 11 release instead, which supports Node 20 and
+# whose bundled dependencies are audited separately from the lockfile.
+RUN npm install -g npm@11.21.3 --no-audit --no-fund
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY angular.json tsconfig.json tsconfig.app.json ./

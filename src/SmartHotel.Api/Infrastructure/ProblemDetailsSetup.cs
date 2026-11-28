@@ -21,7 +21,8 @@ namespace SmartHotel.Api.Infrastructure;
 /// Registers the API's ProblemDetails services and owns the single defaults routine that completes every
 /// error body, whether MVC's ProblemDetails factory builds it or <see cref="ApiProblemDetailsWriter"/> writes
 /// it for status-code pages and the exception handler. It also supplies MVC's model-binding messages and its
-/// invalid-model-state response, so a binding 400 carries only fixed messages under contract keys.
+/// invalid-model-state response, so a binding 400 carries only fixed messages under contract keys, and the header
+/// fields every API response carries.
 /// </summary>
 public static class ProblemDetailsSetup
 {
@@ -47,6 +48,19 @@ public static class ProblemDetailsSetup
     private const string NotANumberMessage = "The value must be a number.";
     private const string InvalidJsonMemberMessage = "The JSON value is not valid.";
     private const string InvalidBodyMessage = "The request body must be a valid JSON object.";
+
+    /// <summary>
+    /// The header fields every API response carries, whether the request pipeline produces it or the server rejects
+    /// the request before that pipeline runs: <c>X-Content-Type-Options: nosniff</c>, so a browser never reads a body
+    /// as a media type other than its <c>Content-Type</c>, and <c>X-Frame-Options: DENY</c> with
+    /// <c>Content-Security-Policy: frame-ancestors 'none'</c>, so no page renders a response in a frame.
+    /// </summary>
+    internal static IReadOnlyList<KeyValuePair<string, string>> ResponseSecurityHeaders { get; } =
+    [
+        new("X-Content-Type-Options", "nosniff"),
+        new("X-Frame-Options", "DENY"),
+        new("Content-Security-Policy", "frame-ancestors 'none'"),
+    ];
 
     /// <summary>
     /// Adds ProblemDetails support with <see cref="ApplyDefaults"/> as its customization step, registers

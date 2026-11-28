@@ -107,8 +107,8 @@ public sealed class EnvironmentSecretSource : ISecretSource
     /// <c>ConnectionStrings__SmartHotel</c> is set but is blank or is not a valid Npgsql connection string, or it sets
     /// <c>Passfile</c>, has no non-blank <c>Password</c>, or both; or that variable is unset and any of
     /// <c>DB_HOST</c>, <c>DB_NAME</c>, <c>DB_USER</c> and <c>DB_PASSWORD</c> is missing or blank, or <c>DB_PORT</c> is
-    /// set but is not an integer between 1 and 65535. The message lists every failure, naming the variable or setting
-    /// only, never a value.
+    /// neither blank nor an integer between 1 and 65535. The message lists every failure, naming the variable or
+    /// setting only, never a value.
     /// </exception>
     public string? DatabaseConnectionString =>
         _databaseFailure is null ? _databaseConnectionString : throw new InvalidOperationException(_databaseFailure);

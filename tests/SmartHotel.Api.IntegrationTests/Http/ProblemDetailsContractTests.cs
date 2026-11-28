@@ -44,12 +44,14 @@ namespace SmartHotel.Api.IntegrationTests.Http;
 /// <summary>
 /// The error contract for responses the framework produces rather than an action: routing's 405 and 404, requests
 /// whose <c>Accept</c> header admits no JSON, an unhandled exception, the 400 for input that fails model binding,
-/// and a plaintext request refused outside Development. Each must still be an <c>application/problem+json</c>
-/// document that keeps its protocol headers and carries no exception data. A binding 400 also keys its errors only
-/// by contract names and JSON paths, and echoes no request text. The log records behind those responses are held to the
-/// same rule: whatever log levels configuration sets, no record that reaches a log provider carries a request value, a
-/// header value, a credential, an exception's text, or the name of the database or its server, while every other record
-/// still follows the configured levels.
+/// and a plaintext request refused outside Development, unless it names a listed host and is redirected. Each must
+/// still be an <c>application/problem+json</c> document that keeps its protocol headers and carries no exception data.
+/// Every response, a success included, also carries the fields that keep a browser from sniffing its media type or
+/// rendering it in a frame, and none names the server in a <c>Server</c> header. A binding 400 also keys its errors
+/// only by contract names and JSON paths, and echoes no request text. The log records behind those responses are
+/// held to the same rule: whatever log levels configuration sets, no record that reaches a log provider carries a
+/// request value, a header value, a credential, an exception's text, or the name of the database or its server, while
+/// every other record still follows the configured levels.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -90,6 +92,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private const string InvalidDateSearchScenario = "invalid-date-search";
     private const string BookingsWithoutTokenScenario = "bookings-without-token";
     private const string UnknownRouteScenario = "unknown-route";
+    private const string WrongMethodScenario = "wrong-method";
+    private const string AllowedOriginRequestScenario = "allowed-origin-request";
 
     private const string LoginScenario = "login";
     private const string BookingsWithTokenScenario = "bookings-with-token";
@@ -99,6 +103,19 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private const string InvalidInputDetail =
         "Some of the information provided is missing or not valid. Correct it and try again.";
     private const string HttpsWebOrigin = "https://localhost:4200";
+
+    // The setting that lists the hosts a plaintext request is redirected from outside Development, and the HTTPS port
+    // that lets in-process redirection build its target.
+    private const string RedirectHostsSetting = "HttpsRedirection:AllowedHosts";
+    private const string DefaultHttpsPort = "443";
+
+    // The fields every API response carries: no media-type sniffing and no rendering in a frame.
+    private static readonly (string Name, string Value)[] SecurityHeaders =
+    [
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("Content-Security-Policy", "frame-ancestors 'none'"),
+    ];
 
     // The API process tests' listeners, on a loopback port the operating system chooses, the variables Kestrel reads
     // its default certificate from, the console lines of the API's NoHttpsListener and HostRunFailed events and of the
@@ -424,6 +441,72 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.NotFound, cancellationToken: cancellationToken);
     }
 
+    // Every response of the pipeline, a success or a problem from MVC, routing, the bearer challenge or the status-code
+    // pages, carries the fields that keep a browser from sniffing its media type or rendering it in a frame. They are
+    // added beside the protocol fields each response needs: Allow on routing's 405, the bare bearer challenge on the
+    // 401 and the CORS grant on a request from the web app's origin.
+    [Theory]
+    [InlineData(HealthScenario, HttpStatusCode.OK)]
+    [InlineData(AllowedOriginRequestScenario, HttpStatusCode.OK)]
+    [InlineData(InvalidDateSearchScenario, HttpStatusCode.BadRequest)]
+    [InlineData(BookingsWithoutTokenScenario, HttpStatusCode.Unauthorized)]
+    [InlineData(UnknownRouteScenario, HttpStatusCode.NotFound)]
+    [InlineData(WrongMethodScenario, HttpStatusCode.MethodNotAllowed)]
+    public async Task PipelineResponse_CarriesSecurityHeadersBesideProtocolHeaders(
+        string scenario,
+        HttpStatusCode expected)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        ApiTestClient client = _factory.CreateApiClient();
+
+        (HttpMethod method, string uri) = scenario switch
+        {
+            HealthScenario or AllowedOriginRequestScenario => (HttpMethod.Get, ReadinessPath),
+            InvalidDateSearchScenario => (HttpMethod.Get, SameDayCheckOutSearchUri()),
+            BookingsWithoutTokenScenario => (HttpMethod.Get, "/api/bookings"),
+            UnknownRouteScenario => (HttpMethod.Get, UnknownRoutePath),
+            WrongMethodScenario => (HttpMethod.Put, "/api/hotels"),
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+
+        using HttpRequestMessage request = new(method, uri);
+        if (scenario == AllowedOriginRequestScenario)
+        {
+            request.Headers.Add(CorsConstants.Origin, _factory.AllowedOrigin);
+        }
+
+        using HttpResponseMessage response = await client.Http.SendAsync(request, cancellationToken);
+
+        if (expected == HttpStatusCode.OK)
+        {
+            Assert.Equal(expected, response.StatusCode);
+        }
+        else
+        {
+            await ProblemAssert.AssertProblemAsync(
+                response,
+                expected,
+                scenario == InvalidDateSearchScenario ? "checkOut" : null,
+                cancellationToken);
+        }
+
+        AssertSecurityHeaders(response);
+        switch (scenario)
+        {
+            case AllowedOriginRequestScenario:
+                Assert.Equal(
+                    _factory.AllowedOrigin,
+                    Assert.Single(ReadHeaderItems(response, CorsConstants.AccessControlAllowOrigin)));
+                break;
+            case BookingsWithoutTokenScenario:
+                ProblemAssert.AssertBareBearerChallenge(response);
+                break;
+            case WrongMethodScenario:
+                Assert.Contains("GET", ReadAllowedMethods(response), StringComparer.Ordinal);
+                break;
+        }
+    }
+
     // The first row takes MVC's object-result path: with no XML formatter and ReturnHttpNotAcceptable off, negotiation
     // falls back to the JSON formatter. The other two take the status-code-page path, where the default problem
     // writer would decline an Accept header that admits no JSON and the API's writer must not.
@@ -524,6 +607,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
                 response,
                 HttpStatusCode.InternalServerError,
                 cancellationToken: cancellationToken);
+
+            // The exception handler resets the failed response before it writes the problem; the fields every
+            // response carries are set as that problem starts, so they survive the reset.
+            AssertSecurityHeaders(response);
 
             // Read only after ProblemAssert has decoded the buffered body. Reading first would let an unsupported
             // charset raise an exception whose message quotes the Content-Type value, where ProblemAssert reports a
@@ -1066,6 +1153,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         await ProblemAssert.AssertProblemAsync(response, expected, cancellationToken: cancellationToken);
 
         Assert.Equal("close", rejection.GetHeader("Connection"));
+        Assert.Null(rejection.GetHeader("Server"));
+        AssertSecurityHeaders(rejection);
         Assert.Equal(0, await connection.CountRemainingBytesAsync());
     }
 
@@ -1149,6 +1238,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         }
 
         Assert.Equal("close", rejection.GetHeader("Connection"));
+        Assert.Null(rejection.GetHeader("Server"));
+        AssertSecurityHeaders(rejection);
         Assert.Equal(0, await connection.CountRemainingBytesAsync());
     }
 
@@ -1179,7 +1270,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         await ProblemAssert.AssertProblemAsync(response, HttpStatusCode.BadRequest, cancellationToken: cancellationToken);
     }
 
-    // An ordinary client's successful request through the listening server is answered exactly as without it.
+    // An ordinary client's successful request through the listening server is answered exactly as without it, and
+    // Kestrel names itself in no Server header.
     [Fact]
     public async Task ReadinessProbe_ThroughListeningServer_ReturnsHealthy()
     {
@@ -1198,6 +1290,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         Assert.True(
             string.Equals("Healthy", body, StringComparison.Ordinal),
             "Expected the readiness body to be exactly Healthy.");
+        Assert.Empty(response.Headers.Server);
+        AssertSecurityHeaders(response);
     }
 
     // A variant derived through WithWebHostBuilder builds its host through its parent factory's CreateHost. A Production
@@ -1333,8 +1427,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         return $"GET {ReadinessPath} HTTP/1.1\r\nHost: localhost\r\nNo colon in this line\r\n\r\n";
     }
 
-    // The Production variant configures no HTTPS port and the in-process server publishes none, so outside Development
-    // HTTPS redirection cannot redirect a plaintext request and passes it on. It must then be refused before CORS and
+    // The Production variant lists no redirect host and configures no HTTPS port, and the in-process server publishes
+    // none, so outside Development a plaintext request is never redirected. It must be refused before CORS and
     // authentication: credentials, a bearer token and the readiness probe all get the same 403 problem, and the
     // bookings request never reaches the challenge.
     [Theory]
@@ -1369,6 +1463,105 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             $"Expected the 403 detail to be exactly '{HttpsOnlyDetail}'.");
         Assert.Empty(response.Headers.WwwAuthenticate);
         Assert.Null(response.Headers.Location);
+        AssertSecurityHeaders(response);
+    }
+
+    // HTTPS redirection builds its target from the request's Host header, which the client chooses. With an HTTPS port
+    // configured, outside Development a plaintext request is redirected only when HttpsRedirection:AllowedHosts lists
+    // its host: entries are trimmed, empty ones ignored, and the host is compared without regard to case or port. A
+    // host the setting does not list, or any host when the setting is unset or blank, gets the 403 problem with no
+    // Location, and the host appears nowhere in the response.
+    [Theory]
+    [InlineData("api.example.test", "api.example.test", "https://api.example.test/api/health")]
+    [InlineData(" other.test ; ; API.Example.Test ", "api.example.test:8080", "https://api.example.test/api/health")]
+    [InlineData("192.0.2.10", "192.0.2.10", "https://192.0.2.10/api/health")]
+    [InlineData("[2001:db8::10]", "[2001:db8::10]:8080", "https://[2001:db8::10]/api/health")]
+    [InlineData("[::ffff:192.0.2.10]", "[::ffff:192.0.2.10]:8080", "https://[::ffff:192.0.2.10]/api/health")]
+    [InlineData("api.example.test", "evil.example", null)]
+    [InlineData("api.example.test", "api.example.test.evil.example", null)]
+    [InlineData(" ; ", "api.example.test", null)]
+    [InlineData(null, "api.example.test", null)]
+    public async Task PlaintextRequestOutsideDevelopment_IsRedirectedOnlyFromListedHost(
+        string? allowedHosts,
+        string host,
+        string? expectedLocation)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        await using WebApplicationFactory<Program> production = await StartProductionVariantAsync(
+            new Dictionary<string, string?>
+            {
+                [RedirectHostsSetting] = allowedHosts,
+                ["HTTPS_PORT"] = DefaultHttpsPort,
+            },
+            cancellationToken);
+        using HttpClient client = production.CreateClient(
+            new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+        using HttpRequestMessage request = new(HttpMethod.Get, ReadinessPath);
+        request.Headers.Host = host;
+        using HttpResponseMessage response = await client.SendAsync(request, cancellationToken);
+
+        if (expectedLocation is not null)
+        {
+            Assert.Equal(HttpStatusCode.TemporaryRedirect, response.StatusCode);
+            Assert.Equal(expectedLocation, response.Headers.Location?.OriginalString);
+            AssertSecurityHeaders(response);
+            return;
+        }
+
+        JsonElement problem = await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.Forbidden,
+            cancellationToken: cancellationToken);
+        Assert.Equal(HttpsOnlyDetail, problem.GetProperty("detail").GetString());
+        Assert.Null(response.Headers.Location);
+        AssertSecurityHeaders(response);
+
+        string hostName = new HostString(host).Host;
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        Assert.False(
+            body.Contains(hostName, StringComparison.OrdinalIgnoreCase),
+            "Expected the 403 problem body not to name the request's host.");
+        Assert.False(
+            response.Headers.Concat(response.Content.Headers).Any(header => header.Value.Any(
+                value => value.Contains(hostName, StringComparison.OrdinalIgnoreCase))),
+            "Expected no 403 response header to name the request's host.");
+    }
+
+    // An HttpsRedirection:AllowedHosts entry that is not a host alone, such as one with a wildcard, a scheme, a port or
+    // a path, an IPv6 address without its brackets, or a bracketed IPv6 address with a prefix length, a zone or a port,
+    // stops startup outside Development together with the other configuration failures. The failure names the setting
+    // and never the value.
+    [Theory]
+    [InlineData("*")]
+    [InlineData("*.example.test")]
+    [InlineData("https://api.example.test")]
+    [InlineData("api.example.test:443")]
+    [InlineData("api.example.test/api")]
+    [InlineData("2001:db8::10")]
+    [InlineData("[2001:db8::10/64]")]
+    [InlineData("[fe80::1%25eth0]")]
+    [InlineData("[fe80::1%eth0]")]
+    [InlineData("[2001:db8::10]:443")]
+    [InlineData("api.example.test;bad host.example.test")]
+    public async Task InvalidRedirectHostsOutsideDevelopment_StopsStartup(string allowedHosts)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        AggregateException failure = await Assert.ThrowsAsync<AggregateException>(
+            () => StartProductionVariantAsync(
+                new Dictionary<string, string?> { [RedirectHostsSetting] = allowedHosts },
+                cancellationToken));
+
+        Assert.StartsWith("The API configuration is invalid.", failure.Message, StringComparison.Ordinal);
+        Exception inner = Assert.Single(failure.InnerExceptions);
+        Assert.IsType<InvalidOperationException>(inner);
+        Assert.True(
+            inner.Message.Contains(RedirectHostsSetting, StringComparison.Ordinal),
+            "Expected the startup failure to name HttpsRedirection:AllowedHosts.");
+        Assert.False(
+            failure.Message.Contains(allowedHosts, StringComparison.Ordinal),
+            "Expected the startup failure not to quote the setting's value.");
     }
 
     // Outside Development Kestrel serves HTTPS on the listener and with the certificate the environment names, and the
@@ -1423,6 +1616,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         Assert.True(
             string.Equals("Healthy", body, StringComparison.Ordinal),
             "Expected the readiness body to be exactly Healthy.");
+        Assert.Empty(response.Headers.Server);
+        AssertSecurityHeaders(response);
         AssertOutputCarriesNoSecret(api.Output, certificate.Password);
     }
 
@@ -1673,9 +1868,10 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     // added in memory after the factory's own, together with any further settings; no process environment variable is
     // set or read. HTTPS redirection takes its port from HTTPS_PORT or ANCM_HTTPS_PORT in the configuration, which the
     // environment of the host running the tests can supply, ASPNETCORE_HTTPS_PORT among others, before it asks the
-    // server. Both are pinned empty in memory, which names no port, and the in-process server publishes no addresses,
-    // so redirection never finds a port. Reading Server builds and starts the host, and Task.Run keeps that synchronous
-    // start off xUnit's synchronization context.
+    // server. Unless the settings name one, both are pinned empty in memory, which names no port, and the in-process
+    // server publishes no addresses, so redirection never finds a port. The hosts redirection may serve, which the same
+    // environment could list, are pinned unset unless the settings list them. Reading Server builds and starts the
+    // host, and Task.Run keeps that synchronous start off xUnit's synchronization context.
     private static async Task<WebApplicationFactory<Program>> StartProductionVariantAsync(
         SmartHotelApiFactory source,
         Dictionary<string, string?> settings,
@@ -1683,8 +1879,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     {
         settings[ConfigurationPath.Combine(ApiCorsOptions.SectionName, nameof(ApiCorsOptions.AllowedOrigin))] =
             HttpsWebOrigin;
-        settings["HTTPS_PORT"] = "";
-        settings["ANCM_HTTPS_PORT"] = "";
+        settings.TryAdd("HTTPS_PORT", "");
+        settings.TryAdd("ANCM_HTTPS_PORT", "");
+        settings.TryAdd(RedirectHostsSetting, null);
         WebApplicationFactory<Program> variant = source.WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -1978,6 +2175,27 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         }
 
         return items;
+    }
+
+    // Each field every API response carries must appear exactly once, with its fixed value.
+    private static void AssertSecurityHeaders(HttpResponseMessage response)
+    {
+        foreach ((string name, string value) in SecurityHeaders)
+        {
+            Assert.True(
+                response.Headers.TryGetValues(name, out IEnumerable<string>? values),
+                $"Expected the {(int)response.StatusCode} response to carry {name}.");
+            Assert.Equal(value, Assert.Single(values));
+        }
+    }
+
+    // The same fields on a response read from the wire, where a repeated field fails GetHeader.
+    private static void AssertSecurityHeaders(RawResponse response)
+    {
+        foreach ((string name, string value) in SecurityHeaders)
+        {
+            Assert.Equal(value, response.GetHeader(name));
+        }
     }
 
     // Throws while routing selects the endpoint for a request that carries the fault header, and leaves every other

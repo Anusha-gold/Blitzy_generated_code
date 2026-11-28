@@ -17,7 +17,16 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { DOCUMENT, NgIf } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { NonNullableFormBuilder, ReactiveFormsModule } from '@angular/forms';
-import { ActivatedRoute, NavigationEnd, NavigationStart, PRIMARY_OUTLET, Router, RouterLink } from '@angular/router';
+import {
+  ActivatedRoute,
+  NavigationEnd,
+  NavigationStart,
+  PRIMARY_OUTLET,
+  Router,
+  RouterLink,
+  UrlSerializer,
+  UrlTree,
+} from '@angular/router';
 import { distinctUntilChanged, filter, finalize, map, of, startWith, switchMap, take, tap, timer } from 'rxjs';
 
 import { AuthService } from '../../core/auth/auth.service';
@@ -65,11 +74,13 @@ const NOTICE_ANNOUNCE_DELAY_MS = 100;
  * the register page in its router state, never in the URL, and the register
  * page brings it back the same way, so the register page and the
  * `/login?registered=1` URL stay as they are. After a successful login the
- * guest goes to it only when it is a same-app path starting with a single `/`;
- * anything else, including an absolute or protocol-relative URL, goes to
- * `/search`. This prevents an open redirect. A return URL that leads back to
- * this login page goes to `/search` too, so a signed-in guest never lands on
- * it.
+ * guest goes to it only when it is a same-app path starting with a single `/`
+ * that the router and a browser read the same way, under the rule
+ * `safeReturnUrl` sets out, and the page navigates with its parsed tree;
+ * anything else, including an absolute or protocol-relative URL, an encoded
+ * separator or a path the router cannot parse, goes to `/search`. This
+ * prevents an open redirect. A return URL that leads back to this login page
+ * goes to `/search` too, so a signed-in guest never lands on it.
  *
  * History: the navigation after a successful login replaces the login entry,
  * so Back never returns a signed-in guest to this form. A guest who is already
@@ -114,6 +125,12 @@ export class LoginPageComponent {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
+
+  /**
+   * Parses the return URL for `safeReturnUrl`: the router's own serializer,
+   * which throws on text it cannot read, where `Router.parseUrl` reads `/`.
+   */
+  private readonly urlSerializer = inject(UrlSerializer);
 
   /** Renders this page synchronously, to replace the alert region of a shown error. */
   private readonly changeDetector = inject(ChangeDetectorRef);
@@ -271,7 +288,7 @@ export class LoginPageComponent {
           takeUntilDestroyed(),
         )
         .subscribe(() => {
-          void this.router.navigateByUrl(safeReturnUrl(this.returnUrl(), this.router), { replaceUrl: true });
+          void this.router.navigateByUrl(safeReturnUrl(this.returnUrl(), this.urlSerializer), { replaceUrl: true });
         });
     }
   }
@@ -318,7 +335,7 @@ export class LoginPageComponent {
           // Replacing the login entry keeps Back from offering this form to a
           // guest who is now signed in.
           void this.router
-            .navigateByUrl(safeReturnUrl(this.returnUrl(), this.router), { replaceUrl: true })
+            .navigateByUrl(safeReturnUrl(this.returnUrl(), this.urlSerializer), { replaceUrl: true })
             .then((navigated) => {
               if (navigated) {
                 focusLandingPageAfterRender(this.document, this.appInjector, this.router);
@@ -414,28 +431,139 @@ export class LoginPageComponent {
 }
 
 /**
- * Returns `value` when it is a same-app path starting with a single `/` that
- * leads somewhere other than this login page, and `/search` otherwise. A
- * leading `//` or `/\` is refused, because browsers read both as
- * protocol-relative URLs to another host. A path whose primary route, as the
- * router parses it, is `login`, such as `/login`, `/login?reason=x`,
- * `/login;a=1` or `/%6Cogin`, is refused too: the router would reuse this page
- * for a guest who is now signed in, showing them the login form again, or
- * nothing at all when the page opened signed in. A path the
- * router cannot parse, such as one with a malformed percent escape, is
- * returned unchanged: the router reads it as `/`, whose redirect lands on
- * `/search`.
+ * The page a successful login continues to: `value` as `serializer` parses
+ * it, when it is a same-app path starting with a single `/` that the router
+ * and a browser read the same way and that leads somewhere other than this
+ * login page, and the tree of `/search` otherwise. The caller navigates with
+ * the returned tree, never with the text, so the router goes exactly where
+ * this check looked.
+ *
+ * `value` is refused when:
+ * - it is `null`, or does not start with `/`;
+ * - it holds, unencoded, an ASCII control character (U+0000 to U+001F, or
+ *   U+007F) or white space anywhere: a browser strips tabs and line breaks
+ *   from a URL, so the text is not read as it looks, and a URL the router
+ *   writes holds none of them unencoded;
+ * - its path, the text before the first `?` or `#`, holds a `\` or an empty
+ *   segment `//`. A browser reads `\` as `/`, so a leading `//` or `/\` is a
+ *   protocol-relative URL to another host, and the router stops reading a
+ *   path at a later `//` and silently drops the rest;
+ * - its path holds a raw `(` or `)`, the router's syntax for named-outlet
+ *   groups, which no route of this app declares. Angular's default parser
+ *   stops reading at a stray `)`, as in `/bookings)x`, and silently drops the
+ *   rest, while the app's serializer reads parentheses in a path as data, so
+ *   the same text means different paths to the two. This check does not
+ *   depend on which one `serializer` is, and a URL the router writes for this
+ *   app's routes holds a parenthesis in its path only percent-encoded;
+ * - its path holds `;=`, a matrix parameter with an empty name, as in
+ *   `/bookings;=%ZZ`: the router stops reading there and silently drops the
+ *   rest;
+ * - its query, the text between the first `?` and the first `#` after it,
+ *   holds a parameter the router stops reading at, silently dropping the
+ *   rest of the query, as {@link hasUnreadQueryParam} sets out: `/bookings?=x`,
+ *   `/bookings?a=1&=x`, `/bookings??a` or `/bookings?a?b=1`;
+ * - `serializer` cannot parse it, as with the malformed percent escape of
+ *   `/%E0%A4%A`;
+ * - it names an outlet other than the primary one, or nests segment groups
+ *   in the primary one, neither of which a route of this app declares;
+ * - a path segment, once decoded, holds `/` or `\`: an encoded separator, as
+ *   in `/%2F%2Fevil.example`, `/%2Fevil.example` or `/%5Cevil.example`;
+ * - a path segment, once decoded, is the dot segment `.` or `..`, as in
+ *   `/hotels/.`, `/hotels/%2e%2e` or `/hotels/1/..`: the router routes it as
+ *   an ordinary segment and writes it back unencoded, but a browser resolves
+ *   it when the router writes the address, so the address bar would show
+ *   another path than the one routed;
+ * - its primary route is `login`, such as `/login`, `/login?reason=x`,
+ *   `/login;a=1` or `/%6Cogin`: the router would reuse this page for a guest
+ *   who is now signed in, showing them the login form again, or nothing at
+ *   all when the page opened signed in.
+ *
+ * Everything else is kept as parsed, its query, matrix parameters and
+ * fragment included, so encoded query values such as the `/` and `\` of
+ * `city=S%C3%A3o%20Paulo%2F%5C`, matrix parameters with a name such as
+ * `/bookings;a=1`, and encoded path data that is no separator or dot segment,
+ * such as the NUL of `/hotels/%00`, reach the page unchanged. The text checks
+ * above refuse every place where the router's parser stops reading without
+ * an error, so a kept tree is parsed from all of `value`.
  *
  * @param value - The return URL as given, or `null` when there is none.
- * @param router - Parses `value` the way a navigation to it would.
+ * @param serializer - The router's URL serializer, which parses `value` the
+ *   way a navigation to it would but throws where `Router.parseUrl` reads `/`.
+ * @returns The validated tree of `value`, or the tree of `/search`.
  */
-function safeReturnUrl(value: string | null, router: Router): string {
-  if (value === null || !value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\')) {
-    return DEFAULT_RETURN_URL;
+function safeReturnUrl(value: string | null, serializer: UrlSerializer): UrlTree {
+  const fallback = serializer.parse(DEFAULT_RETURN_URL);
+  if (value === null || !value.startsWith('/') || hasRawControlOrWhiteSpace(value)) {
+    return fallback;
   }
-  const primary = router.parseUrl(value).root.children[PRIMARY_OUTLET];
+  const pathEnd = value.search(/[?#]/);
+  const path = pathEnd === -1 ? value : value.slice(0, pathEnd);
+  if (path.includes('\\') || path.includes('//') || /[()]/.test(path) || path.includes(';=')) {
+    return fallback;
+  }
+  if (value.charAt(pathEnd) === '?') {
+    const fragmentStart = value.indexOf('#', pathEnd);
+    if (hasUnreadQueryParam(value.slice(pathEnd + 1, fragmentStart === -1 ? value.length : fragmentStart))) {
+      return fallback;
+    }
+  }
+
+  let tree: UrlTree;
+  try {
+    tree = serializer.parse(value);
+  } catch {
+    return fallback;
+  }
+
+  const outlets = tree.root.children;
+  const primary = outlets[PRIMARY_OUTLET];
+  if (Object.keys(outlets).some((outlet) => outlet !== PRIMARY_OUTLET) || primary?.hasChildren()) {
+    return fallback;
+  }
   const paths = primary?.segments.map((segment) => segment.path) ?? [];
-  return paths.length === 1 && paths[0] === LOGIN_PATH ? DEFAULT_RETURN_URL : value;
+  if (
+    paths.some(
+      (segmentPath) =>
+        segmentPath.includes('/') || segmentPath.includes('\\') || segmentPath === '.' || segmentPath === '..',
+    )
+  ) {
+    return fallback;
+  }
+  return paths.length === 1 && paths[0] === LOGIN_PATH ? fallback : tree;
+}
+
+/**
+ * Whether the router's URL parser would stop partway through `query`, the
+ * text of a return URL between its first `?` and the first `#` after it, and
+ * silently drop the rest, which `safeReturnUrl` refuses. The parser reads a
+ * parameter's name up to the first `=`, `?`, `&` or `#`, and stops reading the
+ * query, without an error, at a parameter whose name is empty or is followed
+ * by a `?`. So a parameter, one `&`-separated piece of `query`, is refused
+ * when it is not empty and its name, the text before its first `=`, is empty
+ * or holds a `?`: `=x` in `?=x` or `?a=1&=x`, `?a` in `??a`, and `a?b=1` in
+ * `?a?b=1`. An empty parameter, as in `?a=1&&b=2&`, is read past, and a value
+ * may hold `=` and `?`, as in `?city=a?b`.
+ */
+function hasUnreadQueryParam(query: string): boolean {
+  return query.split('&').some((param) => {
+    const nameEnd = param.indexOf('=');
+    const name = nameEnd === -1 ? param : param.slice(0, nameEnd);
+    return param !== '' && (name === '' || name.includes('?'));
+  });
+}
+
+/**
+ * Whether `value` holds, unencoded, an ASCII control character (U+0000 to
+ * U+001F, or U+007F) or any white space, which `safeReturnUrl` refuses.
+ */
+function hasRawControlOrWhiteSpace(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) {
+      return true;
+    }
+  }
+  return /\s/.test(value);
 }
 
 /** Whether focus moved while a submit was pending, as {@link watchFocusMoves} records it. */

@@ -1,7 +1,7 @@
 import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
 import { DATE_PIPE_DEFAULT_OPTIONS, type DatePipeConfig } from '@angular/common';
 import { provideHttpClient, withInterceptors } from '@angular/common/http';
-import { provideRouter, withRouterConfig } from '@angular/router';
+import { DefaultUrlSerializer, UrlSerializer, provideRouter, withRouterConfig, type UrlTree } from '@angular/router';
 
 import { routes } from './app.routes';
 import { authInterceptor } from './core/auth/auth.interceptor';
@@ -71,6 +71,40 @@ function browserDateFormat(): string {
 }
 
 /**
+ * The router's URL serializer: `DefaultUrlSerializer`, except that it reads
+ * every parenthesis in a URL's path as a literal character.
+ *
+ * `DefaultUrlSerializer` reads `(…)` in a path as a group of named-outlet
+ * routes, such as `/search(popup:x)`. This app declares no named outlets, so
+ * no such group could ever match: the navigation would fail with NG04002 and
+ * leave the page blank, because the `**` route consumes only the primary
+ * outlet. A parenthesis in a path is therefore always path data here, and a
+ * URL with raw parentheses routes exactly as its percent-encoded form does:
+ * `/no-such-page(x)` like `/no-such-page%28x%29`, through `**` to `/search`.
+ * Serializing is unchanged, since `DefaultUrlSerializer` already writes a
+ * parenthesis in a path segment as `%28` or `%29`.
+ */
+class LiteralParenthesesUrlSerializer extends DefaultUrlSerializer {
+  /**
+   * Percent-encodes each `(` and `)` in the path of `url`, the part before
+   * the first `?` or `#`, then parses the result as `DefaultUrlSerializer`
+   * does. The query and the fragment are passed on unchanged: the default
+   * parser already reads parentheses there as data.
+   *
+   * @param url - A URL as the router receives it, such as the browser's
+   *   location or a `navigateByUrl` argument.
+   * @returns The URL tree, whose path segments keep each parenthesis in their
+   *   decoded text.
+   */
+  override parse(url: string): UrlTree {
+    const queryOrFragment = url.search(/[?#]/);
+    const pathEnd = queryOrFragment === -1 ? url.length : queryOrFragment;
+    const path = url.slice(0, pathEnd).replaceAll('(', '%28').replaceAll(')', '%29');
+    return super.parse(path + url.slice(pathEnd));
+  }
+}
+
+/**
  * The application-wide providers that `main.ts` passes to
  * `bootstrapApplication(AppComponent, …)`.
  *
@@ -87,6 +121,12 @@ function browserDateFormat(): string {
  *   to the history entry it left (`canceledNavigationResolution: 'computed'`),
  *   so the entry the guest stepped to stays in history rather than being
  *   overwritten.
+ * - The router's URL serializer, {@link LiteralParenthesesUrlSerializer}. The
+ *   app has no named outlets, so it reads a parenthesis in a URL's path as
+ *   path data: `/search(x)` is an unknown URL that `**` redirects to
+ *   `/search`, and `/hotels/abc(1)` reaches the hotel detail page with the id
+ *   `abc(1)`, as their percent-encoded forms do. Query strings and fragments
+ *   parse as before.
  * - `HttpClient` on its default XHR backend, with two functional
  *   interceptors in this order:
  *   1. {@link loadingInterceptor} is outermost, so the loading counter spans
@@ -104,9 +144,9 @@ function browserDateFormat(): string {
  *   screen. Only the order and separators of the digits follow the browser:
  *   the text stays English on Angular's default `en-US` locale, which needs no
  *   other locale data for numeric fields, and `MM/dd/yyyy` stands in when the
- *   browser's order cannot be read. Only the display changes: dates stay
- *   exact `yyyy-MM-dd` strings in URLs, request bodies, router state and
- *   comparisons. No time zone is set on purpose: the pipe reads a
+ *   browser's order cannot be read. Display formatting does not change URLs,
+ *   request values or comparisons. Valid stay dates use `yyyy-MM-dd`; the API
+ *   rejects invalid input. No time zone is set on purpose: the pipe reads a
  *   `yyyy-MM-dd` string as local midnight of that day, so formatting in local
  *   time keeps the calendar day in every zone, whereas a fixed zone such as
  *   UTC would show the previous day east of UTC.
@@ -122,6 +162,7 @@ export const appConfig: ApplicationConfig = {
       routes,
       withRouterConfig({ onSameUrlNavigation: 'reload', canceledNavigationResolution: 'computed' }),
     ),
+    { provide: UrlSerializer, useClass: LiteralParenthesesUrlSerializer },
     provideHttpClient(withInterceptors([loadingInterceptor, authInterceptor])),
     { provide: DATE_PIPE_DEFAULT_OPTIONS, useFactory: (): DatePipeConfig => ({ dateFormat: browserDateFormat() }) },
   ],

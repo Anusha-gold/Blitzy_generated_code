@@ -1,7 +1,8 @@
 // Criterion 6: every route and component of SmartHotel.Web is reachable from
 // the app's navigation. The redirect routes ('' and '**') are checked by
-// direct URLs, because they are not navigation targets; every navigable route
-// is then reached by clicks alone after one initial load of /search.
+// direct URLs, because they are not navigation targets, '**' with paths that
+// carry raw parentheses as well; every navigable route is then reached by
+// clicks alone after one initial load of /search.
 //
 // The session lifecycle is checked on the same routes. The reachability test
 // ends by logging out from /bookings, so only "Log out" itself can bring the
@@ -47,20 +48,48 @@ function recordApiRequests(page: Page, options: { ignorePreflight: boolean }): {
   return { requests, stop: () => page.off('request', record) };
 }
 
+/**
+ * Unknown URLs the `**` route must redirect to /search, one step each: an
+ * unknown path, then paths with raw parentheses. The app has no named outlets,
+ * so a parenthesis in a path is path data, never an outlet group. The cases put
+ * a group after an unknown path and after a known one, make a group a segment
+ * of its own, and use the named-outlet form.
+ */
+const UNKNOWN_URLS: readonly string[] = [
+  '/no-such-page',
+  '/no-such-page(x)',
+  '/search(x)',
+  '/search/(x)',
+  '/search(popup:x)',
+];
+
 test('entry and unknown URLs redirect to search', async ({ page }) => {
   const h1 = (name: string) => page.getByRole('heading', { level: 1, name, exact: true });
+  // A navigation no route matches fails with NG04002, which Angular logs as an
+  // error while the URL stays put and the page stays blank.
+  const errors: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') {
+      errors.push(message.text());
+    }
+  });
+  page.on('pageerror', (error) => errors.push(`uncaught: ${error.message}`));
 
   await test.step("'' redirects to /search", async () => {
     await page.goto('/');
     await expect(page).toHaveURL(/\/search$/);
     await expect(h1('Find a hotel')).toBeVisible();
+    expect(errors, "console errors after opening '/'").toEqual([]);
   });
 
-  await test.step("'**' redirects to /search", async () => {
-    await page.goto('/no-such-page');
-    await expect(page).toHaveURL(/\/search$/);
-    await expect(h1('Find a hotel')).toBeVisible();
-  });
+  for (const url of UNKNOWN_URLS) {
+    await test.step(`'**' redirects ${url} to /search`, async () => {
+      await page.goto(url);
+      await expect(page).toHaveURL(/\/search$/);
+      await expect(h1('Find a hotel')).toBeVisible();
+      expect(errors, `console errors after opening ${url}`).toEqual([]);
+    });
+  }
 });
 
 test('every navigable route is reachable by clicks', async ({ page }) => {
