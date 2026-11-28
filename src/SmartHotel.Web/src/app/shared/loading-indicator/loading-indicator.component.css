@@ -1,0 +1,69 @@
+/* Request status slot between the nav bar and the page. It keeps the banner's
+   height (one 0.875rem line at line-height 1.5 plus 0.25rem block padding)
+   while idle, so the page never shifts when loading starts or ends. */
+:host {
+  display: block;
+  min-block-size: calc(0.875rem * 1.5 + 0.5rem);
+}
+
+/* Global request banner, in normal flow inside the slot, so it covers nothing. */
+.loading-indicator {
+  /* Anchors the absolutely positioned sweep bar. */
+  position: relative;
+  /* Display-only status, not a control, so it takes no pointer input. */
+  pointer-events: none;
+  padding: 0.25rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  /* Explicit so the banner's height matches the slot reserved on :host. */
+  line-height: 1.5;
+  text-align: center;
+  color: var(--sh-color-on-accent);
+  background-color: var(--sh-color-accent);
+}
+
+/* Decorative sweep along the bottom edge. Four 1s alternate passes stop it
+   within five seconds, back at its start; the visible "Loading" text stays
+   until loading ends. With a reduced-motion preference it stays static. */
+.loading-indicator__bar {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: 0;
+  block-size: 3px;
+  background: linear-gradient(90deg, transparent, var(--sh-color-on-accent), transparent) 0 0 / 40% 100% no-repeat;
+  /* Named here, not in the media query: Angular renames scoped @keyframes
+     references only in top-level rules of the minified component CSS. */
+  animation: loading-indicator-sweep 1s ease-in-out 4 alternate paused;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .loading-indicator__bar {
+    animation-play-state: running;
+  }
+}
+
+/* Forced colours paint the banner's fill as Canvas and drop the bar's gradient.
+   An inset outline draws the banner's edge and takes no space, so the banner
+   still fills the slot exactly. Only the decorative bar opts out of forced
+   colours, so the text keeps the user's palette; its sweep uses the Highlight
+   system colour and keeps the height and animation set above, inset by the
+   outline's width so it never paints over the edge. */
+@media (forced-colors: active) {
+  .loading-indicator {
+    outline: 1px solid CanvasText;
+    outline-offset: -1px;
+  }
+
+  .loading-indicator__bar {
+    inset-inline: 1px;
+    inset-block-end: 1px;
+    forced-color-adjust: none;
+    background-image: linear-gradient(90deg, transparent, Highlight, transparent);
+  }
+}
+
+@keyframes loading-indicator-sweep {
+  to {
+    background-position: 100% 0;
+  }
+}

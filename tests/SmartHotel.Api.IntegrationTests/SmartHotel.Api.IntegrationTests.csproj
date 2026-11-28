@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/SmartHotel.Api/SmartHotel.Api.csproj" />
+    <ProjectReference Include="../../src/SmartHotel.Data/SmartHotel.Data.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!--
+    This test executable hosts the API in-process and opens its own Npgsql connections before the host starts, so it
+    needs the API's runtime setting: Npgsql keeps DateOnly and DateTime MinValue and MaxValue finite instead of
+    writing them as -infinity and infinity.
+  -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Npgsql.DisableDateTimeInfinityConversions" Value="true" />
+  </ItemGroup>
+
+</Project>

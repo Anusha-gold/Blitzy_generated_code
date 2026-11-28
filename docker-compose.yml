@@ -1,0 +1,169 @@
+# SmartHotel local stack: `docker compose up` starts db, api and web, migrates
+# and seeds the database, with no manual step.
+#
+# Also used, always with -f, --project-directory and an explicit project, by:
+#   - the acceptance stack (project smarthotel-acceptance, ports 18080/14200,
+#     --env-file deploy/acceptance.env);
+#   - the integration-test database (project smarthotel-test, --profile test,
+#     service db-test).
+#
+# Host ports are bound to 127.0.0.1 only. SMARTHOTEL_API_PORT and
+# SMARTHOTEL_WEB_PORT set the published ports and the origins derived from
+# them, so the SPA, CORS and the tests always agree. Each must be one port
+# number from 1 to 65535, written in decimal without leading zeros. Compose
+# also accepts 0, ranges and leading zeros, which give the derived URLs no
+# fixed port written as browsers write it, so the api entrypoint rejects
+# them, naming the variable, and the stack does not start. For web port 80
+# it writes the CORS origin as http://localhost, without the default port,
+# as browsers send it.
+#
+# Secrets: none is written here. On the first start the db wrapper writes the
+# database password and the JWT signing key into the `secrets` volume, from
+# SMARTHOTEL_DB_PASSWORD / SMARTHOTEL_JWT_SIGNING_KEY when set, otherwise
+# generated. Reset the secrets and the database together with
+# `docker compose down -v`.
+#
+# Only Compose v2.1.1 features are used, the minimum the project supports.
+
+services:
+  db:
+    image: postgres:16.16-alpine3.24
+    # The wrapper creates the secrets, exports POSTGRES_PASSWORD and execs the
+    # image entrypoint. Overriding the entrypoint clears the image's default
+    # command, so it is restated.
+    entrypoint: ["/bin/sh", "/opt/smarthotel/db-entrypoint.sh"]
+    command: ["postgres"]
+    environment:
+      POSTGRES_DB: smarthotel
+      POSTGRES_USER: smarthotel
+      # First-start overrides only; blank means "generate".
+      SMARTHOTEL_DB_PASSWORD: ${SMARTHOTEL_DB_PASSWORD:-}
+      SMARTHOTEL_JWT_SIGNING_KEY: ${SMARTHOTEL_JWT_SIGNING_KEY:-}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - secrets:/run/smarthotel-secrets
+      - ./deploy/db/db-entrypoint.sh:/opt/smarthotel/db-entrypoint.sh:ro
+    # No published port. Only the api service uses the database.
+    networks:
+      - default
+    healthcheck:
+      # TCP, so the image's init-only, socket-only server never counts as ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U smarthotel -d smarthotel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: src/SmartHotel.Api/Dockerfile
+    # Caps the API's memory. The .NET GC derives its heap hard limit (75% of
+    # the container limit) from it; without a limit Server GC sizes its heaps
+    # to the whole host.
+    mem_limit: 1g
+    # DB_PASSWORD and Jwt__SigningKey are deliberately absent: the image's
+    # entrypoint exports each from its secret file only when the variable is
+    # unset, and keeps a value set here, even an empty one.
+    # Jwt__Issuer and Jwt__Audience come from appsettings.json.
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_HTTP_PORTS: "8080"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: smarthotel
+      DB_USER: smarthotel
+      SMARTHOTEL_SECRETS_DIR: /run/smarthotel-secrets
+      # A bare origin, with no path or trailing slash, as the API requires.
+      Cors__AllowedOrigin: http://localhost:${SMARTHOTEL_WEB_PORT:-4200}
+      # Passed on so the image's entrypoint checks both host ports before the
+      # API starts; api starts before web, so a bad port stops the stack.
+      SMARTHOTEL_API_PORT: ${SMARTHOTEL_API_PORT:-8080}
+      SMARTHOTEL_WEB_PORT: ${SMARTHOTEL_WEB_PORT:-4200}
+    volumes:
+      - secrets:/run/smarthotel-secrets:ro
+    ports:
+      - "127.0.0.1:${SMARTHOTEL_API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - default
+    healthcheck:
+      # The API listens only after migration and seeding succeed, so healthy
+      # means a migrated and seeded database.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 5s
+      retries: 30
+      start_period: 20s
+
+  web:
+    build:
+      context: src/SmartHotel.Web
+      dockerfile: Dockerfile
+    # Rendered into /config.json as apiBaseUrl and environment at start.
+    environment:
+      API_BASE_URL: http://localhost:${SMARTHOTEL_API_PORT:-8080}/api
+      WEB_ENVIRONMENT: Development
+    ports:
+      - "127.0.0.1:${SMARTHOTEL_WEB_PORT:-4200}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1/"]
+      interval: 5s
+      retries: 20
+
+  # Integration-test database. The test profile keeps it out of an ordinary
+  # `up`: it starts when that profile is enabled or when it is named on the
+  # command line, and the test fixture does both. It trusts every connection,
+  # so it sits alone on the testdb network and is published on host loopback
+  # only. testdb is not internal: an internal network cannot publish a port.
+  # Loopback publishing keeps other hosts out only on Docker Engine 28.0 or
+  # later; on a Linux host running firewalld, engines 28.2.0 through 28.3.2
+  # lose that protection when firewalld reloads (CVE-2025-54388), so such a
+  # host needs 28.3.3 or later; see Tools under Prerequisites in README.md.
+  db-test:
+    image: postgres:16.16-alpine3.24
+    profiles: ["test"]
+    # Fewer value-bearing diagnostics in the server log, as for db. terse
+    # drops DETAIL, where a unique violation prints the conflicting key (a
+    # guest's email, for one), with HINT, QUERY and CONTEXT; panic keeps the
+    # failing statement out of every error record below PANIC; the two 0
+    # settings keep bind parameters out of error records and logged
+    # statements. The primary message is still logged and can quote a
+    # rejected value. The server still sends clients the SQLSTATE, the
+    # constraint name and DETAIL. Npgsql redacts DETAIL, because no
+    # connection sets Include Error Detail, and the tests and the API's
+    # 23505/23P01 translation need only the SQLSTATE and the constraint name.
+    # The image entrypoint passes these options to its init server as well.
+    command: ["postgres",
+      "-c", "log_error_verbosity=terse",
+      "-c", "log_min_error_statement=panic",
+      "-c", "log_parameter_max_length_on_error=0",
+      "-c", "log_parameter_max_length=0"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+    networks:
+      - testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+networks:
+  default:
+  testdb:
+
+volumes:
+  db-data:
+  secrets:

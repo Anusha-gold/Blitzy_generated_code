@@ -1,0 +1,373 @@
+using System.Globalization;
+using System.Net;
+using System.Text;
+
+using Microsoft.Extensions.Options;
+
+namespace SmartHotel.Api.Infrastructure;
+
+/// <summary>
+/// Settings for issuing and validating the API's HS256 bearer tokens, bound from the <c>Jwt</c>
+/// configuration section.
+/// </summary>
+/// <remarks>
+/// This is a class rather than a record because a record's synthesized <c>ToString</c> would print the
+/// signing key.
+/// </remarks>
+public sealed class JwtOptions
+{
+    /// <summary>
+    /// The configuration section the options are bound from.
+    /// </summary>
+    public const string SectionName = "Jwt";
+
+    /// <summary>
+    /// The shortest signing key accepted, in UTF-8 bytes: RFC 7518 requires an HS256 key of at least
+    /// 256 bits.
+    /// </summary>
+    public const int MinimumSigningKeyBytes = 32;
+
+    /// <summary>
+    /// Gets or sets the token issuer (<c>iss</c>). <c>appsettings.json</c> supplies <c>SmartHotel.Api</c>.
+    /// </summary>
+    public string Issuer { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the token audience (<c>aud</c>). <c>appsettings.json</c> supplies <c>SmartHotel.Web</c>.
+    /// </summary>
+    public string Audience { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the HS256 signing key text.
+    /// </summary>
+    /// <remarks>
+    /// The key is filled only from <see cref="ISecretSource.JwtSigningKey"/>, by <c>Program.cs</c>'s
+    /// <c>PostConfigure</c> step, which overwrites any configured value. A key placed in a JSON file is
+    /// therefore ignored, and validation fails when the environment supplies none or a blank
+    /// (whitespace-only) one.
+    /// </remarks>
+    public string? SigningKey { get; set; }
+}
+
+/// <summary>
+/// Validates <see cref="JwtOptions"/> when the options are first resolved, so a missing issuer or audience,
+/// or a missing, blank or short signing key, stops the API before any database work.
+/// </summary>
+public sealed class JwtOptionsValidator : IValidateOptions<JwtOptions>
+{
+    /// <summary>
+    /// Checks every setting and reports all failures together. Each message names the setting and never
+    /// contains the signing key, its length or any part of it.
+    /// </summary>
+    /// <param name="name">The options name. Every name is validated alike.</param>
+    /// <param name="options">The bound and post-configured options.</param>
+    /// <returns>Success, or a failure listing every invalid setting.</returns>
+    public ValidateOptionsResult Validate(string? name, JwtOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        List<string> failures = [];
+
+        if (string.IsNullOrWhiteSpace(options.Issuer))
+        {
+            failures.Add("Jwt__Issuer (Jwt:Issuer) must be set.");
+        }
+
+        if (string.IsNullOrWhiteSpace(options.Audience))
+        {
+            failures.Add("Jwt__Audience (Jwt:Audience) must be set.");
+        }
+
+        // A blank key is rejected before its length is measured: whitespace can reach the minimum byte
+        // count and would still be predictable key material. The key is measured as given, never trimmed.
+        if (string.IsNullOrWhiteSpace(options.SigningKey))
+        {
+            failures.Add("Jwt__SigningKey must be set.");
+        }
+        else if (Encoding.UTF8.GetByteCount(options.SigningKey) < JwtOptions.MinimumSigningKeyBytes)
+        {
+            failures.Add("Jwt__SigningKey must be at least 32 bytes in UTF-8.");
+        }
+
+        return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
+    }
+}
+
+/// <summary>
+/// Settings for the API's single cross-origin policy, bound from the <c>Cors</c> configuration section.
+/// </summary>
+public sealed class ApiCorsOptions
+{
+    /// <summary>
+    /// The configuration section the options are bound from.
+    /// </summary>
+    public const string SectionName = "Cors";
+
+    /// <summary>
+    /// The name of the one CORS policy, which <c>Program.cs</c> registers and applies.
+    /// </summary>
+    public const string PolicyName = "web";
+
+    /// <summary>
+    /// How long, in seconds, a browser may cache the policy's answer to a preflight for a request URL
+    /// (<c>Access-Control-Max-Age</c>) before it sends another preflight. Ten minutes covers a session's
+    /// repeated calls, while a changed policy still reaches browsers quickly. Without the header, Chromium
+    /// caches a preflight for only 5 seconds, and it caps the value at 7,200 seconds.
+    /// </summary>
+    public const int PreflightMaxAgeSeconds = 600;
+
+    /// <summary>
+    /// Gets or sets the only origin allowed to call the API: the web app's serialized origin,
+    /// <c>scheme://host[:port]</c> with no trailing <c>/</c>.
+    /// </summary>
+    /// <remarks>
+    /// Set from the environment variable <c>Cors__AllowedOrigin</c>, which Compose derives from the web
+    /// port (for example <c>http://localhost:4200</c>), or from in-memory configuration in the
+    /// integration tests.
+    /// </remarks>
+    public string? AllowedOrigin { get; set; }
+}
+
+/// <summary>
+/// Validates <see cref="ApiCorsOptions"/>: the allowed origin must be a serialized origin, and outside
+/// Development it must be an <c>https://</c> origin.
+/// </summary>
+/// <remarks>
+/// Browsers send the <c>Origin</c> header in serialized form: a lower-case scheme, the host in ASCII
+/// (internationalized labels in punycode, an IPv4 address in dotted decimal, an IPv6 address in brackets
+/// in compressed hexadecimal), the port only when it is not the scheme's default, and no user information
+/// or path. A configured value in any other form, such as one with a trailing <c>/</c>, would never match
+/// a request and would silently block the web app, so it is rejected at startup instead.
+/// <para>
+/// Every IPv6 address is accepted in the form browsers write, with every piece in hexadecimal, including
+/// the pieces of an address that embeds an IPv4 address, such as <c>https://[::ffff:c000:201]</c>. Any
+/// other spelling of the same address, such as <c>https://[::ffff:192.0.2.1]</c>, upper-case or
+/// uncompressed pieces, or a zone identifier, is rejected with a message that shows the browser's form.
+/// The policy holds the validated value as is, because <c>CorsPolicyBuilder.WithOrigins</c> would rebuild
+/// it through <see cref="Uri"/>, which writes such an address with a dotted IPv4 tail that no browser sends.
+/// </para>
+/// </remarks>
+/// <param name="environment">The host environment, which decides whether plain <c>http</c> is allowed.</param>
+public sealed class ApiCorsOptionsValidator(IHostEnvironment environment) : IValidateOptions<ApiCorsOptions>
+{
+    /// <summary>
+    /// Checks the allowed origin and reports the first rule it breaks.
+    /// </summary>
+    /// <param name="name">The options name. Every name is validated alike.</param>
+    /// <param name="options">The bound options.</param>
+    /// <returns>Success, or a failure naming the first broken rule.</returns>
+    public ValidateOptionsResult Validate(string? name, ApiCorsOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        string? value = options.AllowedOrigin;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return ValidateOptionsResult.Fail("Cors__AllowedOrigin must be set to the web app's origin.");
+        }
+
+        // The origin itself is not secret, but a malformed value can carry credentials (user:password@host),
+        // so no message echoes the raw value. Only the last shape check shows a value: the origin rebuilt
+        // from the parsed scheme, host and port, which never contains user information.
+        if (!Uri.TryCreate(value, UriKind.Absolute, out Uri? uri))
+        {
+            return ValidateOptionsResult.Fail("Cors__AllowedOrigin must be an absolute URI.");
+        }
+
+        if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+        {
+            return ValidateOptionsResult.Fail("Cors__AllowedOrigin must use the http or https scheme.");
+        }
+
+        if (uri.UserInfo.Length > 0 || uri.Query.Length > 0 || uri.Fragment.Length > 0)
+        {
+            return ValidateOptionsResult.Fail(
+                "Cors__AllowedOrigin must not contain user information, a query or a fragment.");
+        }
+
+        if (uri.AbsolutePath != "/")
+        {
+            return ValidateOptionsResult.Fail("Cors__AllowedOrigin must not contain a path.");
+        }
+
+        // Browsers send the host in ASCII and refuse a host the IDN rules reject, so such a value never
+        // matches the Origin header.
+        string? asciiHost = ReadAsciiHost(uri);
+        if (asciiHost is null)
+        {
+            return ValidateOptionsResult.Fail(
+                "Cors__AllowedOrigin must have a host that is a valid internationalized domain name.");
+        }
+
+        // Browsers read a host whose last label is a number as an IPv4 address: they rewrite it in dotted
+        // decimal, or refuse the URL when it is not a valid address. Uri parses such a host as IPv4 only
+        // when it is a valid address without a trailing '.', so any other host ending in a number never
+        // matches the Origin header.
+        if (uri.HostNameType != UriHostNameType.IPv4
+            && uri.HostNameType != UriHostNameType.IPv6
+            && EndsInNumber(asciiHost))
+        {
+            return ValidateOptionsResult.Fail(
+                "Cors__AllowedOrigin must write a host that ends in a number as a dotted-decimal IPv4 address.");
+        }
+
+        // The serialized origin is rebuilt from the parsed scheme, host and port the way a browser writes the
+        // Origin header. A value that differs from it has, for example, a trailing '/', upper-case letters,
+        // Unicode host labels, an empty user-information delimiter ('@' with nothing before it), an IPv6
+        // address written other than as browsers write it (with a dotted IPv4 tail, or with uncompressed or
+        // leading-zero pieces) or with a zone identifier, an explicit default port or surrounding whitespace.
+        string serializedOrigin = SerializeOrigin(uri, asciiHost);
+        if (!string.Equals(value, serializedOrigin, StringComparison.Ordinal))
+        {
+            return ValidateOptionsResult.Fail(
+                $"Cors__AllowedOrigin must be a serialized origin, written exactly as {serializedOrigin}.");
+        }
+
+        if (!environment.IsDevelopment() && uri.Scheme != Uri.UriSchemeHttps)
+        {
+            return ValidateOptionsResult.Fail("Cors__AllowedOrigin must be an https:// origin outside Development.");
+        }
+
+        return ValidateOptionsResult.Success;
+    }
+
+    /// <summary>
+    /// Reads the host of <paramref name="uri"/> in lower-case ASCII, as browsers send it: internationalized
+    /// labels become punycode, and label separators such as the ideographic full stop become <c>.</c>.
+    /// </summary>
+    /// <param name="uri">An absolute <c>http</c> or <c>https</c> URI.</param>
+    /// <returns>
+    /// The ASCII host, or <see langword="null"/> when the IDN rules reject it because a label holds a
+    /// disallowed character, such as an unassigned code point.
+    /// </returns>
+    private static string? ReadAsciiHost(Uri uri)
+    {
+        try
+        {
+            return uri.IdnHost;
+        }
+        catch (UriFormatException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Reports whether <paramref name="host"/> ends in a number the way browsers judge it: its last label,
+    /// ignoring one trailing <c>.</c>, is all decimal digits, or <c>0x</c> followed only by hexadecimal
+    /// digits.
+    /// </summary>
+    /// <param name="host">An ASCII host name.</param>
+    /// <returns><see langword="true"/> when browsers would parse the host as an IPv4 address.</returns>
+    private static bool EndsInNumber(string host)
+    {
+        string[] labels = host.Split('.');
+        int last = labels.Length - 1;
+        if (labels[last].Length == 0 && last > 0)
+        {
+            last--;
+        }
+
+        string label = labels[last];
+        if (label.Length > 0 && label.All(char.IsAsciiDigit))
+        {
+            return true;
+        }
+
+        return label.Length >= 2
+            && label[0] == '0'
+            && (label[1] == 'x' || label[1] == 'X')
+            && label[2..].All(char.IsAsciiHexDigit);
+    }
+
+    /// <summary>
+    /// Writes the origin of <paramref name="uri"/> as a browser serializes it in the <c>Origin</c> header:
+    /// the lower-case scheme, <c>://</c>, the ASCII host, and <c>:port</c> only when the port is not the
+    /// scheme's default. User information is never part of it.
+    /// </summary>
+    /// <param name="uri">
+    /// An absolute <c>http</c> or <c>https</c> URI. An IPv6 host is written in brackets from the address
+    /// itself, as <see cref="SerializeIPv6"/> describes, whatever spelling the URI used, and without a zone
+    /// identifier.
+    /// </param>
+    /// <param name="asciiHost">The host as <see cref="ReadAsciiHost"/> returned it.</param>
+    /// <returns>The serialized origin.</returns>
+    private static string SerializeOrigin(Uri uri, string asciiHost)
+    {
+        string host = asciiHost;
+        if (uri.HostNameType == UriHostNameType.IPv6)
+        {
+            // IdnHost drops the brackets and keeps the zone identifier. Uri.Host brackets the address and drops
+            // the zone identifier, but writes an address that embeds an IPv4 address with a dotted tail, which
+            // browsers never do. The bracketed text is an address Uri has already parsed, so it parses again
+            // here and is written from its bytes.
+            IPAddress address = IPAddress.Parse(uri.Host.AsSpan(1, uri.Host.Length - 2));
+            host = "[" + SerializeIPv6(address) + "]";
+        }
+
+        return uri.IsDefaultPort
+            ? uri.Scheme + "://" + host
+            : uri.Scheme + "://" + host + ":" + uri.Port.ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Writes an IPv6 address the way the URL Standard's IPv6 serializer does, which is how browsers write it
+    /// in the <c>Origin</c> header: the eight 16-bit pieces in lower-case hexadecimal without leading zeros,
+    /// separated by <c>:</c>, with the first longest run of two or more zero pieces written as <c>::</c>.
+    /// Every piece is hexadecimal, including those of an address that embeds an IPv4 address.
+    /// </summary>
+    /// <param name="address">An IPv6 address.</param>
+    /// <returns>The address without brackets, for example <c>::ffff:c000:201</c>.</returns>
+    private static string SerializeIPv6(IPAddress address)
+    {
+        byte[] bytes = address.GetAddressBytes();
+        int[] pieces = new int[bytes.Length / 2];
+        for (int index = 0; index < pieces.Length; index++)
+        {
+            pieces[index] = (bytes[2 * index] << 8) | bytes[(2 * index) + 1];
+        }
+
+        // A run replaces the current choice only when strictly longer, so the first of equally long runs wins,
+        // and a single zero piece is never compressed.
+        int compressStart = -1;
+        int compressLength = 1;
+        int runStart = 0;
+        for (int index = 0; index <= pieces.Length; index++)
+        {
+            if (index < pieces.Length && pieces[index] == 0)
+            {
+                continue;
+            }
+
+            if (index - runStart > compressLength)
+            {
+                compressStart = runStart;
+                compressLength = index - runStart;
+            }
+
+            runStart = index + 1;
+        }
+
+        // With no run chosen, compressStart is -1 and compressEnd is 0, so every piece is written.
+        int compressEnd = compressStart + compressLength;
+        StringBuilder output = new();
+        for (int index = 0; index < pieces.Length; index++)
+        {
+            if (index == compressStart)
+            {
+                // A preceding piece already wrote its ':' separator, so only a run at the start needs two.
+                output.Append(index == 0 ? "::" : ":");
+            }
+            else if (index < compressStart || index >= compressEnd)
+            {
+                output.Append(pieces[index].ToString("x", CultureInfo.InvariantCulture));
+                if (index < pieces.Length - 1)
+                {
+                    output.Append(':');
+                }
+            }
+        }
+
+        return output.ToString();
+    }
+}

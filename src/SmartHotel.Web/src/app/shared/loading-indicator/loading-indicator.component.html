@@ -1,0 +1,5 @@
+<div *ngIf="loading.isLoading()" class="loading-indicator" role="progressbar" aria-label="Loading" data-testid="loading-indicator">
+  <span class="loading-indicator__bar" aria-hidden="true"></span>
+  Loading…
+</div>
+<p class="visually-hidden" role="status" aria-live="polite">{{ loading.isLoading() ? 'Loading…' : 'Loading complete.' }}</p>

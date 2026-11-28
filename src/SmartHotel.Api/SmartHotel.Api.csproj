@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SmartHotel.Data\SmartHotel.Data.csproj" />
+  </ItemGroup>
+
+  <!--
+    By default Npgsql writes DateOnly and DateTime MinValue and MaxValue as -infinity and infinity, so a stay ending
+    9999-12-31 would be stored and compared as infinity. The option is written to runtimeconfig.json, so it is in force
+    before any Npgsql use under dotnet run, in the published image, and under dotnet ef, whose tools run with the
+    startup project's runtimeconfig.json.
+  -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Npgsql.DisableDateTimeInfinityConversions" Value="true" />
+  </ItemGroup>
+
+  <!--
+    DATAS (dynamic adaptation to application sizes). Server GC otherwise keeps one heap per core, with allocation
+    budgets sized to the host, so on a large machine the process retains gigabytes it does not need. DATAS adapts the
+    heap count and the budgets to the live data, so memory follows the load in any deployment, with or without a
+    container memory limit. The SDK writes it to runtimeconfig.json as System.GC.DynamicAdaptationMode.
+  -->
+  <PropertyGroup>
+    <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
+  </PropertyGroup>
+
+</Project>

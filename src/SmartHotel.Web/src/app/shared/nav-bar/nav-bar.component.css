@@ -1,0 +1,104 @@
+/* Nav bar: full-width strip whose row lines up with main's 64rem measure.
+   Focus rings are the global :focus-visible rule. On #f5f7fa: accent 5.95:1, email 6.02:1. */
+:host {
+  display: block;
+}
+
+.nav-bar {
+  border-block-end: 1px solid var(--sh-color-rule);
+  background-color: #f5f7fa;
+}
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 1.25rem;
+  max-inline-size: 64rem;
+  margin-inline: auto;
+  /* Room for the 4px focus ring at the viewport's top edge. */
+  padding-block: 0.25rem;
+  padding-inline: 1rem;
+}
+
+/* Block padding around one line of text gives each link a target about
+   2.75rem tall at the body font size, and it scales with the text. */
+nav a {
+  padding-block: 0.625rem;
+  font-weight: 600;
+  text-decoration-line: none;
+  text-underline-offset: 0.2em;
+}
+
+/* Qualified to outrank the nav a weight. */
+nav .brand {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--sh-color-text);
+}
+
+nav .brand:active {
+  color: var(--sh-color-accent-pressed);
+}
+
+/* Current page (aria-current): body text color plus an underline thicker than hover's 2px,
+   so not color alone, and no box change, so no shift. Qualified to outrank nav a. */
+nav .current {
+  text-decoration-line: underline;
+  text-decoration-thickness: 3px;
+  color: var(--sh-color-text);
+}
+
+nav .current:active {
+  color: var(--sh-color-accent-pressed);
+}
+
+/* Short of room it wraps to its own row, then shrinks: the email wraps in full, never widening the page. */
+.account {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  min-inline-size: 0;
+  margin-inline-start: auto;
+}
+
+.email {
+  /* Unlike break-word, anywhere lowers min-content, so a long address breaks onto more lines. */
+  overflow-wrap: anywhere;
+  color: var(--sh-color-text-muted);
+}
+
+/* Outlined, unlike the global filled button: replaces its white text and
+   outranks its hover and press. */
+.account button {
+  flex: none;
+  padding-block: 0.25rem;
+  padding-inline: 0.75rem;
+  border-color: var(--sh-color-control-border);
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--sh-color-accent);
+  background-color: var(--sh-color-bg);
+}
+
+@media (hover: hover) {
+  nav a:hover {
+    text-decoration-line: underline;
+  }
+
+  .account button:hover {
+    border-color: var(--sh-color-accent);
+    background-color: var(--sh-color-accent-tint);
+  }
+}
+
+.account button:active {
+  border-color: var(--sh-color-accent-pressed);
+  color: var(--sh-color-accent-pressed);
+}
+
+@media (max-width: 30rem) {
+  nav {
+    column-gap: 0.75rem;
+  }
+}

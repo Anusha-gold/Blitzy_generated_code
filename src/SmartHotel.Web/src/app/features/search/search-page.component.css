@@ -1,0 +1,79 @@
+/* Search page: the criteria form and the hotel result cards. */
+:host {
+  display: block;
+}
+
+/* One row on wide screens; fields and the button wrap on narrow ones. */
+form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem 1rem;
+  margin-block-end: 1rem;
+}
+
+.field {
+  display: flex;
+  flex: 1 1 10rem;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-inline-size: 10rem;
+}
+
+label {
+  font-weight: 600;
+  margin-block-end: 0.125rem;
+}
+
+/* The list's gap, not item margins, spaces the cards. */
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-block: 1rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.results li {
+  padding: 1rem;
+  border: 1px solid var(--sh-color-rule);
+  border-radius: var(--sh-radius);
+}
+
+.results h2 {
+  font-size: 1.125rem;
+  margin-block: 0 0.25rem;
+}
+
+.results p {
+  margin-block: 0 0.5rem;
+}
+
+.price {
+  font-weight: 600;
+  color: var(--sh-color-text);
+}
+
+/* Muted text on white is 6.4:1. */
+.empty {
+  margin-block: 1rem 0;
+  color: var(--sh-color-text-muted);
+}
+
+/* Chrome's date-picker button takes focus inside the input, where the
+   input itself no longer matches :focus-visible. */
+a:focus-visible,
+input:focus-visible,
+input[type="date"]:focus-within,
+button:focus-visible {
+  outline: 2px solid var(--sh-color-accent);
+  outline-offset: 2px;
+}
+
+/* A field the server rejected: a 2px error-coloured edge, the inset shadow adding the second pixel without a
+   layout shift. Its specificity and later order beat the plain and hover borders. */
+input[aria-invalid="true"] {
+  border-color: var(--sh-color-error);
+  box-shadow: inset 0 0 0 1px var(--sh-color-error);
+}

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>SmartHotel</title>
+    <base href="/">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      /* Pre-bootstrap messages: the boot-loading element below and the
+         boot-error alert main.ts puts in its place, direct children of
+         app-root only; the rendered shell never places a <p> there.
+         They are styled here rather than in styles.css because the build
+         inlines only the stylesheet rules that match this file's static
+         markup and loads the rest asynchronously, and the alert does not exist
+         until main.ts creates it. Inline, both states are styled from the
+         first paint even when the stylesheet is slow or never arrives. The
+         colour token comes from the :root rules, which are always inlined. */
+      app-root > p {
+        padding: 1rem;
+      }
+
+      app-root > p[role="alert"] {
+        color: var(--sh-color-error);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <app-root><p data-testid="boot-loading">Loading SmartHotel…</p></app-root>
+  </body>
+</html>

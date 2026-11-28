@@ -1,0 +1,138 @@
+<h1 tabindex="-1">My bookings</h1>
+
+<!-- Visible as a banner only while it holds a cancellation message; every
+     other message repeats what the page already shows. -->
+<p
+  [class.visually-hidden]="!cancellationShown()"
+  [class.cancel-notice]="cancellationShown()"
+  role="status"
+  aria-live="polite"
+  data-testid="bookings-announcement"
+>{{ announcement() }}</p>
+
+<section
+  *ngIf="confirmation() as c"
+  #confirmationBanner
+  class="confirmation"
+  data-testid="booking-confirmation"
+  aria-label="Booking confirmed"
+  tabindex="-1"
+>
+  <h2>Booking confirmed</h2>
+  <p>{{ c.hotelName }}, {{ c.roomTypeName }}, room {{ c.roomNumber }}</p>
+  <p><time [attr.datetime]="c.checkIn">{{ c.checkIn | date }}</time> to <time [attr.datetime]="c.checkOut">{{ c.checkOut | date }}</time>, {{ c.nights }} {{ c.nights === 1 ? 'night' : 'nights' }}</p>
+  <p>Total: {{ c.totalPrice | currency: 'USD' }}</p>
+  <p>No payment is taken online in this version.</p>
+</section>
+
+<app-error-message [error]="error()">
+  <a
+    *ngIf="error()?.status === 401"
+    routerLink="/login"
+    [queryParams]="{ returnUrl: '/bookings' }"
+    data-testid="login-again"
+  >Log in again</a>
+</app-error-message>
+
+<p *ngIf="signedOut()" data-testid="bookings-signed-out">
+  Your session has expired.
+  <a routerLink="/login" [queryParams]="{ returnUrl: '/bookings' }" data-testid="login-again">Log in again</a>
+  to see your bookings.
+</p>
+
+<ng-container *ngIf="bookings() as list">
+  <p *ngIf="list.length === 0" class="empty" data-testid="bookings-empty">You have no bookings yet.</p>
+
+  <ng-container *ngIf="list.length > 0">
+    <!-- A Cancel button may be on no row, so the scroller itself is a focusable
+         region named by the caption: Tab reaches it and the arrow keys scroll it. -->
+    <div
+      class="bookings-scroll"
+      role="region"
+      aria-labelledby="bookings-caption"
+      tabindex="0"
+      data-testid="bookings-scroll"
+    >
+      <table class="bookings" [class.wide-totals]="hasWideTotals()" data-testid="bookings-table">
+        <caption id="bookings-caption" class="visually-hidden">Your bookings, newest first</caption>
+        <thead>
+          <tr>
+            <th scope="col">Hotel</th>
+            <th scope="col">Room type</th>
+            <th scope="col" class="num">Room</th>
+            <th scope="col">Check-in</th>
+            <th scope="col">Check-out</th>
+            <th scope="col" class="num">Nights</th>
+            <th scope="col" class="num">Guests</th>
+            <th scope="col" class="num">Total</th>
+            <th scope="col">Status</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- data-label repeats each column header for the compact rows of
+               narrow screens, which hide the header row and show it as
+               generated content above the value. -->
+          <tr *ngFor="let b of visibleBookings(); trackBy: trackById" [attr.data-testid]="'booking-row-' + b.id">
+            <td>{{ b.hotelName }}</td>
+            <td data-label="Room type">{{ b.roomTypeName }}</td>
+            <td class="num" data-label="Room">{{ b.roomNumber }}</td>
+            <td data-label="Check-in"><time [attr.datetime]="b.checkIn">{{ b.checkIn | date }}</time></td>
+            <td data-label="Check-out"><time [attr.datetime]="b.checkOut">{{ b.checkOut | date }}</time></td>
+            <td class="num" data-label="Nights">{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
+            <td class="num" data-label="Guests">{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
+            <td class="num" data-label="Total" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
+            <!-- The status look is on the value alone, so the compact rows'
+                 "Status" label stays plain like the other labels. -->
+            <td
+              class="status"
+              data-label="Status"
+              [attr.data-testid]="'booking-status-' + b.id"
+              tabindex="-1"
+            ><span
+              [class.status-confirmed]="b.status === 'Confirmed'"
+              [class.status-cancelled]="b.status === 'Cancelled'"
+            >{{ b.status }}</span></td>
+            <td>
+              <!-- The visible label "Cancel" starts the accessible name, and the
+                   visually hidden rest names the booking: hotel, room type, room
+                   and dates. The seeded hotel names are distinct, a room number
+                   is unique within its hotel and a room never has two
+                   overlapping Confirmed bookings, so no two buttons share a name. -->
+              <button
+                *ngIf="cancellableIds().has(b.id)"
+                type="button"
+                class="button-secondary"
+                [attr.data-testid]="'cancel-' + b.id"
+                [disabled]="cancelPending()"
+                #cancelButton
+                (click)="cancel(b, cancelButton)"
+              >Cancel<span class="visually-hidden"> booking at {{ b.hotelName }}, {{ b.roomTypeName }} room {{ b.roomNumber }}, {{ b.checkIn | date }} to {{ b.checkOut | date }}</span></button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- At either end the button is aria-disabled, not disabled: a native
+         disabled button would drop keyboard focus to the page body after the
+         press that reached that end. The handlers ignore those clicks. -->
+    <nav *ngIf="pageCount() > 1" class="pager" aria-label="Bookings pages" data-testid="bookings-pager">
+      <button
+        #previousButton
+        type="button"
+        data-testid="bookings-previous"
+        [attr.aria-disabled]="page() === 0 ? 'true' : null"
+        (click)="previousPage(previousButton)"
+      >Previous</button>
+      <p aria-live="polite" data-testid="bookings-range">Showing {{ range().first }}–{{ range().last }} of {{ range().total }} bookings</p>
+      <button
+        #nextButton
+        type="button"
+        data-testid="bookings-next"
+        [attr.aria-disabled]="page() === pageCount() - 1 ? 'true' : null"
+        (click)="nextPage(nextButton)"
+      >Next</button>
+    </nav>
+  </ng-container>
+</ng-container>

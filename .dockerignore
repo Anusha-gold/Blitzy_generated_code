@@ -1,0 +1,35 @@
+# Build context for the API image (src/SmartHotel.Api/Dockerfile, context: repository root).
+# An allowlist: exclude everything, then re-include only the files the API image build reads, by name or as C#
+# sources, never as whole folders. The last matching rule wins. Any other local file, such as an .env variant,
+# appsettings.<Environment>.json, secrets.json, launchSettings.json or a certificate or key file, stays out of the
+# context and the image. TLS certificates and other private material are supplied at run time as a mounted file and
+# environment variables (Kestrel__Certificates__Default__Path, Kestrel__Certificates__Default__Password), never
+# through the build context.
+# SmartHotel.sln stays out on purpose: it lists the test projects, which are not in this context, so the
+# Dockerfile restores and publishes the API project directly.
+*
+
+# Root build inputs (.editorconfig is read by the analyzers, so the image build matches the host build)
+!global.json
+!Directory.Build.props
+!Directory.Packages.props
+!.editorconfig
+
+# Data project: the project file and the C# sources
+!src/SmartHotel.Data/SmartHotel.Data.csproj
+!src/SmartHotel.Data/**/*.cs
+
+# API project: the project file, the C# sources, the one committed settings file and the container entrypoint
+!src/SmartHotel.Api/SmartHotel.Api.csproj
+!src/SmartHotel.Api/**/*.cs
+!src/SmartHotel.Api/appsettings.json
+!src/SmartHotel.Api/docker-entrypoint.sh
+
+# Never send local build output, even where a re-include above matches it (obj/ holds generated .cs files).
+# These rules follow the re-includes so that they win, and end in /** so that they match the files themselves:
+# BuildKit does not apply a folder rule to a file that a re-include matched inside an already excluded folder.
+**/bin/**
+**/obj/**
+
+# Local dotenv files can hold credentials, so they stay out at any depth
+**/.env

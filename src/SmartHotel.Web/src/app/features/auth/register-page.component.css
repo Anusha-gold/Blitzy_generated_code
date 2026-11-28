@@ -1,0 +1,46 @@
+/* Register page: shares the login page's narrow centred column and vertical spacing. */
+:host {
+  display: block;
+  max-inline-size: 24rem;
+  margin-inline: auto;
+}
+
+/* Block flow, so the heading's global bottom margin puts the first content
+   0.75rem below it, as on every screen. flow-root keeps the heading's top
+   margin inside the column. */
+.auth-page {
+  display: flow-root;
+}
+
+p {
+  margin-block: 0;
+}
+
+/* Spaces the "Already registered? Log in" paragraph below the form. */
+form {
+  margin-block-end: 1rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-block-end: 1rem;
+}
+
+.field > label {
+  margin-block-end: 0;
+}
+
+/* Size, padding, border, colours, focus ring and disabled state are the
+   global control defaults in src/styles.css; only the column width is set here. */
+input {
+  inline-size: 100%;
+}
+
+/* A field the server rejected: a 2px error-coloured edge, the inset shadow adding the second pixel without a
+   layout shift. Its specificity and later order beat the plain and hover borders. */
+input[aria-invalid="true"] {
+  border-color: var(--sh-color-error);
+  box-shadow: inset 0 0 0 1px var(--sh-color-error);
+}

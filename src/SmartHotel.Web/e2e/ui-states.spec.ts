@@ -1,0 +1,5000 @@
+/**
+ * The web app's request states, exercised in Chromium against the stack at
+ * `baseURL`: the loading indicator while a request is pending, the
+ * empty-result message, inline errors for 400, 409 and 401, and the redirect
+ * to login when a protected page is opened without a valid session.
+ *
+ * Both branches of the 401 rule are proved with a real server rejection: the
+ * app's own bookings requests have their `Authorization` header rewritten, so
+ * the 401 comes from the API's JwtBearer validation, not from a stub.
+ * Entering My bookings then redirects to login with the session-expired
+ * notice, or, when the browser throws on that redirect's history update,
+ * stays open with the 401 inline and a "Log in again" back to the list. An
+ * action, "Book" or "Cancel", stays on its page with the 401 inline. The
+ * remaining tests cover related page states, such as the auth pages and the
+ * return URLs the login page refuses or keeps, URL criteria, late answers,
+ * the request deadline, a request that fails with no HTTP response, a 5xx
+ * problem body shown only as generic text, the hotel load's "Retry", unusable
+ * response bodies and success statuses, a hotel detail whose echoed stay
+ * contradicts the request, and a 201 whose My bookings page fails to load,
+ * which keeps the confirmed booking on the hotel page. Booking outcomes stay
+ * with the session that sent them: "Log out" or the session's expiry while
+ * "Book" is in flight, a late 401
+ * notice that names no booking, a late notice's link once the clock has
+ * passed the expiry, and the expiry checks that run when the timer is late.
+ *
+ * Every test runs in a fresh browser context and therefore starts signed
+ * out, because the session lives only in memory. Every guest is registered
+ * by the test that uses it, under a unique email, and the bookings a test
+ * arranges or reads go straight to the API under that guest's own token,
+ * which no diagnostic prints.
+ *
+ * After each test, cleanup attempts to cancel the bookings it created,
+ * through the API or the web app, and warns when it cannot. Best-effort
+ * cleanup can leave bookings on a reused stack.
+ */
+import {
+  expect,
+  test,
+  type APIRequestContext,
+  type APIResponse,
+  type Locator,
+  type Page,
+  type Response,
+  type Route,
+} from '@playwright/test';
+
+import {
+  apiRequest,
+  apiUrl,
+  displayDate,
+  expectControlValue,
+  expectNoInlineError,
+  // Some tests fill forms field by field: the form helpers also wait for
+  // their success outcome, which these tests must not wait for (a delayed
+  // search) or expect never to happen (a rejected registration or login).
+  fillBound,
+  isApiEndpoint,
+  logIn,
+  readAvailableCount,
+  registerGuest,
+  searchHotels,
+  uniqueEmail,
+  uniquePassword,
+  utcDates,
+  watchInlineErrors,
+} from './support/helpers';
+
+// The positive predicates below match a request only on the target API's
+// origin and endpoint path (`isApiEndpoint`), so a web app that calls another
+// stack's API fails the waiters and routes built on them; each waiter matches
+// its endpoint's exact path and checks the method as well. The recorders that
+// assert no request was sent match any origin instead, so a request to
+// another API cannot slip past them.
+
+/**
+ * The target API's hotel search, `GET /api/hotels?…`, and never the detail
+ * `/api/hotels/{id}`. A predicate rather than a glob: Playwright globs match
+ * `?` literally and never let `*` cross a `/`.
+ */
+const isHotelSearch = (url: URL): boolean => isApiEndpoint(url, '/hotels');
+
+/**
+ * The target API's bookings endpoints: the list, "Book" and "Cancel". The
+ * SPA's own `/bookings` page never matches, because it is on the web origin
+ * and its path has no `/api` prefix.
+ */
+const isBookingsApi = (url: URL): boolean => isApiEndpoint(url, '/bookings', 'withSubPaths');
+
+/**
+ * The target API's bookings collection, `/api/bookings` exactly: the list
+ * (`GET`) and "Book" (`POST`), never a booking's own `/api/bookings/{id}`.
+ */
+const isBookingsCollection = (url: URL): boolean => isApiEndpoint(url, '/bookings');
+
+/** The target API's registration endpoint, `/api/auth/register`, never the SPA's `/register` page. */
+const isRegisterApi = (url: URL): boolean => isApiEndpoint(url, '/auth/register');
+
+/** The target API's login endpoint, `/api/auth/login`, never the SPA's `/login` page. */
+const isLoginApi = (url: URL): boolean => isApiEndpoint(url, '/auth/login');
+
+/**
+ * Any API endpoint, on any origin, for asserting that the app sent no API
+ * request: matching the target API's origin only would let a request to
+ * another API go unseen. The SPA's own routes never match, because none has
+ * an `/api` prefix.
+ */
+const isApi = (url: URL): boolean => url.pathname === '/api' || url.pathname.startsWith('/api/');
+
+/** Every hotel card on the search page. */
+const HOTEL_RESULTS = '[data-testid^="hotel-result-"]';
+
+/** Every "View rooms" link on the search page. */
+const VIEW_ROOMS = '[data-testid^="view-rooms-"]';
+
+/** Every "Book" button of the hotel detail page's room table. */
+const BOOK_BUTTONS = '[data-testid^="book-"]';
+
+/**
+ * A deep link whose criteria only the server can judge: the page must send
+ * the URL's text unchanged and show the server's answer inline.
+ */
+interface RawCriteriaCase {
+  /** What the URL holds, for the test title. */
+  title: string;
+  /** The page URL; `{stay}` stands for a valid `checkIn=…&checkOut=…` query. */
+  url: string;
+  /**
+   * The target API endpoint the page's `GET` must request, below the API base
+   * and with the hotel id included, as {@link isApiEndpoint} takes it.
+   */
+  endpoint: string;
+  /** The `guests` text that `GET` must carry: the URL's own, or `1` when it has none. */
+  guests: string;
+  /** The status the server answers. */
+  status: number;
+}
+
+/** The deep links of the raw-criteria test, one test each. */
+const RAW_CRITERIA_CASES: readonly RawCriteriaCase[] = [
+  {
+    title: 'a search URL with only guests',
+    url: '/search?guests=2',
+    endpoint: '/hotels',
+    guests: '2',
+    status: 400,
+  },
+  {
+    title: 'a search URL with guests=2.0',
+    url: '/search?city=Seattle&{stay}&guests=2.0',
+    endpoint: '/hotels',
+    guests: '2.0',
+    status: 400,
+  },
+  {
+    title: 'a search URL with an empty guests',
+    url: '/search?city=Seattle&{stay}&guests=',
+    endpoint: '/hotels',
+    guests: '',
+    status: 400,
+  },
+  {
+    title: 'a detail URL with guests=2e0',
+    url: '/hotels/1?{stay}&guests=2e0',
+    endpoint: '/hotels/1',
+    guests: '2e0',
+    status: 400,
+  },
+  {
+    title: 'a detail URL with an empty guests',
+    url: '/hotels/1?{stay}&guests=',
+    endpoint: '/hotels/1',
+    guests: '',
+    status: 400,
+  },
+];
+
+/**
+ * Hotel ids a deep link can carry that are not integer literals, one test
+ * each. The API's `{id:int}` route matches none of them.
+ */
+const NON_INTEGER_HOTEL_IDS: readonly string[] = ['1.0', 'abc'];
+
+/** The inline title for a request that got no response, its deadline included. */
+const UNREACHABLE_TITLE = 'The service is unreachable.';
+
+/** The inline title for a 2xx response whose body the page cannot use. */
+const UNEXPECTED_RESPONSE_TITLE = 'The service sent an unexpected response.';
+
+/** A form whose POST the API never answers, so only the request deadline ends the wait. */
+interface DeadlineCase {
+  /** The page's route and the prefix of its form's test ids. */
+  form: 'login' | 'register';
+  /** The endpoint the form posts to. */
+  isEndpoint: (url: URL) => boolean;
+  /** Fills every field of the form, waiting for no outcome. */
+  fill: (page: Page) => Promise<void>;
+}
+
+/** The forms of the request-deadline test, one test each. */
+const DEADLINE_CASES: readonly DeadlineCase[] = [
+  {
+    form: 'login',
+    isEndpoint: isLoginApi,
+    fill: async (page) => {
+      await fillBound(page, 'login-email', uniqueEmail());
+      await fillBound(page, 'login-password', uniquePassword());
+    },
+  },
+  {
+    form: 'register',
+    isEndpoint: isRegisterApi,
+    fill: async (page) => {
+      await fillBound(page, 'register-email', uniqueEmail());
+      await fillBound(page, 'register-password', uniquePassword());
+      await fillBound(page, 'register-full-name', 'States Guest');
+    },
+  },
+];
+
+/**
+ * The message of the plain `Error` that {@link throwOnFirstSend} throws in
+ * place of a request. It is no HTTP response, so no inline error may show it.
+ */
+const NON_HTTP_ERROR_MESSAGE = 'non-http-marker: the request was never sent';
+
+/**
+ * The text of each field a stubbed 5xx problem body carries: its `title`,
+ * `detail`, `traceId`, and the one field name and message of its `errors`.
+ * A server fault shows only the generic text, so none may appear on screen.
+ */
+const SERVER_ERROR_MARKERS = {
+  title: 'server-title-marker',
+  detail: 'server-detail-marker',
+  traceId: 'server-trace-marker',
+  field: 'serverFieldMarker',
+  message: 'server-message-marker',
+} as const;
+
+/** The 5xx statuses of the server-error test, one test each. */
+const SERVER_ERROR_STATUSES: readonly number[] = [500, 503];
+
+/** A 200 body the page cannot use, stubbed in place of the API's answer. */
+interface UnusableBodyCase {
+  /** What the body holds, for the test title. */
+  title: string;
+  /** The JSON text of the 200 body. */
+  body: string;
+}
+
+/** Login 200 bodies that carry no usable session, one test each. */
+const UNUSABLE_LOGIN_BODIES: readonly UnusableBodyCase[] = [
+  { title: 'a null body', body: 'null' },
+  { title: 'a blank token and an unparseable expiry', body: '{"token":"","expiresAt":"x"}' },
+  {
+    title: 'a token that is not a JWT',
+    body: '{"token":"not-a-jwt","expiresAt":"2099-01-01T00:00:00Z"}',
+  },
+  {
+    title: 'a JWT-shaped token and an expiry on 30 February',
+    body: '{"token":"header.payload.signature","expiresAt":"2099-02-30T00:00:00Z"}',
+  },
+];
+
+/**
+ * A deep link whose page receives a 200 body it cannot render. In `url` and
+ * `body`, `{checkIn}` and `{checkOut}` stand for the dates of a valid two-night
+ * stay, and `{laterDate}` for the date 1,095 days (three 365-day years) after
+ * `{checkOut}`, all from one clock read and as exact `yyyy-MM-dd` text, so
+ * `{laterDate}` never equals either stay date.
+ */
+interface UnusableReadCase extends UnusableBodyCase {
+  /** The page URL; `{stay}` stands for `checkIn={checkIn}&checkOut={checkOut}`. */
+  url: string;
+  /**
+   * The target API endpoint of the page's `GET`, below the API base and with
+   * the hotel id included, as {@link isApiEndpoint} takes it.
+   */
+  endpoint: string;
+}
+
+/**
+ * The fields of a complete hotel detail that answers `GET /api/hotels/1` for
+ * the two-night stay `{checkIn}` to `{checkOut}` and 3 guests, with one
+ * bookable room type, for the stubbed answers to start from.
+ */
+const ECHOED_DETAIL_FIELDS: Readonly<Record<string, unknown>> = {
+  id: 1,
+  name: 'Stub Hotel',
+  city: 'Seattle',
+  address: 'Stub Street 1',
+  description: 'Stub description',
+  checkIn: '{checkIn}',
+  checkOut: '{checkOut}',
+  nights: 2,
+  guests: 3,
+  roomTypes: [{ id: 1, name: 'Standard', maxGuests: 4, nightlyPrice: 100, availableRooms: 5, stayTotal: 200 }],
+};
+
+/** Returns {@link ECHOED_DETAIL_FIELDS} as JSON text with `changes` applied. */
+function echoedDetailJson(changes: Readonly<Record<string, unknown>>): string {
+  return JSON.stringify({ ...ECHOED_DETAIL_FIELDS, ...changes });
+}
+
+/** The deep links of the unusable-read test, one test each. */
+const UNUSABLE_READ_CASES: readonly UnusableReadCase[] = [
+  {
+    title: 'a search answered with {}',
+    url: '/search?city=Seattle&{stay}',
+    endpoint: '/hotels',
+    body: '{}',
+  },
+  {
+    title: 'a hotel detail answered with {"id":1}',
+    url: '/hotels/1?{stay}',
+    endpoint: '/hotels/1',
+    body: '{"id":1}',
+  },
+  {
+    title: 'a search answered with a result id beyond the 32-bit range',
+    url: '/search?city=Seattle&{stay}',
+    endpoint: '/hotels',
+    body: '[{"id":2147483648,"name":"X","city":"Seattle","address":"Y","lowestNightlyPrice":100}]',
+  },
+  {
+    title: 'a hotel detail answered with checkIn 2099-02-30',
+    url: '/hotels/1?{stay}',
+    endpoint: '/hotels/1',
+    body:
+      '{"id":1,"name":"X","city":"Seattle","address":"Y","description":"Z",' +
+      '"checkIn":"2099-02-30","checkOut":"2099-03-02","nights":2,"guests":1,"roomTypes":[]}',
+  },
+  // Complete details whose echo contradicts the request they answer.
+  {
+    title: 'a hotel detail echoing a check-in years after the requested check-out',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ checkIn: '{laterDate}' }),
+  },
+  {
+    title: 'a hotel detail echoing 1 guest for a 3-guest request',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ guests: 1 }),
+  },
+  {
+    title: 'a hotel detail echoing another hotel id',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ id: 2 }),
+  },
+  {
+    title: 'a hotel detail echoing 3 nights for a two-night stay',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ nights: 3 }),
+  },
+  {
+    // The request itself is reversed, and the echo repeats it with its own
+    // day count, so only the order of the dates contradicts a 200.
+    title: 'a hotel detail echoing a reversed range',
+    url: '/hotels/1?checkIn={checkOut}&checkOut={checkIn}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ checkIn: '{checkOut}', checkOut: '{checkIn}', nights: -2 }),
+  },
+];
+
+/**
+ * `guests` texts a detail deep link can carry that the API binds as 3, though
+ * none is the canonical `3`, one test each: leading zeros and a plus sign, and
+ * surrounding white space that .NET's `string.Trim()` removes: U+0085, which
+ * JavaScript's `trim()` keeps, a space and U+3000.
+ */
+const LENIENT_GUESTS_TEXTS: readonly { title: string; text: string }[] = [
+  { title: '"+003"', text: '+003' },
+  { title: 'U+0085, a space, "3" and U+3000', text: '\u0085 3\u3000' },
+];
+
+/**
+ * Every field of a booking as the API writes it, each with its wire type, for
+ * the stubbed bookings answers to start from. The `createdAt` carries the
+ * microseconds the API stamps.
+ */
+const UNUSABLE_BOOKING_FIELDS: Readonly<Record<string, unknown>> = {
+  id: 7,
+  hotelId: 1,
+  hotelName: 'Stub Hotel',
+  roomTypeId: 1,
+  roomTypeName: 'Standard',
+  roomNumber: '101',
+  checkIn: '2099-01-10',
+  checkOut: '2099-01-12',
+  nights: 2,
+  guests: 1,
+  totalPrice: 200,
+  status: 'Confirmed',
+  createdAt: '2026-11-27T21:27:07.714883Z',
+};
+
+/**
+ * Returns {@link UNUSABLE_BOOKING_FIELDS} as JSON text with `changes` applied
+ * and the `omitted` fields left out.
+ */
+function unusableBookingJson(changes: Readonly<Record<string, unknown>>, omitted: readonly string[] = []): string {
+  const fields = Object.entries({ ...UNUSABLE_BOOKING_FIELDS, ...changes }).filter(([name]) => !omitted.includes(name));
+  return JSON.stringify(Object.fromEntries(fields));
+}
+
+/**
+ * A 2xx answer stubbed in place of a bookings endpoint's own: a success
+ * status the endpoint never gives, or a body the page cannot use.
+ */
+interface WrongStatusAnswer {
+  /** What the answer is, for the test title. */
+  title: string;
+  /** Its status, a 2xx. */
+  status: number;
+  /** The JSON text of its body; empty for none. */
+  body: string;
+}
+
+/** Answers to `GET /api/bookings` that My bookings cannot show, one test each. */
+const UNUSABLE_BOOKING_LISTS: readonly WrongStatusAnswer[] = [
+  { title: 'a 200 with {}', status: 200, body: '{}' },
+  { title: 'a 200 with null', status: 200, body: 'null' },
+  {
+    title: 'a 200 listing a booking whose id is the string "7"',
+    status: 200,
+    body: `[${unusableBookingJson({ id: '7' })}]`,
+  },
+  { title: 'a 200 listing a booking whose id is 0', status: 200, body: `[${unusableBookingJson({ id: 0 })}]` },
+  {
+    title: 'a 200 listing a booking without createdAt',
+    status: 200,
+    body: `[${unusableBookingJson({}, ['createdAt'])}]`,
+  },
+  {
+    title: 'a 200 listing two otherwise valid bookings that share an id',
+    status: 200,
+    body: `[${unusableBookingJson({})},${unusableBookingJson({ roomNumber: '102' })}]`,
+  },
+  {
+    title: 'a 200 listing a booking whose checkIn is in year 0000',
+    status: 200,
+    body: `[${unusableBookingJson({ checkIn: '0000-01-10' })}]`,
+  },
+  {
+    title: 'a 200 listing a booking whose createdAt is in year 0000',
+    status: 200,
+    body: `[${unusableBookingJson({ createdAt: '0000-11-27T21:27:07.714883Z' })}]`,
+  },
+  {
+    title: 'a 200 listing a booking whose totalPrice has three decimals',
+    status: 200,
+    body: `[${unusableBookingJson({ totalPrice: 200.001 })}]`,
+  },
+  { title: 'a 204 with no body', status: 204, body: '' },
+];
+
+/** Answers to "Book"'s `POST /api/bookings` that confirm no booking, one test each. */
+const WRONG_STATUS_BOOK_ANSWERS: readonly WrongStatusAnswer[] = [
+  { title: 'a 200 with an otherwise valid booking', status: 200, body: unusableBookingJson({}) },
+  { title: 'a 201 with {"id":1}', status: 201, body: '{"id":1}' },
+  { title: 'a 201 with a Cancelled booking', status: 201, body: unusableBookingJson({ status: 'Cancelled' }) },
+  {
+    title: 'a 201 with a booking whose totalPrice has three decimals',
+    status: 201,
+    body: unusableBookingJson({ totalPrice: 258.005 }),
+  },
+];
+
+/**
+ * Guest counts typed into the search form that only the server can judge, one
+ * test each: a decimal and an exponent spelling of a whole number, an
+ * incomplete exponent, and white space, which is not the empty field. A number
+ * input would read the first two as 2 and the last two as an empty field.
+ */
+const TYPED_GUESTS: readonly string[] = ['2.0', '2e0', '1e', ' '];
+
+/**
+ * Guest counts a search deep link can carry that only the server can judge,
+ * one test each: a decimal spelling of a whole number, and an explicit empty
+ * `guests=`, which the API rejects while it gives an absent count 1. The form
+ * must hold each unedited and send it again on an unchanged re-submit.
+ */
+const DEEP_LINK_GUESTS: readonly string[] = ['2.0', ''];
+
+/** The API's message for a supplied `guests` it cannot bind as an integer, an empty one included. */
+const GUESTS_INTEGER_MESSAGE = 'The value must be a whole number of at least 1.';
+
+/** The nav bar links to bare `/search`, one test each. */
+const BARE_SEARCH_LINKS: readonly string[] = ['nav-brand', 'nav-search'];
+
+/**
+ * Return URLs the login page refuses, one test each: a login must land on
+ * `/search` for every one. The first four lead to the login page itself, each
+ * written a different way, which a guest now signed in must never see again.
+ * The rest are unsafe, or read differently by the router and a browser: an
+ * encoded leading `//`, `/` or `\`, which a decoding reader would take for a
+ * URL to another host; an encoded `//` and a raw `\` inside a hotel id; a raw
+ * tab, which a browser strips; an empty segment, where the router stops
+ * reading and drops the rest; a malformed percent escape, which the router
+ * cannot parse; a matrix parameter and a query parameter with an empty name,
+ * where the router also stops reading and drops the rest, so each would
+ * otherwise open My bookings; and an encoded and a raw dot segment as a hotel
+ * id, `%2e%2e` and `..`, which the router routes as segments but a browser
+ * resolves when the address is written, so the address bar would show another
+ * path than the one routed. Each hotel path would open a hotel page if it were
+ * followed.
+ */
+const REFUSED_RETURN_URLS: readonly string[] = [
+  '/login',
+  '/login?reason=session-expired',
+  '/login;a=1',
+  '/%6Cogin',
+  '/%2F%2Fevil.example',
+  '/%2Fevil.example',
+  '/%5Cevil.example',
+  '/hotels/%2F%2Fevil.example',
+  '/hotels/1\\evil.example',
+  '/hotels/\t1',
+  '/hotels/1//evil.example',
+  '/%E0%A4%A',
+  '/bookings;=%ZZ',
+  '/bookings?=x',
+  '/hotels/%2e%2e',
+  '/hotels/..',
+];
+
+/**
+ * Records, from now on, every request the page sends to a hotel detail path,
+ * `/api/hotels/{id}`, on any origin and whatever its method, and returns the
+ * list it fills. It is for asserting that no such request was sent, so it is
+ * not limited to the target API's origin.
+ */
+function recordDetailRequests(page: Page): URL[] {
+  const requested: URL[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/hotels/')) {
+      requested.push(url);
+    }
+  });
+  return requested;
+}
+
+/**
+ * Asserts the hotel detail page's answer to a non-integer id: the client's
+ * local 404, given without a request and equivalent to the API's answer for an
+ * unknown hotel id, is shown inline in place of the content with that answer's
+ * title and detail, the page does not report the service as unreachable, and
+ * `detailRequests` stayed empty. It checks the client's answer only; the API's
+ * own routing of such an id is never exercised.
+ */
+async function expectLocal404(page: Page, detailRequests: readonly URL[]): Promise<void> {
+  const error = page.getByTestId('inline-error');
+  await expect(error).toBeVisible();
+  await expect(error).toContainText('Hotel not found');
+  await expect(error).toContainText('No hotel matches the requested id.');
+  await expect(error).not.toContainText('The service is unreachable.');
+  await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+  expect(detailRequests.map((u) => u.href)).toEqual([]);
+}
+
+/**
+ * Clicks a "View rooms" link and waits until the hotel detail page shows the
+ * hotel it opens. Returns that hotel's id, read from the link's
+ * `view-rooms-<id>` hook, and the name the page shows.
+ */
+async function openHotel(page: Page, link: Locator): Promise<{ id: string; name: string }> {
+  const testId = (await link.getAttribute('data-testid')) ?? '';
+  expect(testId).toMatch(/^view-rooms-\d+$/);
+  const id = testId.slice('view-rooms-'.length);
+
+  await link.click();
+  await expect(page).toHaveURL(new RegExp(`/hotels/${id}\\?`));
+  const name = page.getByTestId('hotel-name');
+  await expect(name).toHaveText(/\S/);
+  return { id, name: (await name.innerText()).trim() };
+}
+
+/**
+ * A test guest's credentials: a fresh email and the guest's own random
+ * password, which no diagnostic prints.
+ */
+interface GuestCredentials {
+  /** The guest's email, from {@link uniqueEmail}. */
+  email: string;
+  /** The guest's password, from {@link uniquePassword}. */
+  password: string;
+}
+
+/**
+ * Opens the register page, registers a fresh guest with its own generated
+ * password and returns both credentials, which the test never prints.
+ * The browser is left on `/login?registered=1`.
+ */
+async function registerNewGuest(page: Page): Promise<GuestCredentials> {
+  const email = uniqueEmail();
+  const password = uniquePassword();
+  await page.goto('/register');
+  await registerGuest(page, { email, password, fullName: 'States Guest' });
+  return { email, password };
+}
+
+/**
+ * Registers a fresh guest and logs in. With no `returnUrl`, the login page
+ * continues to `/search`, so the browser is left there, signed in. Returns the
+ * guest's credentials, which sign the same guest in through the API with
+ * {@link apiSignIn}.
+ */
+async function registerAndLogIn(page: Page): Promise<GuestCredentials> {
+  const guest = await registerNewGuest(page);
+  await logIn(page, guest.email, guest.password);
+  await expect(page).toHaveURL(/\/search$/);
+  return guest;
+}
+
+/**
+ * Opens the first Seattle hotel from a search while signed out and clicks
+ * "Book" on its first bookable room type, which sends the guest to log in.
+ * Returns the hotel page's path and query, which the login URL must carry,
+ * encoded, as its `returnUrl`.
+ */
+async function bookSignedOut(page: Page): Promise<string> {
+  const [checkIn, checkOut] = utcDates(35, 37);
+  await page.goto('/search');
+  await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+  await openHotel(page, page.locator(VIEW_ROOMS).first());
+
+  const hotel = new URL(page.url());
+  const hotelPath = `${hotel.pathname}${hotel.search}`;
+  const book = page.locator('[data-testid^="book-"]:enabled').first();
+  await expect(book).toBeVisible();
+  await book.click();
+  await expect(page).toHaveURL(`/login?returnUrl=${encodeURIComponent(hotelPath)}`);
+  return hotelPath;
+}
+
+/**
+ * From now on, sends every bookings API request with a token the API cannot
+ * validate, while the app still holds its unexpired session. The guard
+ * therefore admits the page and the app sends the request; only the server
+ * rejects it.
+ */
+async function rejectBookingsToken(page: Page): Promise<void> {
+  await page.route(isBookingsApi, (route) =>
+    route.continue({
+      headers: { ...route.request().headers(), authorization: 'Bearer not-a-valid-token' },
+    }),
+  );
+}
+
+/**
+ * Fills the search form, without submitting it, with Seattle, a valid stay
+ * and `guests` exactly as given. Returns the stay's dates.
+ */
+async function fillSearchForm(page: Page, guests: string): Promise<{ checkIn: string; checkOut: string }> {
+  const [checkIn, checkOut] = utcDates(30, 32);
+  await fillBound(page, 'search-city', 'Seattle');
+  await fillBound(page, 'search-check-in', checkIn);
+  await fillBound(page, 'search-check-out', checkOut);
+  await fillBound(page, 'search-guests', guests);
+  return { checkIn, checkOut };
+}
+
+/**
+ * Clicks Search and returns the response to the hotel search it sends. The
+ * method filter keeps a CORS preflight from matching.
+ */
+async function submitSearch(page: Page): Promise<Response> {
+  const response = page.waitForResponse(
+    (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+  );
+  await page.getByTestId('search-submit').click();
+  return response;
+}
+
+/**
+ * Asserts the idle search page: bare `/search`, the form holding its initial
+ * criteria (no city, no dates, 1 guest), and no result, empty-result message
+ * or inline error.
+ */
+async function expectIdleSearch(page: Page): Promise<void> {
+  await expect(page).toHaveURL(/\/search$/);
+  await expectControlValue(page, 'search-city', '');
+  await expectControlValue(page, 'search-check-in', '');
+  await expectControlValue(page, 'search-check-out', '');
+  await expectControlValue(page, 'search-guests', '1');
+  await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="search-empty"]`)).toHaveCount(0);
+  await expectNoInlineError(page);
+}
+
+/**
+ * A guest's API session, for the fixture requests a test sends to the API
+ * directly rather than through the web app: arranging bookings, reading their
+ * server state and cancelling them afterwards. The token is held only in
+ * `headers` and never appears in a diagnostic.
+ */
+interface ApiSession {
+  /** The `Authorization` header carrying the guest's bearer token. */
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+/**
+ * A stay: its dates as exact `yyyy-MM-dd` text and its party size, as the
+ * hotel detail page shows it and both hotel endpoints and
+ * `POST /api/bookings` take it.
+ */
+interface Stay {
+  checkIn: string;
+  checkOut: string;
+  guests: number;
+}
+
+/** A booking to create through the API, as `POST /api/bookings` takes it. */
+interface FixtureBookingRequest extends Stay {
+  hotelId: number;
+  roomTypeId: number;
+}
+
+/** One room type of a hotel for one stay, as `GET /api/hotels/{id}` reports it. */
+interface FixtureRoomType {
+  /** The id its `book-<id>` and `available-count-<id>` hooks carry. */
+  id: number;
+  /** Its name, such as `Standard`, as the 409's detail names it. */
+  name: string;
+  /** How many guests one of its rooms takes. */
+  maxGuests: number;
+  /** How many of its rooms are free for the stay, whatever the party size. */
+  availableRooms: number;
+}
+
+/**
+ * The bookings the fixtures created through the API, each with the session
+ * that may cancel it. The `afterEach` hook attempts to cancel each one, also
+ * after a failed or timed-out test; its failures warn and may leave bookings
+ * behind on a reused stack. A module variable, because the hook must reach it
+ * when a test body never returns; the suite runs one test at a time
+ * (`workers: 1`). Bookings the web app makes are found by
+ * {@link cancelGuestBookingsAfterTest} instead.
+ */
+const bookingsToCancel: { session: ApiSession; id: number }[] = [];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Sends one fixture request and returns its response. A request that fails
+ * without a response is rethrown as an error naming only `step` and the error
+ * type: the original message carries Playwright's call log, which can include
+ * the `Authorization` header.
+ */
+async function fixtureRequest(step: string, send: () => Promise<APIResponse>): Promise<APIResponse> {
+  try {
+    return await send();
+  } catch (err) {
+    const kind = err instanceof Error ? err.name : typeof err;
+    throw new Error(`API fixture: ${step} sent no response (${kind}).`);
+  }
+}
+
+/**
+ * Registers a fresh guest, with its own random password, through the API,
+ * without the web app, for a fixture that must hold bookings under an
+ * account of its own.
+ *
+ * @returns The new guest's credentials.
+ */
+async function apiRegisterGuest(request: APIRequestContext): Promise<GuestCredentials> {
+  const guest: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
+  const response = await fixtureRequest('registering a fixture guest', () =>
+    apiRequest(request, 'POST', '/auth/register', {
+      data: { email: guest.email, password: guest.password, fullName: 'Fixture Guest' },
+    }),
+  );
+  expect(response.status(), 'the fixture registration returns 201').toBe(201);
+  return guest;
+}
+
+/**
+ * Logs a guest in through the API and returns the session that authorizes the
+ * fixture requests. The web app's own session is not affected.
+ */
+async function apiSignIn(request: APIRequestContext, guest: GuestCredentials): Promise<ApiSession> {
+  const response = await fixtureRequest('logging in', () =>
+    apiRequest(request, 'POST', '/auth/login', { data: { email: guest.email, password: guest.password } }),
+  );
+  expect(response.status(), 'the fixture login returns 200').toBe(200);
+  const body: unknown = await response.json();
+  const token = isRecord(body) ? body['token'] : undefined;
+  expect(typeof token === 'string' && token !== '', 'the fixture login returns a token').toBe(true);
+  return { headers: { authorization: `Bearer ${String(token)}` } };
+}
+
+/**
+ * Records a booking for the `afterEach` cancellation, as soon as its id is
+ * known and before anything else is asserted about it.
+ */
+function cancelAfterTest(session: ApiSession, id: number): void {
+  bookingsToCancel.push({ session, id });
+}
+
+/** A guest {@link cancelGuestBookingsAfterTest} recorded. */
+interface GuestToReconcile {
+  /** The guest's API session, which lists and cancels its bookings. */
+  readonly session: ApiSession;
+  /**
+   * One promise per `POST /api/bookings` the guest's page sent after the
+   * guest was recorded. Each settles once its request has a response or has
+   * failed, and none rejects.
+   */
+  readonly creates: Promise<unknown>[];
+}
+
+/**
+ * The guests the web app books for, each unique to its test, so every booking
+ * one holds is that test's own. A hook lists each guest's bookings through the
+ * API after the test and attempts to cancel every one still `Confirmed`, also
+ * after a failed or timed-out test; its failures warn and may leave bookings
+ * behind. The API commits a booking before it answers, so a list taken once
+ * the booking request has settled shows it even when the test never decoded
+ * its 201. A module variable for the same reason as {@link bookingsToCancel}.
+ */
+const guestsToReconcile: GuestToReconcile[] = [];
+
+/**
+ * Records the guest signed in on `page` for the reconciliation after the test.
+ * From now on it follows every `POST /api/bookings` the page sends, so that the
+ * reconciliation lists the guest's bookings only once each POST has settled.
+ * Call it before the page can send one, that is before "Book" is clicked.
+ */
+function cancelGuestBookingsAfterTest(page: Page, session: ApiSession): void {
+  const guest: GuestToReconcile = { session, creates: [] };
+  page.on('request', (sent) => {
+    if (sent.method() === 'POST' && isBookingsApi(new URL(sent.url()))) {
+      // `response()` resolves with null once the request fails, and rejects
+      // when the page closes first; either way the request has settled.
+      guest.creates.push(sent.response().catch(() => null));
+    }
+  });
+  guestsToReconcile.push(guest);
+}
+
+/**
+ * Creates a booking through the API, requires the 201, and records it for the
+ * `afterEach` cancellation.
+ *
+ * @returns The new booking's id.
+ */
+async function apiBook(request: APIRequestContext, session: ApiSession, booking: FixtureBookingRequest): Promise<number> {
+  const response = await fixtureRequest('creating a booking', () =>
+    apiRequest(request, 'POST', '/bookings', { headers: session.headers, data: booking }),
+  );
+  expect(response.status(), 'the fixture booking returns 201').toBe(201);
+  const body: unknown = await response.json();
+  const id = isRecord(body) ? body['id'] : undefined;
+  expect(typeof id === 'number' && Number.isInteger(id), 'the fixture booking returns an id').toBe(true);
+  cancelAfterTest(session, Number(id));
+  return Number(id);
+}
+
+/**
+ * Reads, through the API, the server's status of one of the session's
+ * bookings.
+ *
+ * @returns The booking's `status`, such as `Confirmed`, or `null` when the
+ *   session's list does not hold it.
+ */
+async function apiBookingStatus(request: APIRequestContext, session: ApiSession, id: number): Promise<string | null> {
+  const response = await fixtureRequest('listing bookings', () =>
+    apiRequest(request, 'GET', '/bookings', { headers: session.headers }),
+  );
+  expect(response.status(), 'the fixture booking list returns 200').toBe(200);
+  const list: unknown = await response.json();
+  expect(Array.isArray(list), 'the fixture booking list is an array').toBe(true);
+  const found = (list as unknown[]).find((b) => isRecord(b) && b['id'] === id);
+  return isRecord(found) && typeof found['status'] === 'string' ? found['status'] : null;
+}
+
+/**
+ * Reads one hotel's room types for a stay through the API, in the server's
+ * order.
+ */
+async function apiRoomTypes(request: APIRequestContext, hotelId: number, stay: Stay): Promise<FixtureRoomType[]> {
+  const params = { checkIn: stay.checkIn, checkOut: stay.checkOut, guests: stay.guests };
+  const response = await fixtureRequest('reading a hotel', () =>
+    apiRequest(request, 'GET', `/hotels/${hotelId}`, { params }),
+  );
+  expect(response.status(), 'the fixture hotel read returns 200').toBe(200);
+  const body: unknown = await response.json();
+  const roomTypes = isRecord(body) ? body['roomTypes'] : undefined;
+  expect(Array.isArray(roomTypes), 'the fixture hotel read lists room types').toBe(true);
+  return (roomTypes as unknown[]).map((rt) => {
+    const valid =
+      isRecord(rt) &&
+      Number.isInteger(rt['id']) &&
+      typeof rt['name'] === 'string' &&
+      Number.isInteger(rt['maxGuests']) &&
+      Number.isInteger(rt['availableRooms']);
+    expect(valid, 'each fixture room type has an id, a name, maxGuests and availableRooms').toBe(true);
+    const r = rt as Record<string, unknown>;
+    return {
+      id: Number(r['id']),
+      name: String(r['name']),
+      maxGuests: Number(r['maxGuests']),
+      availableRooms: Number(r['availableRooms']),
+    };
+  });
+}
+
+/**
+ * Attempts to cancel one booking after a test, under the session that may
+ * cancel it. It never throws. Cleanup accepts 204 and 409 as terminal; 409
+ * does not distinguish already cancelled from check-in passed. Any other
+ * status, or a request that fails, is printed as a warning naming only the
+ * booking and the HTTP status or the error type.
+ */
+async function cancelInCleanup(request: APIRequestContext, session: ApiSession, id: number): Promise<void> {
+  try {
+    const response = await apiRequest(request, 'DELETE', `/bookings/${id}`, { headers: session.headers });
+    if (response.status() !== 204 && response.status() !== 409) {
+      console.warn(`ui-states cleanup: cancelling booking ${id} returned HTTP ${response.status()}.`);
+    }
+  } catch (err) {
+    // Only the error type is printed: a request error's message carries
+    // Playwright's call log, which can include the Authorization header.
+    const kind = err instanceof Error ? err.name : typeof err;
+    console.warn(`ui-states cleanup: cancelling booking ${id} failed (${kind}); it may remain Confirmed.`);
+  }
+}
+
+test.afterEach(async ({ request }) => {
+  for (const { session, id } of bookingsToCancel.splice(0)) {
+    await cancelInCleanup(request, session, id);
+  }
+});
+
+/**
+ * One request the app sends, held in the browser until the test lets it go,
+ * so a pending state lasts exactly as long as the test needs to observe it,
+ * with no timer.
+ */
+interface RequestGate {
+  /**
+   * Waits until the app has sent the request and the gate holds it. When the
+   * request never comes, it fails within the expect timeout under `message`,
+   * so a missing request is reported as such rather than as a test timeout.
+   */
+  expectArrival(message: string): Promise<void>;
+  /**
+   * Sends the held request on to the real API; call it once
+   * {@link RequestGate.expectArrival} has passed. Each of `headers` replaces
+   * the request header of the same lower-case name.
+   */
+  release(headers?: Readonly<Record<string, string>>): Promise<void>;
+  /**
+   * Fails the held request as a network error, so it never reaches the API.
+   * Before the request arrives it disarms the gate instead; once the request
+   * has been released or aborted it does nothing.
+   */
+  abort(): Promise<void>;
+}
+
+/**
+ * The gates of the running test. The `afterEach` hook below aborts any
+ * request one still holds, also after a failed or timed-out test, so a held
+ * `POST /api/bookings` can never commit a booking once its test has ended. A
+ * module variable for the same reason as {@link bookingsToCancel}.
+ */
+const heldGates: RequestGate[] = [];
+
+/**
+ * Holds the first request of `method` whose URL `matches`, from now on. Every
+ * other request, a CORS preflight `OPTIONS` to the same URL included, and
+ * every later match go on as if the gate were not installed.
+ */
+async function holdRequest(page: Page, matches: (url: URL) => boolean, method: string): Promise<RequestGate> {
+  let held: Route | null = null;
+  let arrived = false;
+  let done = false;
+
+  await page.route(matches, async (route) => {
+    if (done || held !== null || route.request().method() !== method) {
+      await route.fallback();
+      return;
+    }
+    held = route;
+    arrived = true;
+  });
+
+  const take = (): Route | null => {
+    const route = held;
+    held = null;
+    done = true;
+    return route;
+  };
+
+  const gate: RequestGate = {
+    async expectArrival(message) {
+      await expect.poll(() => arrived, { message }).toBe(true);
+    },
+    async release(headers) {
+      if (done) {
+        throw new Error('This gate has already released or aborted its request.');
+      }
+      const route = take();
+      if (route === null) {
+        throw new Error('This gate holds no request yet; release it only once expectArrival has passed.');
+      }
+      await route.continue(headers === undefined ? undefined : { headers: { ...route.request().headers(), ...headers } });
+    },
+    async abort() {
+      const route = take();
+      if (route !== null) {
+        await route.abort();
+      }
+    },
+  };
+  heldGates.push(gate);
+  return gate;
+}
+
+test.afterEach(async () => {
+  for (const gate of heldGates.splice(0)) {
+    try {
+      await gate.abort();
+    } catch (err) {
+      // A route that cannot be aborted belongs to a closed page, whose held
+      // request was dropped unsent. Only the error type is printed, because
+      // the message's call log can carry the request's headers.
+      const kind = err instanceof Error ? err.name : typeof err;
+      console.warn(`ui-states cleanup: aborting a held request failed (${kind}).`);
+    }
+  }
+});
+
+/**
+ * How long the reconciliation after a test waits for the booking requests a
+ * guest's page sent to settle. The API answers one well within it; the bound
+ * only keeps a request that never settles from holding the hook.
+ */
+const CREATES_SETTLE_MS = 10_000;
+
+/**
+ * Waits until every one of `settlements` has settled, or `ms` have passed.
+ *
+ * @returns Whether all of them settled in time.
+ */
+async function settleWithin(settlements: readonly Promise<unknown>[], ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([Promise.all(settlements).then(() => true), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Lists a reconciled guest's bookings through the API after a test and
+ * returns the ids of those still `Confirmed`. It never throws: a request that
+ * fails, a status other than 200, a body that is not a JSON array, or a
+ * `Confirmed` entry without an integer id is printed as a warning naming only
+ * that step and the HTTP status or the error type, never the token, the email
+ * or the body, and leaves out what it could not read.
+ */
+async function confirmedBookingIds(request: APIRequestContext, session: ApiSession): Promise<number[]> {
+  const remain = 'its Confirmed bookings may remain.';
+  let list: unknown;
+  try {
+    const response = await apiRequest(request, 'GET', '/bookings', { headers: session.headers });
+    if (response.status() !== 200) {
+      console.warn(`ui-states cleanup: listing a guest's bookings returned HTTP ${response.status()}; ${remain}`);
+      return [];
+    }
+    list = await response.json();
+  } catch (err) {
+    // Only the error type is printed, for the same reason as in cancelInCleanup.
+    const kind = err instanceof Error ? err.name : typeof err;
+    console.warn(`ui-states cleanup: listing a guest's bookings failed (${kind}); ${remain}`);
+    return [];
+  }
+  if (!Array.isArray(list)) {
+    console.warn(`ui-states cleanup: a guest's booking list is not an array; ${remain}`);
+    return [];
+  }
+  const confirmed = (list as unknown[]).filter((b) => isRecord(b) && b['status'] === 'Confirmed');
+  const ids = confirmed
+    .map((b) => (b as Record<string, unknown>)['id'])
+    .filter((id): id is number => typeof id === 'number' && Number.isInteger(id));
+  if (ids.length !== confirmed.length) {
+    console.warn(
+      `ui-states cleanup: ${confirmed.length - ids.length} Confirmed booking(s) in a guest's list carry no ` +
+        'integer id and may remain Confirmed.',
+    );
+  }
+  return ids;
+}
+
+// Declared after the hook that aborts held requests, so it runs after that
+// one: a booking request still held by then never reaches the API, and every
+// other is awaited for at most CREATES_SETTLE_MS, so the list shows any
+// booking it committed by then.
+test.afterEach(async ({ request }) => {
+  for (const guest of guestsToReconcile.splice(0)) {
+    if (!(await settleWithin(guest.creates, CREATES_SETTLE_MS))) {
+      console.warn(
+        "ui-states cleanup: a guest's booking request had not settled in time; a booking it commits later may remain Confirmed.",
+      );
+    }
+    for (const id of await confirmedBookingIds(request, guest.session)) {
+      await cancelInCleanup(request, guest.session, id);
+    }
+  }
+});
+
+/**
+ * A search held by a {@link RequestGate}: a valid stay answered with hotels,
+ * or a check-out on the check-in day answered with a 400. Either way the
+ * indicator and the disabled Search must last until the answer, and neither
+ * may stay behind once it is shown.
+ */
+interface HeldSearchCase {
+  /** The answer, for the test title. */
+  title: string;
+  /** Days from today of check-in and check-out, for one {@link utcDates} call. */
+  offsets: readonly [number, number];
+  /** The status the API answers. */
+  status: number;
+  /** The outcome the page shows once the answer arrives. */
+  outcome: string;
+}
+
+/** The held searches, one test each. */
+const HELD_SEARCH_CASES: readonly HeldSearchCase[] = [
+  { title: 'results', offsets: [100, 102], status: 200, outcome: HOTEL_RESULTS },
+  { title: 'inline 400', offsets: [100, 100], status: 400, outcome: '[data-testid="inline-error"]' },
+];
+
+for (const c of HELD_SEARCH_CASES) {
+  test(`loading indicator shows and Search is disabled while a held search is pending, until its ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(...c.offsets);
+    const indicator = page.getByTestId('loading-indicator');
+    const submit = page.getByTestId('search-submit');
+
+    const search = await test.step('submit a Seattle search and hold its GET', async () => {
+      await page.goto('/search');
+      await fillBound(page, 'search-city', 'Seattle');
+      await fillBound(page, 'search-check-in', checkIn);
+      await fillBound(page, 'search-check-out', checkOut);
+      await fillBound(page, 'search-guests', '2');
+      await expect(indicator).toHaveCount(0);
+      // While idle, the slot reserves the banner's height.
+      const slotHeight = await page
+        .locator('app-loading-indicator')
+        .evaluate((slot) => slot.getBoundingClientRect().height);
+
+      const gate = await holdRequest(page, isHotelSearch, 'GET');
+      // From the keyboard: the focused Search button activated with Enter.
+      await submit.focus();
+      await page.keyboard.press('Enter');
+      await gate.expectArrival('Search sends the GET');
+      return { gate, slotHeight };
+    });
+
+    await test.step('while the GET is held the indicator shows, Search is disabled and the heading holds focus', async () => {
+      await expect(indicator).toBeVisible();
+      await expect(indicator).toHaveAttribute('role', 'progressbar');
+      await expect(submit).toBeDisabled();
+      // The disabled button lost focus to the page heading, not to the body.
+      await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeFocused();
+
+      // Forced colours drop fills and gradients. The banner keeps a solid edge
+      // that takes no space, so it still fills exactly the idle slot, and the
+      // sweep keeps its gradient.
+      await page.emulateMedia({ forcedColors: 'active' });
+      await expect(indicator).toHaveCSS('outline-style', 'solid');
+      await expect(indicator.locator('.loading-indicator__bar')).toHaveCSS('background-image', /gradient/);
+      expect(await indicator.evaluate((banner) => banner.getBoundingClientRect().height)).toBe(search.slotHeight);
+    });
+
+    await test.step(`once released the GET answers ${c.status} and the pending state ends`, async () => {
+      const answered = page.waitForResponse(
+        (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await search.gate.release();
+      expect((await answered).status()).toBe(c.status);
+
+      await expect(page.locator(c.outcome).first()).toBeVisible();
+      await expect(indicator).toHaveCount(0);
+      await expect(submit).toBeEnabled();
+      // Focus that the heading held while the button was disabled returns to it.
+      await expect(submit).toBeFocused();
+    });
+  });
+}
+
+/**
+ * A form submitted from the keyboard on a small screen scrolled down to its
+ * submit button, so that its heading is above the screen, with entries the
+ * API rejects and the request held by a {@link RequestGate}.
+ */
+interface ScrolledSubmitCase {
+  /** The submit button's label, for the test title. */
+  title: string;
+  /** The page holding the form. */
+  path: string;
+  /** The name of the page heading, which holds focus while the request is held. */
+  heading: string;
+  /** The submit button's test hook. */
+  submit: string;
+  /** The target API endpoint the submit sends its request to. */
+  endpoint: (url: URL) => boolean;
+  /** The request's method. */
+  method: string;
+  /**
+   * Fills the form with entries the API rejects, the last into the field
+   * just before the submit button, which a Tab from it reaches; `request`
+   * arranges any fixture data they need.
+   */
+  fill(page: Page, request: APIRequestContext): Promise<void>;
+  /** The status the API answers. */
+  status: number;
+  /** The test hook of the element that takes focus once the answer shows. */
+  focusedAfter: string;
+}
+
+/** The scrolled submits, one test each. */
+const SCROLLED_SUBMIT_CASES: readonly ScrolledSubmitCase[] = [
+  {
+    title: 'Search',
+    path: '/search',
+    heading: 'Find a hotel',
+    submit: 'search-submit',
+    endpoint: isHotelSearch,
+    method: 'GET',
+    fill: async (page) => {
+      // A check-out on the check-in day, which the API answers with a 400.
+      const [day] = utcDates(100);
+      await fillBound(page, 'search-city', 'Seattle');
+      await fillBound(page, 'search-check-in', day);
+      await fillBound(page, 'search-check-out', day);
+      await fillBound(page, 'search-guests', '2');
+    },
+    status: 400,
+    focusedAfter: 'search-submit',
+  },
+  {
+    title: 'Log in',
+    path: '/login',
+    heading: 'Log in',
+    submit: 'login-submit',
+    endpoint: isLoginApi,
+    method: 'POST',
+    fill: async (page, request) => {
+      // A registered guest with a wrong password, which the API answers with
+      // a 401: one character longer than the guest's own, so never equal to it.
+      const guest = await apiRegisterGuest(request);
+      await fillBound(page, 'login-email', guest.email);
+      await fillBound(page, 'login-password', `${guest.password}x`);
+    },
+    status: 401,
+    focusedAfter: 'login-submit',
+  },
+  {
+    title: 'Create account',
+    path: '/register',
+    heading: 'Register',
+    submit: 'register-submit',
+    endpoint: isRegisterApi,
+    method: 'POST',
+    fill: async (page) => {
+      await fillBound(page, 'register-email', uniqueEmail());
+      // Seven characters: the server's rule is 8 to 128, so it answers 400
+      // and creates no account.
+      await fillBound(page, 'register-password', 'x'.repeat(7));
+      await fillBound(page, 'register-full-name', 'States Guest');
+    },
+    status: 400,
+    // The first, and only, field the 400 marks invalid.
+    focusedAfter: 'register-password',
+  },
+];
+
+for (const c of SCROLLED_SUBMIT_CASES) {
+  test(`${c.title} pressed on a small screen scrolled past the heading shows the heading that holds focus while pending`, async ({
+    page,
+    request,
+  }) => {
+    await page.setViewportSize({ width: 320, height: 256 });
+    const heading = page.getByRole('heading', { level: 1, name: c.heading });
+    const submit = page.getByTestId(c.submit);
+
+    const gate = await test.step(`fill the form, Tab to ${c.title} at the end of the page and press Enter, holding the request`, async () => {
+      await page.goto(c.path);
+      await c.fill(page, request);
+      await page.keyboard.press('Tab');
+      await expect(submit).toBeFocused();
+      // At the end of the page the button shows and the heading is wholly
+      // above the screen.
+      await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      await expect(submit).toBeInViewport({ ratio: 1 });
+      await expect(heading).not.toBeInViewport();
+
+      const held = await holdRequest(page, c.endpoint, c.method);
+      await page.keyboard.press('Enter');
+      await held.expectArrival(`${c.title} sends its request`);
+      return held;
+    });
+
+    await test.step('while the request is held the heading holds focus, scrolled into view with its focus ring', async () => {
+      await expect(submit).toBeDisabled();
+      await expect(heading).toBeFocused();
+      await expect(heading).toBeInViewport({ ratio: 1 });
+      // The ring, drawn outside the border box, shows whole as well.
+      const ringShows = await heading.evaluate((element) => {
+        const style = getComputedStyle(element);
+        const ring = parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset);
+        const box = element.getBoundingClientRect();
+        const { clientWidth, clientHeight } = document.documentElement;
+        return (
+          style.outlineStyle !== 'none' &&
+          ring > 0 &&
+          box.top - ring >= 0 &&
+          box.left - ring >= 0 &&
+          box.bottom + ring <= clientHeight &&
+          box.right + ring <= clientWidth
+        );
+      });
+      expect(ringShows, "the heading's focus ring is drawn and shows whole").toBe(true);
+    });
+
+    await test.step(`once released the API answers ${c.status} and focus moves on from the heading`, async () => {
+      const answered = page.waitForResponse(
+        (r) => c.endpoint(new URL(r.url())) && r.request().method() === c.method,
+      );
+      await gate.release();
+      expect((await answered).status()).toBe(c.status);
+
+      await expect(page.getByTestId('inline-error')).toBeVisible();
+      await expect(submit).toBeEnabled();
+      const focused = page.getByTestId(c.focusedAfter);
+      await expect(focused).toBeFocused();
+      await expect(focused).toBeInViewport();
+    });
+  });
+}
+
+test('search with check-out equal to check-in shows an inline 400', async ({ page }) => {
+  await page.goto('/search');
+  const response = page.waitForResponse(
+    (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+  );
+  const [day] = utcDates(30);
+  await searchHotels(page, { city: 'Seattle', checkIn: day, checkOut: day, guests: 1 });
+  expect((await response).status()).toBe(400);
+
+  const error = page.getByTestId('inline-error');
+  await expect(error).toBeVisible();
+  await expect(error.getByRole('alert').locator('strong')).toHaveText(/\S/);
+  // The field error names its field by the visible label, never by the API's key.
+  await expect(error).toContainText('Check-out: The date must be after the check-in date.');
+  await expect(error).not.toContainText('checkOut');
+  await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+
+  // Only the rejected input is marked invalid, described by its own message.
+  const checkOut = page.getByTestId('search-check-out');
+  await expect(checkOut).toHaveAttribute('aria-invalid', 'true');
+  await expect(checkOut).toHaveAccessibleDescription('The date must be after the check-in date.');
+  await expect(page.getByTestId('search-check-in')).not.toHaveAttribute('aria-invalid');
+});
+
+/**
+ * A Seattle search the server rejects with check-out among the rejected
+ * fields, then check-out edited to two days after check-in without searching
+ * again: the edit ends check-out's field error and leaves any other field's.
+ */
+interface EditedCheckOutCase {
+  /** What else the edit ends or leaves, for the test title. */
+  title: string;
+  /**
+   * Days from today of the rejected check-in and check-out, and of the
+   * check-out then entered, for one {@link utcDates} call.
+   */
+  offsets: readonly [number, number, number];
+  /**
+   * The server's message for check-in, which must outlast the edit together
+   * with its mark, or `null` when the server rejected check-out alone and the
+   * whole error must go.
+   */
+  checkInMessage: string | null;
+}
+
+/** The rejected searches, one test each. */
+const EDITED_CHECK_OUT_CASES: readonly EditedCheckOutCase[] = [
+  { title: 'and the whole error when it was the only one', offsets: [30, 30, 32], checkInMessage: null },
+  // A day the client reads as past is past for the server too, whenever the
+  // request arrives.
+  { title: "but not the rejected check-in's", offsets: [-1, -1, 1], checkInMessage: 'The date cannot be in the past.' },
+];
+
+for (const c of EDITED_CHECK_OUT_CASES) {
+  test(`editing a rejected check-out without searching again ends its field error, ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut, corrected] = utcDates(...c.offsets);
+    const checkInField = page.getByTestId('search-check-in');
+    const checkOutField = page.getByTestId('search-check-out');
+    const fieldMessages = page.getByTestId('inline-error').getByRole('alert').locator('li');
+    const checkOutMessage = 'The date must be after the check-in date.';
+
+    await test.step('a Seattle search the server rejects marks check-out invalid', async () => {
+      await page.goto('/search');
+      const response = page.waitForResponse(
+        (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      expect((await response).status()).toBe(400);
+
+      await expect(checkOutField).toHaveAttribute('aria-invalid', 'true');
+      await expect(checkOutField).toHaveAttribute('aria-describedby', /\S/);
+      await expect(checkOutField).toHaveAccessibleDescription(checkOutMessage);
+      if (c.checkInMessage === null) {
+        await expect(checkInField).not.toHaveAttribute('aria-invalid');
+        await expect(fieldMessages).toHaveText([`Check-out: ${checkOutMessage}`]);
+      } else {
+        await expect(checkInField).toHaveAttribute('aria-invalid', 'true');
+        await expect(fieldMessages).toHaveText([`Check-in: ${c.checkInMessage}`, `Check-out: ${checkOutMessage}`]);
+      }
+    });
+
+    await test.step('editing check-out, without searching, ends its message and mark', async () => {
+      const searchUrl = page.url();
+      const sent = recordApiRequests(page);
+      await fillBound(page, 'search-check-out', corrected);
+      await expect(checkOutField).not.toHaveAttribute('aria-invalid');
+      await expect(checkOutField).not.toHaveAttribute('aria-describedby');
+      // No answer cleared it: the edit sent nothing and left the URL as it was.
+      expect(sent, 'API requests sent by the edit').toEqual([]);
+      await expect(page).toHaveURL(searchUrl);
+    });
+
+    if (c.checkInMessage === null) {
+      await test.step('check-out was the only field the server rejected, so the whole error is gone', async () => {
+        await expectNoInlineError(page);
+      });
+    } else {
+      const message = c.checkInMessage;
+      await test.step('check-in keeps its message and mark', async () => {
+        await expect(fieldMessages).toHaveText([`Check-in: ${message}`]);
+        await expect(checkInField).toHaveAttribute('aria-invalid', 'true');
+        await expect(checkInField).toHaveAccessibleDescription(message);
+      });
+    }
+  });
+}
+
+test('in forced colours a rejected search field keeps a dashed edge, distinct from valid fields and the focus ring', async ({
+  page,
+}) => {
+  const [day] = utcDates(30);
+  const checkIn = page.getByTestId('search-check-in');
+  const checkOut = page.getByTestId('search-check-out');
+  // The size of the input's border box, and how far its text is inset from it.
+  const geometry = (field: Locator) =>
+    field.evaluate((input) => {
+      const box = input.getBoundingClientRect();
+      const style = getComputedStyle(input);
+      return {
+        size: [box.width, box.height],
+        inset: [
+          parseFloat(style.borderTopWidth) + parseFloat(style.paddingTop),
+          parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft),
+        ],
+      };
+    });
+
+  await page.goto('/search');
+  await page.emulateMedia({ forcedColors: 'active' });
+  await expect(checkOut).toBeVisible();
+  const valid = await geometry(checkOut);
+
+  await test.step('a search with check-out on the check-in day marks check-out invalid', async () => {
+    const response = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await searchHotels(page, { city: 'Seattle', checkIn: day, checkOut: day, guests: 1 });
+    expect((await response).status()).toBe(400);
+    await expect(checkOut).toHaveAttribute('aria-invalid', 'true');
+  });
+
+  await test.step('forced colours drop the error colour and shadow, so the edge itself changes shape', async () => {
+    await expect(checkOut).toHaveCSS('box-shadow', 'none');
+    await expect(checkOut).toHaveCSS('border-style', 'dashed');
+    await expect(checkOut).toHaveCSS('border-width', '3px');
+    await expect(checkIn).toHaveCSS('border-style', 'solid');
+    await expect(checkIn).toHaveCSS('border-width', '1px');
+    // The padding gives up what the border adds: the field keeps its size and
+    // its text stays where it was.
+    expect(await geometry(checkOut)).toEqual(valid);
+  });
+
+  await test.step('focused, it shows the solid focus ring outside its dashed edge', async () => {
+    await checkOut.focus();
+    await expect(checkOut).toHaveCSS('outline-style', 'solid');
+    await expect(checkOut).toHaveCSS('outline-width', '2px');
+    await expect(checkOut).toHaveCSS('outline-offset', '2px');
+    await expect(checkOut).toHaveCSS('border-style', 'dashed');
+    await expect(checkOut).toHaveCSS('border-width', '3px');
+  });
+
+  await test.step('without forced colours the rejected field keeps its error-coloured solid edge', async () => {
+    await page.emulateMedia({ forcedColors: 'none' });
+    await expect(checkOut).toHaveCSS('border-style', 'solid');
+    await expect(checkOut).toHaveCSS('border-width', '1px');
+    await expect(checkOut).toHaveCSS('border-color', 'rgb(176, 0, 32)');
+    await expect(checkOut).toHaveCSS('box-shadow', 'rgb(176, 0, 32) 0px 0px 0px 1px inset');
+  });
+});
+
+test('search with no availability shows the empty message', async ({ page }) => {
+  const [checkIn, checkOut] = utcDates(30, 32);
+  await page.goto('/search');
+  await searchHotels(page, { city: 'Atlantis', checkIn, checkOut, guests: 1 });
+
+  await expect(page.getByTestId('search-empty')).toHaveText(
+    'No hotels with available rooms in Atlantis for these dates.',
+  );
+  // The message sits in the page's polite status region, so it is announced.
+  await expect(page.getByRole('status').filter({ has: page.getByTestId('search-empty') })).toHaveCount(1);
+  await expectNoInlineError(page);
+});
+
+test('search while the service is unreachable shows the status-0 message, and Search again recovers', async ({ page }) => {
+  // Refuses the first search GET at the network level, so it fails with
+  // status 0 and no response at all; every later request, a CORS preflight
+  // included, goes on to the real API unchanged.
+  let refused = false;
+  await page.route(isHotelSearch, (route) => {
+    if (!refused && route.request().method() === 'GET') {
+      refused = true;
+      return route.abort('connectionrefused');
+    }
+    return route.fallback();
+  });
+
+  await test.step('fill a valid Seattle search', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    await page.goto('/search');
+    await fillBound(page, 'search-city', 'Seattle');
+    await fillBound(page, 'search-check-in', checkIn);
+    await fillBound(page, 'search-check-out', checkOut);
+    await fillBound(page, 'search-guests', '2');
+  });
+
+  const error = page.getByTestId('inline-error');
+
+  await test.step('a refused search shows only "The service is unreachable."', async () => {
+    const failed = page.waitForEvent(
+      'requestfailed',
+      (r) => isHotelSearch(new URL(r.url())) && r.method() === 'GET',
+    );
+    await page.getByTestId('search-submit').click();
+    expect((await failed).failure()?.errorText).toBe('net::ERR_CONNECTION_REFUSED');
+
+    // Status 0 carries no problem body: the title alone, with no detail
+    // paragraph and no field list.
+    const alert = error.getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+
+    // The failed request has settled: the indicator is gone and the form can
+    // be submitted again, with no result and no empty message shown.
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.getByTestId('search-submit')).toBeEnabled();
+    await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+  });
+
+  await test.step('Search again reaches the API and replaces the error with results', async () => {
+    // The criteria are already in the URL, so this resubmission is the
+    // page's rerun of an identical search.
+    const retried = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('search-submit').click();
+    expect((await retried).status()).toBe(200);
+    await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+    await expect(error).toHaveCount(0);
+  });
+});
+
+/**
+ * Makes the first `XMLHttpRequest` each document of the page opens for one
+ * target API endpoint throw a plain `Error`, carrying
+ * {@link NON_HTTP_ERROR_MESSAGE}, synchronously from `send`. Nothing reaches
+ * the network, and `HttpClient` fails that request with the `Error` itself,
+ * not an `HttpErrorResponse`. Every other request, a later one to the same
+ * endpoint included, is sent unchanged. The endpoint is compared by origin
+ * and path, as {@link isApiEndpoint} compares it; the query is ignored.
+ *
+ * @param endpoint - The endpoint's path below the API base, such as `/hotels`
+ *   or `/hotels/1`.
+ */
+async function throwOnFirstSend(page: Page, endpoint: string): Promise<void> {
+  const api = new URL(apiUrl());
+  await page.addInitScript(
+    ({ target, message }: { target: string; message: string }) => {
+      const targeted = new WeakMap<XMLHttpRequest, boolean>();
+      const open = XMLHttpRequest.prototype.open;
+      const send = XMLHttpRequest.prototype.send;
+      let thrown = false;
+
+      XMLHttpRequest.prototype.open = function (
+        this: XMLHttpRequest,
+        method: string,
+        url: string | URL,
+        async?: boolean,
+        username?: string | null,
+        password?: string | null,
+      ): void {
+        const requested = new URL(url, document.baseURI);
+        targeted.set(this, `${requested.origin}${requested.pathname}` === target);
+        open.call(this, method, url, async ?? true, username, password);
+      };
+
+      XMLHttpRequest.prototype.send = function (
+        this: XMLHttpRequest,
+        body?: Document | XMLHttpRequestBodyInit | null,
+      ): void {
+        if (!thrown && targeted.get(this) === true) {
+          thrown = true;
+          throw new Error(message);
+        }
+        send.call(this, body);
+      };
+    },
+    { target: `${api.origin}${api.pathname}${endpoint}`, message: NON_HTTP_ERROR_MESSAGE },
+  );
+}
+
+test('a search that fails without an HTTP response shows the status-0 message, and the next search runs', async ({ page }) => {
+  // The first search GET throws from `send`, so it fails with a plain Error
+  // and no response at all; the next one goes to the real API unchanged.
+  await throwOnFirstSend(page, '/hotels');
+  const sent: URL[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (isHotelSearch(url) && request.method() === 'GET') {
+      sent.push(url);
+    }
+  });
+
+  await test.step('fill a valid Seattle search for two guests', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    await page.goto('/search');
+    await fillBound(page, 'search-city', 'Seattle');
+    await fillBound(page, 'search-check-in', checkIn);
+    await fillBound(page, 'search-check-out', checkOut);
+    await fillBound(page, 'search-guests', '2');
+  });
+
+  const error = page.getByTestId('inline-error');
+
+  await test.step('the failed search shows only "The service is unreachable."', async () => {
+    await page.getByTestId('search-submit').click();
+
+    // No response was received: the status-0 title alone, never the
+    // exception's own message.
+    const alert = error.getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText(NON_HTTP_ERROR_MESSAGE);
+
+    // The failed request has settled, and it never reached the network.
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.getByTestId('search-submit')).toBeEnabled();
+    await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+    expect(sent).toEqual([]);
+  });
+
+  await test.step('a search for one guest changes the URL, reaches the API and shows results', async () => {
+    // New criteria are a route change, so this proves the page's
+    // route-driven search survived the failure.
+    await fillBound(page, 'search-guests', '1');
+    const answered = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('search-submit').click();
+    expect((await answered).status()).toBe(200);
+    await expect(page).toHaveURL(/[?&]guests=1(&|$)/);
+    await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+    await expect(error).toHaveCount(0);
+    expect(sent.map((url) => url.searchParams.get('guests'))).toEqual(['1']);
+  });
+});
+
+test('a hotel load that fails without an HTTP response shows the status-0 message, and the reused page loads again', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(40, 42);
+  const stay = { city: 'Seattle', checkIn, checkOut, guests: 1 };
+
+  const [first, second] = await test.step('read two Seattle hotels through the API', async () => {
+    const search = await fixtureRequest('searching hotels', () =>
+      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', checkIn, checkOut, guests: 1 } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const body: unknown = await search.json();
+    const hotels: { id: number; name: string }[] = [];
+    for (const hotel of Array.isArray(body) ? (body as unknown[]) : []) {
+      if (isRecord(hotel) && typeof hotel['id'] === 'number' && typeof hotel['name'] === 'string') {
+        hotels.push({ id: hotel['id'], name: hotel['name'] });
+      }
+    }
+    expect(hotels.length, 'the fixture search returns two Seattle hotels').toBeGreaterThanOrEqual(2);
+    return [hotels[0], hotels[1]];
+  });
+
+  // The second hotel's first load throws from `send`, so it fails with a
+  // plain Error and no response at all; every other request is unchanged.
+  await throwOnFirstSend(page, `/hotels/${second.id}`);
+
+  await test.step('open the first hotel from a search', async () => {
+    await page.goto('/search');
+    await searchHotels(page, stay);
+    await openHotel(page, page.getByTestId(`view-rooms-${first.id}`));
+    await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
+  });
+
+  const error = page.getByTestId('inline-error');
+
+  await test.step('the second hotel\'s failed load shows only "The service is unreachable."', async () => {
+    await page.getByTestId('nav-search').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await searchHotels(page, stay);
+    await page.getByTestId(`view-rooms-${second.id}`).click();
+    await expect(page).toHaveURL(new RegExp(`/hotels/${second.id}\\?`));
+
+    const alert = error.getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText(NON_HTTP_ERROR_MESSAGE);
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+  });
+
+  await test.step('one history traversal back to the first hotel loads it on the same page instance', async () => {
+    // A mark on the page's host element survives only if the router reuses
+    // the component, so the load below comes from the same route stream that
+    // carried the failure.
+    const host = page.locator('app-hotel-detail-page');
+    await host.evaluate((element) => element.setAttribute('data-e2e-reused', 'yes'));
+    const loaded = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/hotels/${first.id}`) && r.request().method() === 'GET',
+    );
+
+    // The history holds /search, /search?<stay>, /hotels/<first>, /search,
+    // /search?<stay> and /hotels/<second>: three entries back is the first
+    // hotel, reached by one navigation that keeps the detail page.
+    await page.evaluate(() => history.go(-3));
+    expect((await loaded).status()).toBe(200);
+    await expect(page).toHaveURL(new RegExp(`/hotels/${first.id}\\?`));
+    await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
+    await expect(error).toHaveCount(0);
+    await expect(host).toHaveAttribute('data-e2e-reused', 'yes');
+  });
+});
+
+for (const status of SERVER_ERROR_STATUSES) {
+  test(`a search answered ${status} with a problem body shows only "Request failed (${status})."`, async ({ page }) => {
+    // The search GET gets a 5xx labelled as a problem, every field holding
+    // marker text; a CORS preflight would go on to the real API unchanged.
+    await page.route(isHotelSearch, (route) =>
+      route.request().method() === 'GET'
+        ? route.fulfill({
+            status,
+            contentType: 'application/problem+json',
+            body: JSON.stringify({
+              type: 'about:blank',
+              title: SERVER_ERROR_MARKERS.title,
+              status,
+              detail: SERVER_ERROR_MARKERS.detail,
+              traceId: SERVER_ERROR_MARKERS.traceId,
+              errors: { [SERVER_ERROR_MARKERS.field]: [SERVER_ERROR_MARKERS.message] },
+            }),
+          })
+        : route.fallback(),
+    );
+
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const answered = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.goto(`/search?city=Seattle&checkIn=${checkIn}&checkOut=${checkOut}`);
+    expect((await answered).status()).toBe(status);
+
+    // The generic title alone: no detail paragraph, no field list, and no
+    // text the body carried anywhere on the page.
+    const alert = page.getByTestId('inline-error').getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(`Request failed (${status}).`);
+    await expect(alert).toHaveText(`Request failed (${status}).`);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+    for (const marker of Object.values(SERVER_ERROR_MARKERS)) {
+      await expect(page.locator('body')).not.toContainText(marker);
+    }
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+  });
+}
+
+/** The answer "Retry" gets after a hotel load answered 500, and where focus must then land. */
+interface RetryCase {
+  /** The outcome, for the test title. */
+  title: string;
+  /** Whether the retried `GET` is answered 500 too, rather than passed on to the API. */
+  failsAgain: boolean;
+  /** The test hook of the heading that must have focus once the retry has settled. */
+  heading: string;
+}
+
+/** The retries of the load-retry test, one test each. */
+const RETRY_CASES: readonly RetryCase[] = [
+  { title: 'loads the same stay and focuses the hotel heading', failsAgain: false, heading: 'hotel-name' },
+  {
+    title: 'that fails again shows the error with Retry and focuses its heading',
+    failsAgain: true,
+    heading: 'load-error-heading',
+  },
+];
+
+for (const c of RETRY_CASES) {
+  test(`Retry after a hotel load answered 500 ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const url = `/hotels/1?checkIn=${checkIn}&checkOut=${checkOut}&guests=2`;
+    const isDetail = (u: URL): boolean => isApiEndpoint(u, '/hotels/1');
+    const indicator = page.getByTestId('loading-indicator');
+    const retry = page.getByTestId('load-retry');
+    const alert = page.getByTestId('inline-error').getByRole('alert');
+
+    // The first detail GET is answered 500. The second, the retry, is held
+    // until the test lets it go, and is then answered 500 too when it fails
+    // again, or else reaches the API, as every later GET does.
+    let gets = 0;
+    let releaseRetry = (): void => undefined;
+    const retryReleased = new Promise<void>((resolve) => {
+      releaseRetry = resolve;
+    });
+    await page.route(isDetail, async (route) => {
+      if (route.request().method() !== 'GET') {
+        await route.fallback();
+        return;
+      }
+      gets += 1;
+      if (gets === 2) {
+        await retryReleased;
+      }
+      if (gets === 1 || (gets === 2 && c.failsAgain)) {
+        await route.fulfill({
+          status: 500,
+          contentType: 'application/problem+json',
+          body: JSON.stringify({ title: 'server-title-marker', status: 500 }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    const sent = recordApiRequests(page);
+
+    await test.step('the failed load shows the generic error with Retry in place of the content', async () => {
+      const failed = page.waitForResponse((r) => isDetail(new URL(r.url())) && r.request().method() === 'GET');
+      await page.goto(url);
+      expect((await failed).status()).toBe(500);
+      await expect(alert).toHaveText('Request failed (500).');
+      await expect(retry).toHaveText('Retry');
+      await expect(retry).toHaveAttribute('type', 'button');
+      await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+      await expect(page.locator(BOOK_BUTTONS)).toHaveCount(0);
+    });
+
+    await test.step('while the retried GET is held, Retry is gone and the indicator shows', async () => {
+      await retry.click();
+      await expect.poll(() => gets, { message: 'Retry sends the GET again' }).toBe(2);
+      await expect(retry).toHaveCount(0);
+      await expect(page.getByTestId('inline-error')).toHaveCount(0);
+      await expect(indicator).toBeVisible();
+      releaseRetry();
+    });
+
+    await test.step(`once it settles, focus is on ${c.heading} and the URL is unchanged`, async () => {
+      await expect(indicator).toHaveCount(0);
+      await expect(page.getByTestId(c.heading)).toBeFocused();
+      await expect(page).toHaveURL(url);
+      if (c.failsAgain) {
+        await expect(alert).toHaveText('Request failed (500).');
+        await expect(retry).toBeVisible();
+        await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+      } else {
+        await expect(page.locator('.hotel-stay')).toContainText(`${displayDate(checkIn)} to ${displayDate(checkOut)}`);
+        await expect(page.locator('.hotel-stay')).toContainText('2 guests');
+        await expect(page.locator(BOOK_BUTTONS)).not.toHaveCount(0);
+        await expectNoInlineError(page);
+      }
+      // The load and its one retry, for the same hotel and stay.
+      const stay = `GET /api/hotels/1 checkIn=${checkIn} checkOut=${checkOut} guests=2`;
+      expect(sent.map(describeStayRequest)).toEqual([stay, stay]);
+    });
+  });
+}
+
+for (const c of RAW_CRITERIA_CASES) {
+  test(`${c.title} reaches the server as written and its ${c.status} shows inline`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const url = c.url.replace('{stay}', `checkIn=${checkIn}&checkOut=${checkOut}`);
+
+    const res = await test.step('open the deep link', async () => {
+      const response = page.waitForResponse(
+        (r) => isApiEndpoint(r.url(), c.endpoint) && r.request().method() === 'GET',
+      );
+      await page.goto(url);
+      return response;
+    });
+
+    await test.step(`the GET carries the URL's text and gets ${c.status}`, () => {
+      expect(new URL(res.url()).searchParams.get('guests')).toBe(c.guests);
+      expect(res.status()).toBe(c.status);
+    });
+
+    await test.step('the page shows the error inline and no hotel', async () => {
+      await expect(page.getByTestId('inline-error')).toBeVisible();
+      await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="hotel-name"]`)).toHaveCount(0);
+    });
+  });
+}
+
+for (const text of TYPED_GUESTS) {
+  test(`typed guests ${JSON.stringify(text)} reaches the server as written, also on an unchanged re-submit`, async ({
+    page,
+  }) => {
+    await page.goto('/search');
+    await fillSearchForm(page, text);
+
+    for (const attempt of ['submit', 'unchanged re-submit']) {
+      await test.step(`the ${attempt} sends the typed text and shows its 400 inline`, async () => {
+        const res = await submitSearch(page);
+        expect(new URL(res.url()).searchParams.get('guests')).toBe(text);
+        expect(res.status()).toBe(400);
+        await expect(page).toHaveURL((url) => url.searchParams.get('guests') === text);
+
+        const guests = page.getByTestId('search-guests');
+        await expect(page.getByTestId('inline-error')).toBeVisible();
+        await expect(guests).toHaveAttribute('aria-invalid', 'true');
+        await expect(guests).toHaveAccessibleDescription(GUESTS_INTEGER_MESSAGE);
+        await expectControlValue(page, 'search-guests', text);
+      });
+    }
+  });
+}
+
+for (const text of DEEP_LINK_GUESTS) {
+  test(`a search deep link's guests ${JSON.stringify(text)} stays in the form for an unchanged re-submit`, async ({
+    page,
+  }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+
+    await test.step(`open a deep link with guests=${text}`, async () => {
+      const response = page.waitForResponse(
+        (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await page.goto(`/search?city=Seattle&checkIn=${checkIn}&checkOut=${checkOut}&guests=${text}`);
+      const res = await response;
+      expect(new URL(res.url()).searchParams.get('guests')).toBe(text);
+      expect(res.status()).toBe(400);
+      await expectControlValue(page, 'search-guests', text);
+    });
+
+    await test.step('the unchanged re-submit sends the same text again and shows its 400 inline', async () => {
+      const res = await submitSearch(page);
+      expect(new URL(res.url()).searchParams.get('guests')).toBe(text);
+      expect(res.status()).toBe(400);
+      await expect(page.getByTestId('inline-error')).toContainText(GUESTS_INTEGER_MESSAGE);
+      // `get`, not `has`: `''` is the explicit empty, `null` an absent guests.
+      await expect(page).toHaveURL((url) => url.searchParams.get('guests') === text);
+      await expectControlValue(page, 'search-guests', text);
+    });
+
+    await test.step('clearing the field leaves guests out', async () => {
+      await fillBound(page, 'search-guests', '3');
+      await fillBound(page, 'search-guests', '');
+      const res = await submitSearch(page);
+      expect(new URL(res.url()).searchParams.get('guests')).toBe('1');
+      expect(res.status()).toBe(200);
+      await expect(page).toHaveURL((url) => !url.searchParams.has('guests'));
+      await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+    });
+  });
+}
+
+test('a guests field left empty is left out of the URL and the search requests 1 guest', async ({ page }) => {
+  await page.goto('/search');
+  const { checkIn, checkOut } = await fillSearchForm(page, '');
+
+  const res = await submitSearch(page);
+  expect(new URL(res.url()).searchParams.get('guests')).toBe('1');
+  expect(res.status()).toBe(200);
+  await expect(page).toHaveURL(new RegExp(`/search\\?city=Seattle&checkIn=${checkIn}&checkOut=${checkOut}$`));
+  await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+  await expectNoInlineError(page);
+});
+
+for (const link of BARE_SEARCH_LINKS) {
+  test(`${link} from a results page returns to the idle search with the initial criteria`, async ({ page }) => {
+    await test.step('search Seattle for 2 guests, then edit the city without searching', async () => {
+      const [checkIn, checkOut] = utcDates(30, 32);
+      await page.goto('/search');
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+      await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+      await fillBound(page, 'search-city', 'Portland');
+    });
+
+    await test.step(`click ${link}`, async () => {
+      await page.getByTestId(link).click();
+      await expectIdleSearch(page);
+    });
+  });
+}
+
+test('Log out from a results page returns to the idle search with the initial criteria', async ({ page }) => {
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  await test.step('search Seattle for 2 guests', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+    await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+  });
+
+  await test.step('log out', async () => {
+    await page.getByTestId('nav-logout').click();
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expectIdleSearch(page);
+  });
+});
+
+for (const id of NON_INTEGER_HOTEL_IDS) {
+  test(`the hotel id ${id} shows an inline 404 without a request`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const detailRequests = recordDetailRequests(page);
+    await page.goto(`/hotels/${id}?checkIn=${checkIn}&checkOut=${checkOut}`);
+    await expectLocal404(page, detailRequests);
+  });
+}
+
+test('the hotel id NUL from the login return URL shows an inline 404 without a request', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  // nginx rejects /hotels/%00 on a direct load, so the in-app navigation
+  // after login, which keeps encoded path data that is no separator, is the
+  // way to reach it.
+  const detailRequests = recordDetailRequests(page);
+  await test.step('log in with a return URL to the hotel id %00', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const returnUrl = `/hotels/%00?checkIn=${checkIn}&checkOut=${checkOut}`;
+    await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(/\/hotels\/%00\?/);
+  });
+
+  await test.step('the page shows the 404 inline and sent no request', () =>
+    expectLocal404(page, detailRequests),
+  );
+});
+
+test('a reused detail page loads once, for the hotel and stay it lands on', async ({ page }) => {
+  const [firstIn, firstOut, secondIn, secondOut] = utcDates(40, 42, 44, 47);
+  const firstStay = { city: 'Seattle', checkIn: firstIn, checkOut: firstOut, guests: 1 };
+  const secondStay = { city: 'Seattle', checkIn: secondIn, checkOut: secondOut, guests: 2 };
+
+  const first = await test.step('open a Seattle hotel for the first stay', async () => {
+    await page.goto('/search');
+    await searchHotels(page, firstStay);
+    return openHotel(page, page.locator(VIEW_ROOMS).first());
+  });
+
+  await test.step('open the other Seattle hotel for a second stay', async () => {
+    await page.getByTestId('nav-search').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await searchHotels(page, secondStay);
+    const other = page.locator(`${VIEW_ROOMS}:not([data-testid="view-rooms-${first.id}"])`).first();
+    await openHotel(page, other);
+  });
+
+  await test.step('go back to the first hotel in one history traversal', async () => {
+    const loads: URL[] = [];
+    page.on('request', (request) => {
+      const requested = new URL(request.url());
+      if (requested.pathname.startsWith('/api/hotels/') && request.method() === 'GET') {
+        loads.push(requested);
+      }
+    });
+
+    // The history holds /search, /search?<first stay>, /hotels/<first>,
+    // /search, /search?<second stay> and /hotels/<other>. Three entries back
+    // is the first hotel: one navigation that reuses the detail page and
+    // changes both its id and its query.
+    await page.evaluate(() => history.go(-3));
+    await expect(page).toHaveURL(new RegExp(`/hotels/${first.id}\\?`));
+    await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
+
+    // Loads are recorded on any origin, so a load sent to another API counts
+    // too and fails here: exactly one, from the target API's detail endpoint.
+    expect(loads.map((u) => `${u.origin}${u.pathname}`)).toEqual([`${apiUrl()}/hotels/${first.id}`]);
+    const [load] = loads;
+    expect(load.searchParams.get('checkIn')).toBe(firstStay.checkIn);
+    expect(load.searchParams.get('checkOut')).toBe(firstStay.checkOut);
+    expect(load.searchParams.get('guests')).toBe(String(firstStay.guests));
+  });
+});
+
+/** How the hotel detail page that "View rooms" opens loads, and which heading must then have focus. */
+interface EntryFocusCase {
+  /** The heading that takes focus, for the test title. */
+  title: string;
+  /** Whether the page's `GET /api/hotels/{id}` gets no HTTP response, so its load fails. */
+  failLoad: boolean;
+  /** The test hook of the heading that must have focus. */
+  heading: string;
+}
+
+const ENTRY_FOCUS_CASES: readonly EntryFocusCase[] = [
+  { title: "the hotel's name once the hotel loads", failLoad: false, heading: 'hotel-name' },
+  { title: "the load error's heading when the hotel fails to load", failLoad: true, heading: 'load-error-heading' },
+];
+
+for (const c of ENTRY_FOCUS_CASES) {
+  test(`View rooms moves focus to ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(35, 37);
+    const link = await test.step('search Seattle hotels', async () => {
+      await page.goto('/search');
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      return page.locator(VIEW_ROOMS).first();
+    });
+    const id = ((await link.getAttribute('data-testid')) ?? '').slice('view-rooms-'.length);
+    expect(id).toMatch(/^\d+$/);
+
+    await test.step('click View rooms, which leaves with the search page', async () => {
+      if (c.failLoad) {
+        await page.route(
+          (url) => isApiEndpoint(url, `/hotels/${id}`),
+          (route) => route.abort(),
+        );
+      }
+      await link.click();
+      await expect(page).toHaveURL(new RegExp(`/hotels/${id}\\?`));
+    });
+
+    await test.step('the heading takes focus once it renders', async () => {
+      await expect(page.getByTestId(c.heading)).toBeFocused();
+      if (c.failLoad) {
+        await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(UNREACHABLE_TITLE);
+      }
+    });
+  });
+}
+
+/**
+ * Asserts that the room table shows "Book" buttons and that every one is
+ * disabled, as they are while the page's booking, or the revalidation after
+ * its answer, is in flight.
+ */
+async function expectEveryBookDisabled(page: Page): Promise<void> {
+  await expect(page.locator(BOOK_BUTTONS)).not.toHaveCount(0);
+  await expect(page.locator(`${BOOK_BUTTONS}:enabled`)).toHaveCount(0);
+}
+
+/** An API request the page sent, as {@link recordApiRequests} keeps it. */
+interface SentApiRequest {
+  method: string;
+  url: URL;
+}
+
+/**
+ * Records, from now on, every API request the page sends except a CORS
+ * preflight, in the order sent, and returns the list it fills.
+ */
+function recordApiRequests(page: Page): SentApiRequest[] {
+  const sent: SentApiRequest[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (isApi(url) && request.method() !== 'OPTIONS') {
+      sent.push({ method: request.method(), url });
+    }
+  });
+  return sent;
+}
+
+/**
+ * Writes a recorded request's target as its path alone when it went to the
+ * target API's origin, and as origin and path otherwise, so a request that
+ * another stack's API received never compares equal to a target API path.
+ */
+function apiRelativeTarget(url: URL): string {
+  return url.origin === new URL(apiUrl()).origin ? url.pathname : `${url.origin}${url.pathname}`;
+}
+
+/**
+ * Describes a recorded request by its method, path and stay query alone, so a
+ * failed comparison prints no other part of it; a request to another origin
+ * than the target API's also shows that origin ({@link apiRelativeTarget}).
+ */
+function describeStayRequest({ method, url }: SentApiRequest): string {
+  const query = url.searchParams;
+  return `${method} ${apiRelativeTarget(url)} checkIn=${query.get('checkIn')} checkOut=${query.get('checkOut')} guests=${query.get('guests')}`;
+}
+
+/**
+ * Reads, through the API, how many rooms of one room type the server holds
+ * free for a stay at a hotel: the figure the detail page shows in
+ * `available-count-<id>`.
+ */
+async function apiAvailableCount(
+  request: APIRequestContext,
+  hotelId: string,
+  stay: Stay,
+  roomTypeId: number,
+): Promise<number> {
+  const roomType = (await apiRoomTypes(request, Number(hotelId), stay)).find((rt) => rt.id === roomTypeId);
+  expect(roomType !== undefined, 'the hotel lists the room type').toBe(true);
+  return Number(roomType?.availableRooms);
+}
+
+/** What {@link bookThenReturnToShownStay} leaves on screen. */
+interface PendingLateBooking {
+  /** The hotel of both stays, with the name its page shows. */
+  hotel: { id: string; name: string };
+  /** The room type whose "Book" was clicked, with the name its row shows. */
+  roomType: { id: number; name: string };
+  /** The held `POST /api/bookings` of that click. */
+  post: RequestGate;
+  /** The detail page URL of the shown stay, now on screen. */
+  url: string;
+  /** The room type's available count for the shown stay, as the page shows it. */
+  shownCount: number;
+}
+
+/**
+ * Clicks "Book" on a Seattle hotel's page for the `booked` stay, holds its
+ * `POST /api/bookings`, and goes back to the same hotel's page for the
+ * `shown` stay in one history traversal, which reuses the page component with
+ * the booking still in flight. On the way it asserts that the indicator and
+ * every disabled "Book" last as long as the POST, also once the traversal's
+ * own GET has answered. The browser is left there, with the POST held.
+ *
+ * Expects the browser on `/search`, signed in, with nothing searched yet.
+ */
+async function bookThenReturnToShownStay(page: Page, shown: Stay, booked: Stay): Promise<PendingLateBooking> {
+  const indicator = page.getByTestId('loading-indicator');
+  const stayLine = page.locator('.hotel-stay');
+
+  const hotel = await test.step('open a Seattle hotel for the stay to come back to', async () => {
+    await searchHotels(page, { city: 'Seattle', ...shown });
+    return openHotel(page, page.locator(VIEW_ROOMS).first());
+  });
+
+  await test.step('open the same hotel for the stay to book', async () => {
+    await page.getByTestId('nav-search').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await searchHotels(page, { city: 'Seattle', ...booked });
+    await openHotel(page, page.getByTestId(`view-rooms-${hotel.id}`));
+    await expect(stayLine).toContainText(`${displayDate(booked.checkIn)} to ${displayDate(booked.checkOut)}`);
+  });
+
+  const { roomType, post } = await test.step('click Book and hold its POST', async () => {
+    const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+    expect(testId).toMatch(/^book-\d+$/);
+    const id = Number(testId.slice('book-'.length));
+    const name = (await page.getByTestId(`room-type-row-${id}`).locator('td').first().innerText()).trim();
+
+    const gate = await holdRequest(page, isBookingsCollection, 'POST');
+    await page.getByTestId(testId).click();
+    await gate.expectArrival('Book sends the POST');
+    await expect(indicator).toBeVisible();
+    await expectEveryBookDisabled(page);
+    return { roomType: { id, name }, post: gate };
+  });
+
+  const shownCount = await test.step('go back to the stay to come back to in one history traversal', async () => {
+    const loads = recordApiRequests(page);
+    const loaded = page.waitForResponse((r) => {
+      const url = new URL(r.url());
+      return (
+        isApiEndpoint(url, `/hotels/${hotel.id}`) &&
+        url.searchParams.get('checkIn') === shown.checkIn &&
+        r.request().method() === 'GET'
+      );
+    });
+
+    // The history holds /search, /search?<shown stay>, /hotels/<hotel>?<shown
+    // stay>, /search, /search?<booked stay> and /hotels/<hotel>?<booked stay>.
+    // Three entries back is the shown stay: one navigation that reuses the
+    // detail page, with the POST still held, and changes only its query.
+    await page.evaluate(() => history.go(-3));
+    expect((await loaded).status()).toBe(200);
+    await expect(page).toHaveURL(new RegExp(`/hotels/${hotel.id}\\?.*checkIn=${shown.checkIn}`));
+    // The render that shows the shown stay is the one that applies the GET's
+    // answer, so an indicator that answer lowered would already be gone below.
+    await expect(stayLine).toContainText(`${displayDate(shown.checkIn)} to ${displayDate(shown.checkOut)}`);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    expect(loads.map(describeStayRequest)).toEqual([
+      `GET /api/hotels/${hotel.id} checkIn=${shown.checkIn} checkOut=${shown.checkOut} guests=${shown.guests}`,
+    ]);
+
+    // The GET has answered but the POST is still pending: the shared counter
+    // keeps the indicator up and every "Book" stays disabled.
+    await expect(indicator).toBeVisible();
+    await expectEveryBookDisabled(page);
+    return readAvailableCount(page, roomType.id);
+  });
+
+  return { hotel, roomType, post, url: page.url(), shownCount };
+}
+
+/**
+ * A booked stay whose 201 arrives while the same hotel's page shows another
+ * stay: one that overlaps the shown stay, so the new booking takes a room the
+ * table counts, or one that starts on the shown stay's check-out day, which
+ * is free, so it takes none.
+ */
+interface LateCreatedCase {
+  /** The booked stay, for the test title. */
+  title: string;
+  /** Days from today of the shown check-in and check-out, then of the booked ones. */
+  offsets: readonly [number, number, number, number];
+  /** Whether the booked stay overlaps the shown one as half-open ranges. */
+  overlaps: boolean;
+}
+
+/** The late 201s, one test each. */
+const LATE_CREATED_CASES: readonly LateCreatedCase[] = [
+  { title: 'an overlapping stay', offsets: [100, 103, 101, 104], overlaps: true },
+  { title: 'a stay from the shown check-out day', offsets: [105, 107, 107, 109], overlaps: false },
+];
+
+for (const c of LATE_CREATED_CASES) {
+  test(`a late 201 for ${c.title} leaves the reused detail page on the stay it shows${c.overlaps ? ' and revalidates it' : ', unreloaded'}`, async ({ page, request }) => {
+    const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(...c.offsets);
+    const shown: Stay = { checkIn: shownIn, checkOut: shownOut, guests: 1 };
+    const booked: Stay = { checkIn: bookedIn, checkOut: bookedOut, guests: 2 };
+    const indicator = page.getByTestId('loading-indicator');
+    const inlineErrors = await watchInlineErrors(page);
+
+    await test.step('register and log in', async () => {
+      // Recorded before "Book" is clicked: once released, the POST can commit
+      // a booking whose 201 this test never decodes, and the guest's
+      // reconciliation after the test cancels it all the same.
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, await registerAndLogIn(page)));
+    });
+    const pending = await bookThenReturnToShownStay(page, shown, booked);
+    const detailPath = `/api/hotels/${pending.hotel.id}`;
+    const countAfter = pending.shownCount - (c.overlaps ? 1 : 0);
+
+    // The revalidation is held too, so the indicator and the disabled "Book"
+    // can be seen to outlast the POST until the revalidation has answered.
+    const revalidation = c.overlaps
+      ? await holdRequest(page, (url) => isApiEndpoint(url, `/hotels/${pending.hotel.id}`), 'GET')
+      : null;
+    const sent = recordApiRequests(page);
+
+    await test.step('release the POST: the API creates the booking', async () => {
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await pending.post.release();
+      const response = await created;
+      expect(response.status()).toBe(201);
+      const body: unknown = await response.json();
+      const id = isRecord(body) ? body['id'] : undefined;
+      expect(typeof id === 'number' && Number.isInteger(id), 'the 201 carries the booking id').toBe(true);
+    });
+
+    await test.step('a notice names the booked room type, hotel and stay as confirmed', async () => {
+      await expect(page.getByTestId('late-booking')).toBeVisible();
+      await expect(page.getByTestId('late-booking-message')).toHaveText(
+        `Your booking of ${pending.roomType.name} at ${pending.hotel.name} ` +
+          `from ${displayDate(bookedIn)} to ${displayDate(bookedOut)} ` +
+          'is confirmed. No payment is taken online in this version.',
+      );
+      await expect(page.getByTestId('late-booking-bookings')).toBeVisible();
+      await expect(page.getByTestId('late-booking-bookings')).toHaveText('View it in My bookings');
+    });
+
+    if (revalidation !== null) {
+      await test.step('the indicator and the disabled Book last until the revalidation answers', async () => {
+        await revalidation.expectArrival('the late 201 revalidates the stay on screen');
+        await expect(indicator).toBeVisible();
+        await expectEveryBookDisabled(page);
+        const reread = page.waitForResponse(
+          (r) => isApiEndpoint(r.url(), `/hotels/${pending.hotel.id}`) && r.request().method() === 'GET',
+        );
+        await revalidation.release();
+        expect((await reread).status()).toBe(200);
+      });
+    }
+
+    await test.step('the page stays on the shown stay, with no error and the count the API holds', async () => {
+      // The notice above was rendered after the 201's own work had started,
+      // so with the indicator gone nothing it started is still in flight: the
+      // checks below see the settled page, and no request can join `sent`.
+      await expect(indicator).toHaveCount(0);
+      await expect(page.getByTestId(`available-count-${pending.roomType.id}`)).toHaveText(String(countAfter));
+      await expect(page.getByTestId(`book-${pending.roomType.id}`)).toBeEnabled();
+      await expect(page).toHaveURL(pending.url);
+      await expect(page.getByTestId('hotel-name')).toHaveText(pending.hotel.name);
+      await expect(page.locator('.hotel-stay')).toContainText(`${displayDate(shownIn)} to ${displayDate(shownOut)}`);
+      expect(await apiAvailableCount(request, pending.hotel.id, shown, pending.roomType.id)).toBe(countAfter);
+      // Every API request since the release.
+      expect(sent.map(describeStayRequest)).toEqual(
+        c.overlaps ? [`GET ${detailPath} checkIn=${shownIn} checkOut=${shownOut} guests=${shown.guests}`] : [],
+      );
+      await expectNoInlineError(page);
+      expect(await inlineErrors.appearances()).toEqual([]);
+    });
+
+    await test.step('with the session live, the link opens My bookings with the confirmation', async () => {
+      await page.getByTestId('late-booking-bookings').click();
+      await expect(page).toHaveURL(/\/bookings$/);
+      const confirmation = page.getByTestId('booking-confirmation');
+      await expect(confirmation).toBeVisible();
+      await expect(confirmation).toContainText(`${pending.hotel.name}, ${pending.roomType.name}, room `);
+      await expect(confirmation).toContainText(`${displayDate(bookedIn)} to ${displayDate(bookedOut)}`);
+      await expect(confirmation).toContainText('No payment is taken online in this version.');
+    });
+  });
+}
+
+test('a late 401 on a reused detail page shows in a notice that names no booking, never as an error of the stay on screen', async ({ page }) => {
+  // The stays overlap, so only the status, not the dates, rules out a
+  // revalidation.
+  const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(111, 114, 112, 115);
+  const shown: Stay = { checkIn: shownIn, checkOut: shownOut, guests: 1 };
+  const booked: Stay = { checkIn: bookedIn, checkOut: bookedOut, guests: 2 };
+  const indicator = page.getByTestId('loading-indicator');
+  const inlineErrors = await watchInlineErrors(page);
+
+  await test.step('register and log in', () => registerAndLogIn(page));
+  const pending = await bookThenReturnToShownStay(page, shown, booked);
+  const sent = recordApiRequests(page);
+
+  await test.step('release the POST with a token the API rejects', async () => {
+    const rejected = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await pending.post.release({ authorization: 'Bearer not-a-valid-token' });
+    expect((await rejected).status()).toBe(401);
+  });
+
+  await test.step('the notice names no booking, only that it could not be confirmed, with the 401 and its own link', async () => {
+    const late = page.getByTestId('late-booking');
+    await expect(late).toBeVisible();
+    // The 401 signed the guest out, so the public page keeps none of the
+    // booking: no room type, hotel or dates.
+    await expect(page.getByTestId('late-booking-message')).toHaveText('Your booking could not be confirmed.');
+    await expect(late).not.toContainText(pending.roomType.name);
+    await expect(late).not.toContainText(pending.hotel.name);
+    await expect(late).not.toContainText(displayDate(bookedIn));
+    await expect(late).not.toContainText(displayDate(bookedOut));
+    await expect(late.locator('time')).toHaveCount(0);
+    const error = late.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    const loginAgain = error.getByTestId('late-booking-login-again');
+    await expect(loginAgain).toHaveText('Log in again');
+    // The link comes back to the stay on screen, not the booked one.
+    const target = new URL((await loginAgain.getAttribute('href')) ?? '', page.url());
+    const current = new URL(pending.url);
+    expect(target.pathname).toBe('/login');
+    expect(target.searchParams.get('returnUrl')).toBe(`${current.pathname}${current.search}`);
+    await expect(late.getByTestId('late-booking-bookings')).toHaveCount(0);
+  });
+
+  await test.step('the stay on screen shows no error of its own, signed out, with nothing reloaded', async () => {
+    await expect(indicator).toHaveCount(0);
+    await expect(page.getByTestId('login-again')).toHaveCount(0);
+    await expect(page.getByTestId('inline-error')).toHaveCount(1);
+    await expect(page.getByTestId(`book-${pending.roomType.id}`)).toBeEnabled();
+    await expect(page).toHaveURL(pending.url);
+    await expect(page.getByTestId('hotel-name')).toHaveText(pending.hotel.name);
+    await expect(page.locator('.hotel-stay')).toContainText(`${displayDate(shownIn)} to ${displayDate(shownOut)}`);
+    await expect(page.getByTestId(`available-count-${pending.roomType.id}`)).toHaveText(String(pending.shownCount));
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    // As after the 201: with the indicator gone, the list is complete.
+    expect(sent.map(describeStayRequest)).toEqual([]);
+    expect(await inlineErrors.appearances()).toEqual([new URL(pending.url).pathname]);
+  });
+});
+
+/** The neutral notice of a booking answered after the session that sent it had ended. */
+const SESSION_ENDED_MESSAGE =
+  'Your session ended before this booking was answered. Log in and open My bookings to see whether it was made ' +
+  'before you book again.';
+
+/**
+ * Records, from now on, the path of every URL the page's main frame commits,
+ * the router's history API navigations included, and returns the list it
+ * fills.
+ */
+function recordVisitedPaths(page: Page): string[] {
+  const visited: string[] = [];
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) {
+      visited.push(new URL(frame.url()).pathname);
+    }
+  });
+  return visited;
+}
+
+/**
+ * Registers a fresh guest and logs in, as {@link registerAndLogIn} does, and
+ * also returns the session's expiry, read from the login response.
+ *
+ * @returns The guest's credentials and the `expiresAt` instant in
+ *   milliseconds since the epoch.
+ */
+async function registerAndLogInWithExpiry(page: Page): Promise<{ guest: GuestCredentials; expiresAt: number }> {
+  const login = page.waitForResponse((r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST');
+  const guest = await registerAndLogIn(page);
+  const body: unknown = await (await login).json();
+  const expiresAt = Date.parse(isRecord(body) && typeof body['expiresAt'] === 'string' ? body['expiresAt'] : '');
+  expect(Number.isNaN(expiresAt), 'the login returns an expiry instant').toBe(false);
+  return { guest, expiresAt };
+}
+
+/**
+ * Moves the page's faked clock forward until it reads `offsetMs` from the
+ * session's `expiresAt`: a negative offset stops short of the expiry, a
+ * positive one passes it. Timers due on the way fire, as `clock.fastForward`
+ * fires them. Expects `page.clock.install()` before the app loaded.
+ */
+async function fastForwardToExpiry(page: Page, expiresAt: number, offsetMs: number): Promise<void> {
+  const now = await page.evaluate(() => Date.now());
+  const ms = expiresAt + offsetMs - now;
+  expect(ms, 'the clock only moves forward').toBeGreaterThan(0);
+  await page.clock.fastForward(ms);
+}
+
+test('Log out while Book is in flight reaches the search page, and the later 201 shows nowhere', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(116, 118);
+  const indicator = page.getByTestId('loading-indicator');
+  const inlineErrors = await watchInlineErrors(page);
+
+  const session = await test.step('register and log in', async () => {
+    // Recorded before "Book" is clicked, so the booking the released POST
+    // commits is cancelled after the test.
+    const guest = await apiSignIn(request, await registerAndLogIn(page));
+    cancelGuestBookingsAfterTest(page, guest);
+    return guest;
+  });
+
+  const post = await test.step('open a Seattle hotel, click Book and hold its POST', async () => {
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+    await openHotel(page, page.locator(VIEW_ROOMS).first());
+    const gate = await holdRequest(page, isBookingsCollection, 'POST');
+    await page.locator(`${BOOK_BUTTONS}:enabled`).first().click();
+    await gate.expectArrival('Book sends the POST');
+    await expect(indicator).toBeVisible();
+    await expectEveryBookDisabled(page);
+    return gate;
+  });
+
+  const visited = recordVisitedPaths(page);
+  const sent = recordApiRequests(page);
+
+  await test.step('Log out leaves for the search page at once, signed out', async () => {
+    await page.getByTestId('nav-logout').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Find a hotel');
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+
+  await test.step('release the POST: the API creates the booking', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await post.release();
+    expect((await created).status()).toBe(201);
+  });
+
+  await test.step('the 201 shows nowhere, navigates nowhere and stands on the server', async () => {
+    // The indicator falls only once the answer has been delivered, so the
+    // app has handled it by now.
+    await expect(indicator).toHaveCount(0);
+    await expect(page).toHaveURL(/\/search$/);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('booking-session-ended')).toHaveCount(0);
+    expect(visited, 'the paths the tab visited since Book').toEqual(['/search']);
+    // Leaving neither repeated the POST nor sent anything else.
+    expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+    expect(await inlineErrors.appearances()).toEqual([]);
+    expect(await confirmedBookingIds(request, session), "the guest's Confirmed bookings").toHaveLength(1);
+  });
+});
+
+test('a 201 answered after the session expired shows only the neutral notice and revalidates the stay', async ({ page, request }) => {
+  // Installed before the app loads, so the app's Date and timers run on a
+  // clock the test can move forward; until then it keeps pace with real time.
+  await page.clock.install();
+  const [checkIn, checkOut] = utcDates(144, 146);
+  const stay: Stay = { checkIn, checkOut, guests: 1 };
+  const indicator = page.getByTestId('loading-indicator');
+  const inlineErrors = await watchInlineErrors(page);
+
+  const expiresAt = await test.step('register and log in', async () => {
+    const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+    // Recorded before "Book" is clicked; the API session is the server's own,
+    // so the faked browser clock never expires it.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+    return expiry;
+  });
+
+  const { hotel, roomTypeId, url, shownCount } = await test.step('open a Seattle hotel', async () => {
+    await searchHotels(page, { city: 'Seattle', ...stay });
+    const opened = await openHotel(page, page.locator(VIEW_ROOMS).first());
+    const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+    expect(testId).toMatch(/^book-\d+$/);
+    const id = Number(testId.slice('book-'.length));
+    return { hotel: opened, roomTypeId: id, url: page.url(), shownCount: await readAvailableCount(page, id) };
+  });
+
+  const rooms = page.getByTestId('rooms-scroll');
+  const post = await test.step('ten seconds before the session expires, press Enter on Book and hold its POST', async () => {
+    await fastForwardToExpiry(page, expiresAt, -10_000);
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    const gate = await holdRequest(page, isBookingsCollection, 'POST');
+    // From the keyboard: the focused "Book" activated with Enter.
+    await page.getByTestId(`book-${roomTypeId}`).focus();
+    await page.keyboard.press('Enter');
+    await gate.expectArrival('Book sends the POST');
+    // Every "Book" is disabled while the POST is held, and the focus the
+    // pressed one lost went to the rooms region, not to the body.
+    await expectEveryBookDisabled(page);
+    await expect(rooms).toBeFocused();
+    return gate;
+  });
+
+  await test.step('the session expires while the POST is held', async () => {
+    // Five seconds past the expiry is still inside the POST's 30-second
+    // deadline, so the request is still pending.
+    await fastForwardToExpiry(page, expiresAt, 5_000);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    await expect(indicator).toBeVisible();
+    await expect(rooms).toBeFocused();
+  });
+
+  const visited = recordVisitedPaths(page);
+  const sent = recordApiRequests(page);
+
+  await test.step('release the POST: the API creates the booking', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await post.release();
+    expect((await created).status()).toBe(201);
+  });
+
+  await test.step('only the neutral notice shows, on the same stay, with its counts revalidated', async () => {
+    await expect(page.getByTestId('booking-session-ended')).toHaveText(SESSION_ENDED_MESSAGE);
+    // The notice renders as the 201 is settled, which starts the
+    // revalidation; with the indicator gone that has answered too.
+    await expect(indicator).toHaveCount(0);
+    await expect(page).toHaveURL(url);
+    expect(visited, 'the paths the tab visited since the expiry').toEqual([]);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toHaveText(hotel.name);
+    await expectNoInlineError(page);
+    expect(await inlineErrors.appearances()).toEqual([]);
+    await expect(page.getByTestId(`available-count-${roomTypeId}`)).toHaveText(String(shownCount - 1));
+    expect(await apiAvailableCount(request, hotel.id, stay, roomTypeId)).toBe(shownCount - 1);
+    expect(sent.map(describeStayRequest)).toEqual([
+      `GET /api/hotels/${hotel.id} checkIn=${checkIn} checkOut=${checkOut} guests=${stay.guests}`,
+    ]);
+    // Focus returns from the rooms region to the pressed "Book", as after a
+    // failed booking.
+    await expect(page.getByTestId(`book-${roomTypeId}`)).toBeFocused();
+  });
+});
+
+/**
+ * A "Book" pressed from the keyboard whose POST is held and then fails with
+ * no HTTP response, so the answer neither revalidates the stay nor leaves the
+ * pressed "Book" disabled: only where focus has been while the POST was held
+ * decides where it goes.
+ */
+interface HeldBookFocusCase {
+  /** Where focus ends up, for the test title. */
+  title: string;
+  /**
+   * Whether the guest moves focus off the rooms region and back while the
+   * POST is held, which makes the region the guest's own choice.
+   */
+  refocuses: boolean;
+}
+
+/** The held bookings, one test each. */
+const HELD_BOOK_FOCUS_CASES: readonly HeldBookFocusCase[] = [
+  { title: 'focus left on the rooms region returns to the pressed Book', refocuses: false },
+  { title: 'the rooms region the guest tabbed back to keeps focus', refocuses: true },
+];
+
+for (const c of HELD_BOOK_FOCUS_CASES) {
+  test(`a held Book that fails: ${c.title}`, async ({ page, request }) => {
+    const [checkIn, checkOut] = utcDates(119, 121);
+    const rooms = page.getByTestId('rooms-scroll');
+
+    await test.step('register and log in', async () => {
+      // Recorded before "Book" is pressed, so a booking a POST that slipped
+      // past the gate committed is cancelled after the test.
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, await registerAndLogIn(page)));
+    });
+
+    const book = await test.step('open a Seattle hotel', async () => {
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      await openHotel(page, page.locator(VIEW_ROOMS).first());
+      const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+      expect(testId).toMatch(/^book-\d+$/);
+      return page.getByTestId(testId);
+    });
+
+    const post = await test.step('press Enter on Book and hold its POST: the rooms region takes focus', async () => {
+      const gate = await holdRequest(page, isBookingsCollection, 'POST');
+      // From the keyboard: the focused "Book" activated with Enter.
+      await book.focus();
+      await page.keyboard.press('Enter');
+      await gate.expectArrival('Book sends the POST');
+      await expectEveryBookDisabled(page);
+      await expect(rooms).toBeFocused();
+      return gate;
+    });
+
+    if (c.refocuses) {
+      await test.step('Shift+Tab leaves the rooms region for Log out, and Tab brings focus back to it', async () => {
+        await page.keyboard.press('Shift+Tab');
+        await expect(page.getByTestId('nav-logout')).toBeFocused();
+        await page.keyboard.press('Tab');
+        await expect(rooms).toBeFocused();
+      });
+    }
+
+    await test.step('the POST fails with no response: the status-0 error shows and Book is enabled again', async () => {
+      // A network error: the request never reaches the API.
+      await post.abort();
+      await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(UNREACHABLE_TITLE);
+      await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+      // The render that re-enables "Book" is the one after which focus moves.
+      await expect(book).toBeEnabled();
+    });
+
+    if (c.refocuses) {
+      await test.step('focus stays on the rooms region the guest chose, not on Book', async () => {
+        await expect(rooms).toBeFocused();
+        await expect(book).not.toBeFocused();
+      });
+    } else {
+      await test.step('focus returns from the rooms region to the pressed Book', async () => {
+        await expect(book).toBeFocused();
+      });
+    }
+  });
+}
+
+test('a late-booking notice leaves with its link to My bookings when its session expires', async ({ page, request }) => {
+  // Installed before the app loads, as in the test above.
+  await page.clock.install();
+  // The booked stay starts on the shown stay's check-out day, so the 201
+  // starts no revalidation.
+  const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(160, 162, 162, 164);
+  const shown: Stay = { checkIn: shownIn, checkOut: shownOut, guests: 1 };
+  const booked: Stay = { checkIn: bookedIn, checkOut: bookedOut, guests: 2 };
+  const indicator = page.getByTestId('loading-indicator');
+
+  const expiresAt = await test.step('register and log in', async () => {
+    const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+    return expiry;
+  });
+  const pending = await bookThenReturnToShownStay(page, shown, booked);
+
+  await test.step('release the POST: the notice confirms the booking, with its link', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await pending.post.release();
+    expect((await created).status()).toBe(201);
+    await expect(page.getByTestId('late-booking-message')).toContainText('is confirmed.');
+    await expect(indicator).toHaveCount(0);
+    const link = page.getByTestId('late-booking-bookings');
+    await link.focus();
+    await expect(link).toBeFocused();
+  });
+
+  await test.step('at the expiry the notice and its link leave, and focus moves to the hotel heading', async () => {
+    await fastForwardToExpiry(page, expiresAt, 5_000);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('late-booking-bookings')).toHaveCount(0);
+    await expect(page.getByTestId('booking-session-ended')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toBeFocused();
+    await expect(page).toHaveURL(pending.url);
+    await expect(page.getByTestId('hotel-name')).toHaveText(pending.hotel.name);
+  });
+});
+
+/**
+ * Moves the page's faked wall clock to `offsetMs` past the session's
+ * `expiresAt` without firing a timer: `clock.setSystemTime` changes only what
+ * `Date` reads, and timers keep their own schedule, so the session's expiry
+ * timer stays pending, as a throttled tab's or a sleeping device's would.
+ * Expects `page.clock.install()` before the app loaded.
+ */
+async function passExpiryWithoutTimers(page: Page, expiresAt: number, offsetMs: number): Promise<void> {
+  await page.clock.setSystemTime(expiresAt + offsetMs);
+  expect(await page.evaluate(() => Date.now()), 'the page clock reads past the expiry').toBeGreaterThan(expiresAt);
+}
+
+/**
+ * How the guest activates a late-booking notice's "View it in My bookings"
+ * once its session has expired with the expiry timer not yet fired. Either
+ * way the click reaches the link's own handler first, as the app checks the
+ * expiry after a click only on the next task.
+ */
+interface ExpiredLinkCase {
+  /** The activation, for the test title. */
+  title: string;
+  /** Days from today of the shown check-in and check-out, then of the booked ones. */
+  offsets: readonly [number, number, number, number];
+  /** Activates the link. */
+  activate(link: Locator): Promise<void>;
+}
+
+/** The activations, one test each. The booked stays start on the shown check-out day, so no 201 revalidates. */
+const EXPIRED_LINK_CASES: readonly ExpiredLinkCase[] = [
+  // A real mouse press and release on the link, then its click.
+  { title: 'a pointer click', offsets: [166, 168, 168, 170], activate: (link) => link.click() },
+  // A click event alone, with no press before it, as assistive technology can send.
+  { title: 'a click no press precedes', offsets: [172, 174, 174, 176], activate: (link) => link.dispatchEvent('click') },
+];
+
+for (const c of EXPIRED_LINK_CASES) {
+  test(`${c.title} on a late-booking link after an undelivered expiry hands over no booking`, async ({ page, request }) => {
+    // Installed before the app loads, as in the expiry tests above.
+    await page.clock.install();
+    const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(...c.offsets);
+    const shown: Stay = { checkIn: shownIn, checkOut: shownOut, guests: 1 };
+    const booked: Stay = { checkIn: bookedIn, checkOut: bookedOut, guests: 2 };
+    const indicator = page.getByTestId('loading-indicator');
+    const link = page.getByTestId('late-booking-bookings');
+
+    const expiresAt = await test.step('register and log in', async () => {
+      const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+      return expiry;
+    });
+    const pending = await bookThenReturnToShownStay(page, shown, booked);
+
+    await test.step('release the POST: the notice confirms the booking, with its link', async () => {
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await pending.post.release();
+      expect((await created).status()).toBe(201);
+      await expect(page.getByTestId('late-booking-message')).toContainText('is confirmed.');
+      await expect(indicator).toHaveCount(0);
+      await expect(link).toHaveAttribute('href', '/bookings');
+    });
+
+    await test.step('the clock passes the expiry while its timer stays pending: the notice still shows', async () => {
+      await passExpiryWithoutTimers(page, expiresAt, 5_000);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+      await expect(link).toBeVisible();
+    });
+
+    const visited = recordVisitedPaths(page);
+    const sent = recordApiRequests(page);
+
+    await test.step(`${c.title} signs the guest out and opens no confirmation`, async () => {
+      await c.activate(link);
+      // The link asks My bookings with no state, which the guard sends to log
+      // in; the booking reaches no page.
+      await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      await expect(page.getByTestId('late-booking')).toHaveCount(0);
+      expect(visited, 'the paths the tab visited since the expiry').toEqual(['/login']);
+      await expect(page.getByTestId('booking-confirmation')).toHaveCount(0);
+      expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+    });
+  });
+}
+
+test('duplicate registration shows an inline 409', async ({ page }) => {
+  const { email } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('register the same email again', async () => {
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL(/\/register$/);
+
+    // The API folds the email to lower case before comparing, so the same
+    // address in other letter case is still a duplicate.
+    await fillBound(page, 'register-email', email.replace(/^[^@]+/, (local) => local.toUpperCase()));
+    // A different valid password: the email alone makes the account a duplicate.
+    await fillBound(page, 'register-password', uniquePassword());
+    await fillBound(page, 'register-full-name', 'States Guest');
+    // Any other failing status with the same problem body shows the same
+    // message through its `detail`, so only the response itself proves the
+    // API answered 409. The method filter keeps a CORS preflight from matching.
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    const submit = page.getByTestId('register-submit');
+    const gate = await holdRequest(page, isRegisterApi, 'POST');
+    await submit.click();
+    await gate.expectArrival('Create account sends the POST');
+    // While the POST is held the button is disabled, and the focus it lost
+    // went to the page heading, not to the body.
+    await expect(submit).toBeDisabled();
+    await expect(page.getByRole('heading', { level: 1, name: 'Register' })).toBeFocused();
+    await gate.release();
+    expect((await registration).status()).toBe(409);
+  });
+
+  await test.step('stay on the register page with the 409 inline', async () => {
+    await expect(page.getByTestId('inline-error')).toContainText(
+      'An account with this email already exists.',
+    );
+    await expect(page).toHaveURL(/\/register$/);
+    // Focus that the heading held while the button was disabled returns to it.
+    await expect(page.getByTestId('register-submit')).toBeFocused();
+  });
+});
+
+test('wrong password shows an inline 401', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('log in with a wrong password', async () => {
+    await fillBound(page, 'login-email', email);
+    // One character longer than the guest's own password, so never equal to it.
+    await fillBound(page, 'login-password', `${password}x`);
+    // As for registration, the inline text alone cannot tell a 401 from
+    // another failing status with the same problem body.
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('login-submit').click();
+    expect((await login).status()).toBe(401);
+  });
+
+  await test.step('stay on the login page with the 401 inline, signed out', async () => {
+    await expect(page.getByTestId('inline-error')).toContainText('Email or password is incorrect.');
+    await expect(page).toHaveURL(/\/login(?:\?|$)/);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    // Focus that the heading held while the button was disabled returns to it.
+    await expect(page.getByTestId('login-submit')).toBeFocused();
+  });
+
+  await test.step('a resubmit keeps the error until its own 401 shows it in a new alert', async () => {
+    const shown = await page.getByRole('alert').elementHandle();
+    expect(shown).not.toBeNull();
+    // Records every layout shift from here on, including any frame painted
+    // between the old alert's removal and the new one's insertion.
+    await page.evaluate(() => {
+      const shifts: number[] = [];
+      const observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          shifts.push((entry as unknown as { value: number }).value);
+        }
+      });
+      observer.observe({ type: 'layout-shift' });
+      (window as unknown as Record<string, unknown>)['__resubmitShifts'] = (): number[] => {
+        for (const entry of observer.takeRecords()) {
+          shifts.push((entry as unknown as { value: number }).value);
+        }
+        return shifts;
+      };
+    });
+
+    // Holding the answer back keeps the second attempt pending.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(isLoginApi, async (route) => {
+      await held;
+      await route.continue();
+    });
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('login-submit').click();
+    await expect(page.getByTestId('login-submit')).toBeDisabled();
+    // The focus the disabled button lost went to the page heading, not to the body.
+    await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
+    await expect(page.getByTestId('inline-error')).toContainText('Email or password is incorrect.');
+
+    release();
+    expect((await login).status()).toBe(401);
+    // Focus returns from the heading to the button.
+    await expect(page.getByTestId('login-submit')).toBeFocused();
+    await expect(page.getByRole('alert')).toContainText('Email or password is incorrect.');
+    // A new alert region, so assistive technology announces the repeated error.
+    expect(await shown?.evaluate((element) => element.isConnected)).toBe(false);
+    // Two more frames, so the frames around the answer have been painted.
+    const shifts = await page.evaluate(
+      () =>
+        new Promise<number[]>((resolve) => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() =>
+              resolve(((window as unknown as Record<string, unknown>)['__resubmitShifts'] as () => number[])()),
+            ),
+          );
+        }),
+    );
+    expect(shifts, 'layout shifts from the pending resubmit to its answer').toEqual([]);
+  });
+});
+
+test('a register field error ends once the guest edits that field', async ({ page }) => {
+  await page.goto('/register');
+
+  await test.step('register with a password the server rejects', async () => {
+    await fillBound(page, 'register-email', uniqueEmail());
+    // Seven characters: the server's rule is 8 to 128.
+    await fillBound(page, 'register-password', 'short12');
+    await fillBound(page, 'register-full-name', 'States Guest');
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('register-submit').click();
+    expect((await registration).status()).toBe(400);
+  });
+
+  const password = page.getByTestId('register-password');
+  await test.step('the password is marked invalid and takes focus', async () => {
+    // The field error names its field by the visible label, never by the API's key.
+    await expect(page.getByTestId('inline-error')).toContainText('Password: The value must be 8 to 128 characters long.');
+    await expect(password).toHaveAttribute('aria-invalid', 'true');
+    await expect(password).toHaveAttribute('aria-describedby', /\S/);
+    // Focus moves from the disabled submit button to the field the error marks.
+    await expect(password).toBeFocused();
+  });
+
+  await test.step('editing the password ends its error', async () => {
+    await fillBound(page, 'register-password', uniquePassword());
+    await expect(password).not.toHaveAttribute('aria-invalid');
+    await expect(password).not.toHaveAttribute('aria-describedby');
+    // It was the only field the server rejected, so the whole error is gone.
+    await expect(page.getByTestId('inline-error')).toHaveCount(0);
+    await expect(page).toHaveURL('/register');
+  });
+});
+
+test('registering and logging in move focus to the next page heading', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('the login page heading takes focus', async () => {
+    await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
+  });
+
+  await test.step('after logging in, the search page heading takes focus', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeFocused();
+  });
+});
+
+test('Book while signed out moves focus to the login heading, and a reload of that page leaves focus alone', async ({ page }) => {
+  await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  const heading = page.getByRole('heading', { level: 1, name: 'Log in' });
+  await test.step('the login heading takes focus', async () => {
+    await expect(heading).toBeFocused();
+  });
+
+  await test.step('a reload opens the login page as the first page of the app, with focus left on the body', async () => {
+    await page.reload();
+    await expect(heading).toBeVisible();
+    await expect(heading).not.toBeFocused();
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
+  });
+});
+
+test('a fresh load of My bookings while signed out lands on the login page with focus on the login heading', async ({
+  page,
+}) => {
+  // The guard's redirect ends the app's first navigation, before any
+  // navigation has succeeded.
+  await page.goto('/bookings');
+
+  await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
+  await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
+});
+
+/** How a link within the app opens the register page, and where focus must then be. */
+interface RegisterEntryCase {
+  /** The link and its activation, for the test title. */
+  title: string;
+  /** The page the guest starts on, the app's first. */
+  from: string;
+  /** The test hook of the link that opens the register page. */
+  link: string;
+  /** Activates the link. */
+  activate(link: Locator): Promise<void>;
+  /**
+   * Whether the link stays on screen after the navigation, as the nav bar's
+   * does, and so keeps focus; otherwise it leaves with its page and the
+   * register heading takes focus.
+   */
+  survives: boolean;
+}
+
+/**
+ * The entries, one test each. `press` focuses the link before it presses
+ * Enter, as a guest who tabbed to it does.
+ */
+const REGISTER_ENTRY_CASES: readonly RegisterEntryCase[] = [
+  {
+    title: '"Create an account" by Enter',
+    from: '/login',
+    link: 'register-link',
+    activate: (link) => link.press('Enter'),
+    survives: false,
+  },
+  {
+    title: '"Create an account" by a pointer click',
+    from: '/login',
+    link: 'register-link',
+    activate: (link) => link.click(),
+    survives: false,
+  },
+  {
+    title: 'nav "Register" by Enter',
+    from: '/search',
+    link: 'nav-register',
+    activate: (link) => link.press('Enter'),
+    survives: true,
+  },
+  {
+    title: 'nav "Register" by a pointer click',
+    from: '/search',
+    link: 'nav-register',
+    activate: (link) => link.click(),
+    survives: true,
+  },
+];
+
+for (const c of REGISTER_ENTRY_CASES) {
+  test(`${c.title} opens the register page with focus on ${c.survives ? 'the link, which stays' : 'its heading'}`, async ({
+    page,
+  }) => {
+    await page.goto(c.from);
+    const link = page.getByTestId(c.link);
+    const heading = page.getByRole('heading', { level: 1, name: 'Register' });
+
+    await test.step(`activate ${c.title}`, async () => {
+      await c.activate(link);
+      await expect(page).toHaveURL('/register');
+      // The render that shows the heading is the one that would move focus.
+      await expect(heading).toBeVisible();
+    });
+
+    if (c.survives) {
+      await test.step('the link keeps focus', async () => {
+        await expect(link).toBeFocused();
+        await expect(heading).not.toBeFocused();
+      });
+    } else {
+      await test.step('the link left with the login page, and the register heading takes focus', async () => {
+        await expect(link).toHaveCount(0);
+        await expect(heading).toBeFocused();
+      });
+    }
+  });
+}
+
+test('a reload of the register page leaves focus on the body', async ({ page }) => {
+  await page.goto('/login');
+  const heading = page.getByRole('heading', { level: 1, name: 'Register' });
+
+  await test.step('"Create an account" opens the register page with focus on its heading', async () => {
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await expect(heading).toBeFocused();
+  });
+
+  await test.step('a reload opens the register page as the first page of the app, with focus left on the body', async () => {
+    await page.reload();
+    await expect(heading).toBeVisible();
+    await expect(heading).not.toBeFocused();
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
+  });
+});
+
+/**
+ * Records every uncaught exception, and every error the app reports to the
+ * console, such as Angular's report of a promise rejection nothing handled,
+ * except the browser's own "Failed to load resource" line for a request that
+ * `expectedFailure` matches. Only fixed labels are kept, an exception's error
+ * type or "console error", so no browser error text, which can carry URLs,
+ * tokens or email addresses, reaches the test output.
+ */
+function recordReportedErrors(page: Page, expectedFailure: (url: URL) => boolean): string[] {
+  const reported: string[] = [];
+  page.on('pageerror', (error) => {
+    reported.push(`uncaught ${error.name}`);
+  });
+  page.on('console', (message) => {
+    const source = new URL(message.location().url || 'about:blank');
+    if (
+      message.type() !== 'error' ||
+      (message.text().startsWith('Failed to load resource:') && expectedFailure(source))
+    ) {
+      return;
+    }
+    reported.push('console error');
+  });
+  return reported;
+}
+
+/** One of the web app's lazily loaded code chunks, served from the web origin's root. */
+const isCodeChunk = (url: URL): boolean => /^\/chunk-[^/]+\.js$/.test(url.pathname);
+
+test('a login whose next page fails to load stays on the login page, signed in, with an inline error', async ({ page, request }) => {
+  const { email, password } = await test.step('register a guest through the API', () => apiRegisterGuest(request));
+  const reported = recordReportedErrors(page, isCodeChunk);
+
+  await test.step('open the login page returning to My bookings, whose code is not loaded yet', async () => {
+    await page.goto('/login?returnUrl=%2Fbookings');
+    await expect(page.getByTestId('login-submit')).toBeVisible();
+  });
+
+  await test.step('fail every code chunk requested once the login has answered', async () => {
+    // The flag is set inside the login's own route, before its answer reaches
+    // the page, so the My bookings chunk that the answer leads to always
+    // fails; a response listener would race the router's chunk request.
+    let answered = false;
+    await page.route(isCodeChunk, (route) => (answered ? route.abort() : route.continue()));
+    await page.route(isLoginApi, async (route) => {
+      const response = await route.fetch();
+      if (route.request().method() === 'POST') {
+        answered = true;
+      }
+      await route.fulfill({ response });
+    });
+  });
+
+  await test.step('log in: the nav bar shows the signed-in guest', () => logIn(page, email, password));
+
+  await test.step('stay on the login page with the error inline and focus back on Log in', async () => {
+    await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(
+      'You are logged in, but the next page could not be opened. Reload the page and log in again.',
+    );
+    await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
+    // Focus that the heading held while the button was disabled returns to it.
+    await expect(page.getByTestId('login-submit')).toBeFocused();
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+
+  await test.step('as the error says, a reload, which signs the guest out, and a new login open My bookings', async () => {
+    await page.unroute(isCodeChunk);
+    await page.reload();
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/bookings');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+  });
+});
+
+test('a registration whose login page cannot be opened stays on the register page with an inline error and hands over no email', async ({
+  page,
+}) => {
+  const reported = recordReportedErrors(page, () => false);
+  await page.goto('/register');
+
+  await test.step('make the history update of the navigation to the login page throw', async () => {
+    // The register page's own code already holds most of the login page's,
+    // so whether the login route still has a chunk left to fail is a detail
+    // of the bundle. A throwing history update fails that navigation whatever
+    // the bundle: the router writes `/login?registered=1` with `pushState`
+    // just before it activates the login page, as Safari refuses when a page
+    // updates history too often, and then rejects the navigation's promise.
+    await page.evaluate(() => {
+      const pushState = History.prototype.pushState;
+      (window as unknown as Record<string, unknown>)['__originalPushState'] = pushState;
+      History.prototype.pushState = function (
+        this: History,
+        data: unknown,
+        unused: string,
+        url?: string | URL | null,
+      ): void {
+        if (String(url ?? '').includes('registered=1')) {
+          throw new DOMException('History updates are throttled.', 'SecurityError');
+        }
+        pushState.call(this, data, unused, url);
+      };
+    });
+  });
+
+  await test.step('register a new guest', async () => {
+    await fillBound(page, 'register-email', uniqueEmail());
+    await fillBound(page, 'register-password', uniquePassword());
+    await fillBound(page, 'register-full-name', 'States Guest');
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('register-submit').click();
+    expect((await registration).status()).toBe(201);
+  });
+
+  await test.step('stay on the register page with the error inline and focus back on Create account', async () => {
+    await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(
+      'Your account was created, but the login page could not be opened. Reload the page, then log in.',
+    );
+    await expect(page).toHaveURL('/register');
+    // Focus that the heading held while the button was disabled returns to it.
+    await expect(page.getByTestId('register-submit')).toBeFocused();
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+
+  await test.step('a later /login?registered=1 in the app pre-fills no email', async () => {
+    // No link leads to /login?registered=1, so a history entry and the
+    // popstate event that Forward to it would bring open it within the app,
+    // where the email hand-off lives.
+    await page.evaluate(() => {
+      History.prototype.pushState = (window as unknown as Record<string, unknown>)[
+        '__originalPushState'
+      ] as History['pushState'];
+      history.pushState(null, '', '/login?registered=1');
+      window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    });
+    await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
+    await expect(page).toHaveURL('/login?registered=1');
+    await expectControlValue(page, 'login-email', '');
+  });
+});
+
+/** What {@link failChunksOnceBooked} reports of the booking it lets through and the code it holds. */
+interface BookedChunkFailure {
+  /** The id the POST's 201 carried, or 0 before it has answered. */
+  bookingId(): number;
+  /**
+   * Waits until the page has requested a code chunk since the POST answered,
+   * which the route holds. When none comes, it fails within the expect
+   * timeout under `message`.
+   */
+  expectHeldChunk(message: string): Promise<void>;
+  /** Fails every held code chunk, and every later one, as a network error. */
+  failChunks(): void;
+}
+
+/**
+ * From now on, passes the page's `POST /api/bookings` on to the API and, once
+ * it has answered, holds every code chunk the page requests until
+ * {@link BookedChunkFailure.failChunks}, which fails them as network errors,
+ * as when the tab went offline once the server committed the booking. The
+ * flag is set inside the POST's own route, before its answer reaches the
+ * page, so the My bookings chunk that the answer leads to never loads; a
+ * response listener would race the router's chunk request.
+ */
+async function failChunksOnceBooked(page: Page): Promise<BookedChunkFailure> {
+  let bookingId = 0;
+  let answered = false;
+  let held = false;
+  let release = (): void => undefined;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(isCodeChunk, async (route) => {
+    if (!answered) {
+      await route.continue();
+      return;
+    }
+    held = true;
+    await released;
+    await route.abort();
+  });
+  await page.route(isBookingsCollection, async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body: unknown = await response.json();
+    bookingId = isRecord(body) && typeof body['id'] === 'number' ? body['id'] : 0;
+    answered = true;
+    await route.fulfill({ response });
+  });
+  return {
+    bookingId: () => bookingId,
+    async expectHeldChunk(message) {
+      await expect.poll(() => held, { message }).toBe(true);
+    },
+    failChunks: () => release(),
+  };
+}
+
+/**
+ * How the revalidation after a 201 whose My bookings page failed to load is
+ * answered: by the API, or not at all, as when the tab is offline.
+ */
+interface UnopenedConfirmationCase {
+  /** The revalidation's outcome, for the test title. */
+  title: string;
+  /** Whether the revalidation `GET` fails as a network error. */
+  revalidationFails: boolean;
+  /** Days from today of check-in and check-out, for one {@link utcDates} call. */
+  offsets: readonly [number, number];
+}
+
+/** The revalidations of the unopened-confirmation test, one test each. */
+const UNOPENED_CONFIRMATION_CASES: readonly UnopenedConfirmationCase[] = [
+  { title: 'and the fresh count', revalidationFails: false, offsets: [160, 162] },
+  {
+    title: 'through a failed revalidation, whose Retry restores the table',
+    revalidationFails: true,
+    offsets: [165, 167],
+  },
+];
+
+for (const c of UNOPENED_CONFIRMATION_CASES) {
+  test(`a 201 whose My bookings page fails to load keeps the confirmed booking on the hotel page ${c.title}`, async ({
+    page,
+    request,
+  }) => {
+    const [checkIn, checkOut] = utcDates(...c.offsets);
+    const stay: Stay = { checkIn, checkOut, guests: 1 };
+    const indicator = page.getByTestId('loading-indicator');
+    const notice = page.getByTestId('late-booking');
+    const link = page.getByTestId('late-booking-bookings');
+
+    const guest = await test.step('register and log in', async () => {
+      const credentials = await registerAndLogIn(page);
+      // Recorded before "Book" is clicked, so the booking it makes is
+      // cancelled after the test whatever the test reads of its answer.
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, credentials));
+      return credentials;
+    });
+    const hotelId = await test.step('search Seattle for the stay', () =>
+      searchFirstHotelId(page, { city: 'Seattle', ...stay }),
+    );
+
+    const shown = await test.step('open the hotel and pick an enabled Book', async () => {
+      const hotel = await openHotel(page, page.getByTestId(`view-rooms-${hotelId}`));
+      const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+      expect(testId).toMatch(/^book-\d+$/);
+      const id = Number(testId.slice('book-'.length));
+      const name = (await page.getByTestId(`room-type-row-${id}`).locator('td').first().innerText()).trim();
+      const count = await readAvailableCount(page, id);
+      expect(count, 'the room type has a room to book and one more left').toBeGreaterThanOrEqual(2);
+      return { hotel, roomType: { id, name }, count, url: page.url() };
+    });
+    const book = page.getByTestId(`book-${shown.roomType.id}`);
+    const count = page.getByTestId(`available-count-${shown.roomType.id}`);
+    const detailPath = `/api/hotels/${hotelId}`;
+    const reported = recordReportedErrors(
+      page,
+      (url) => isCodeChunk(url) || (c.revalidationFails && isApiEndpoint(url, `/hotels/${hotelId}`)),
+    );
+
+    const { chunks, revalidation } = await test.step('hold the code chunks requested once the POST has answered', async () => {
+      const failure = await failChunksOnceBooked(page);
+      // Held too, so every "Book" can be seen to stay disabled until it answers.
+      const gate = await holdRequest(page, (url) => isApiEndpoint(url, `/hotels/${hotelId}`), 'GET');
+      return { chunks: failure, revalidation: gate };
+    });
+    const sent = recordApiRequests(page);
+
+    await test.step('click Book: the API creates the booking, and every Book stays disabled while My bookings loads', async () => {
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await book.click();
+      expect((await created).status(), 'Book answers 201').toBe(201);
+      expect(chunks.bookingId(), 'the 201 carries the booking id').toBeGreaterThan(0);
+      await chunks.expectHeldChunk('the 201 starts loading My bookings');
+      await expectEveryBookDisabled(page);
+      await expect(notice).toHaveCount(0);
+    });
+
+    await test.step('My bookings fails to load: the page stays with a notice', async () => {
+      chunks.failChunks();
+      await expect(notice).toBeVisible();
+      await expect(page.getByTestId('late-booking-message')).toHaveText(
+        `Your booking of ${shown.roomType.name} at ${shown.hotel.name} ` +
+          `from ${displayDate(checkIn)} to ${displayDate(checkOut)} ` +
+          'is confirmed. No payment is taken online in this version.',
+      );
+      await expect(link).toHaveText('View it in My bookings');
+      await expect(page).toHaveURL(shown.url);
+    });
+
+    await test.step('every Book stays disabled while the revalidation is pending', async () => {
+      await revalidation.expectArrival('the unopened confirmation revalidates the stay');
+      await expect(indicator).toBeVisible();
+      await expectEveryBookDisabled(page);
+      await expect(count).toHaveText(String(shown.count));
+    });
+
+    if (c.revalidationFails) {
+      await test.step('the failed revalidation shows in place of the table with Retry, and the notice stays', async () => {
+        await revalidation.abort();
+        await expect(page.getByTestId('load-error-heading')).toBeVisible();
+        await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(UNREACHABLE_TITLE);
+        await expect(page.getByTestId('rooms-scroll')).toHaveCount(0);
+        await expect(notice).toBeVisible();
+        await expect(link).toBeFocused();
+      });
+
+      await test.step('Retry reads the stay again: the table returns with the fresh count, beside the notice', async () => {
+        const reread = page.waitForResponse((r) => isApiEndpoint(r.url(), `/hotels/${hotelId}`) && r.request().method() === 'GET');
+        await page.getByTestId('load-retry').click();
+        expect((await reread).status()).toBe(200);
+        await expect(count).toHaveText(String(shown.count - 1));
+        await expect(book).toBeEnabled();
+        await expect(notice).toBeVisible();
+        await expect(page.getByTestId('late-booking-message')).toContainText('is confirmed.');
+        await expect(page.getByTestId('hotel-name')).toBeFocused();
+        await expectNoInlineError(page);
+      });
+    } else {
+      await test.step('the fresh count arrives: one room fewer, Book enabled again, focus on the link', async () => {
+        const reread = page.waitForResponse((r) => isApiEndpoint(r.url(), `/hotels/${hotelId}`) && r.request().method() === 'GET');
+        await revalidation.release();
+        expect((await reread).status()).toBe(200);
+        await expect(count).toHaveText(String(shown.count - 1));
+        await expect(book).toBeEnabled();
+        await expect(link).toBeFocused();
+        await expectNoInlineError(page);
+      });
+    }
+
+    await test.step('one POST was sent, the URL is unchanged and nothing was reported', async () => {
+      await expect(indicator).toHaveCount(0);
+      await expect(page).toHaveURL(shown.url);
+      // Every API request since the page showed the hotel: the one POST, the
+      // revalidation, and the retry when the revalidation failed.
+      const read = `GET ${detailPath} checkIn=${checkIn} checkOut=${checkOut} guests=1`;
+      expect(sent.map((r) => (r.method === 'POST' ? `POST ${apiRelativeTarget(r.url)}` : describeStayRequest(r)))).toEqual(
+        c.revalidationFails ? ['POST /api/bookings', read, read] : ['POST /api/bookings', read],
+      );
+      expect(await apiAvailableCount(request, String(hotelId), stay, shown.roomType.id)).toBe(shown.count - 1);
+      expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+    });
+
+    await test.step('with the code back, the link still cannot open My bookings: the notice says to reload', async () => {
+      // The browser keeps failing the module it could not load, so the
+      // router's second attempt fails without a request, and the notice
+      // shows how to reach the booking.
+      await page.unroute(isCodeChunk);
+      await link.click();
+      await expect(notice.getByTestId('inline-error').getByRole('alert')).toHaveText(
+        'My bookings could not be opened. Reload the page, log in again and open My bookings to see this booking.',
+      );
+      await expect(notice).toBeVisible();
+      await expect(link).toBeVisible();
+      await expect(page).toHaveURL(shown.url);
+      expect(sent.filter((r) => r.method === 'POST')).toHaveLength(1);
+      expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+    });
+
+    await test.step('as the notice says, a reload, a new login and My bookings show the booking', async () => {
+      await page.reload();
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await page.getByTestId('nav-login').click();
+      await logIn(page, guest.email, guest.password);
+      await page.getByTestId('nav-bookings').click();
+      await expect(page).toHaveURL('/bookings');
+      await expect(page.getByTestId(`booking-status-${chunks.bookingId()}`)).toHaveText('Confirmed');
+    });
+  });
+}
+
+test('a 201 whose My bookings page fails to load once the session expired shows only the neutral notice', async ({
+  page,
+  request,
+}) => {
+  // Installed before the app loads, so the app's Date and timers run on a
+  // clock the test can move forward; until then it keeps pace with real time.
+  await page.clock.install();
+  const [checkIn, checkOut] = utcDates(175, 177);
+  const stay: Stay = { checkIn, checkOut, guests: 1 };
+  const indicator = page.getByTestId('loading-indicator');
+  const reported = recordReportedErrors(page, isCodeChunk);
+
+  const expiresAt = await test.step('register and log in', async () => {
+    const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+    // Recorded before "Book" is clicked; the API session is the server's own,
+    // so the faked browser clock never expires it.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+    return expiry;
+  });
+
+  const { hotel, roomTypeId, url, shownCount } = await test.step('open a Seattle hotel', async () => {
+    await searchHotels(page, { city: 'Seattle', ...stay });
+    const opened = await openHotel(page, page.locator(VIEW_ROOMS).first());
+    const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+    expect(testId).toMatch(/^book-\d+$/);
+    const id = Number(testId.slice('book-'.length));
+    return { hotel: opened, roomTypeId: id, url: page.url(), shownCount: await readAvailableCount(page, id) };
+  });
+
+  const chunks = await failChunksOnceBooked(page);
+  const sent = recordApiRequests(page);
+
+  await test.step('ten seconds before the session expires, Book is answered 201 and My bookings starts loading', async () => {
+    await fastForwardToExpiry(page, expiresAt, -10_000);
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId(`book-${roomTypeId}`).click();
+    expect((await created).status(), 'Book answers 201').toBe(201);
+    await chunks.expectHeldChunk('the 201 starts loading My bookings');
+    await expectEveryBookDisabled(page);
+  });
+
+  await test.step('the session expires while My bookings loads, which then fails', async () => {
+    await fastForwardToExpiry(page, expiresAt, 5_000);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    chunks.failChunks();
+  });
+
+  await test.step('only the neutral notice shows, on the same stay, with its counts revalidated', async () => {
+    await expect(page.getByTestId('booking-session-ended')).toHaveText(SESSION_ENDED_MESSAGE);
+    await expect(indicator).toHaveCount(0);
+    await expect(page).toHaveURL(url);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toHaveText(hotel.name);
+    await expectNoInlineError(page);
+    await expect(page.getByTestId(`available-count-${roomTypeId}`)).toHaveText(String(shownCount - 1));
+    expect(sent.map((r) => (r.method === 'POST' ? `POST ${apiRelativeTarget(r.url)}` : describeStayRequest(r)))).toEqual([
+      'POST /api/bookings',
+      `GET /api/hotels/${hotel.id} checkIn=${checkIn} checkOut=${checkOut} guests=${stay.guests}`,
+    ]);
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+});
+
+test('a guest sent from Book to log in who registers first returns to the hotel', async ({ page }) => {
+  const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  const email = uniqueEmail();
+  const password = uniquePassword();
+  await test.step('create an account from the login page', async () => {
+    await page.getByTestId('register-link').click();
+    // The return URL travels in router state, never in the register URL.
+    await expect(page).toHaveURL('/register');
+    await registerGuest(page, { email, password, fullName: 'States Guest' });
+    await expect(page).toHaveURL('/login?registered=1');
+  });
+
+  await test.step('log in and land on the hotel', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    // The heading renders only once the hotel's details load, and takes focus then.
+    await expect(page.getByTestId('hotel-name')).toBeFocused();
+  });
+
+  await test.step('Back to the earlier login entry moves on to the hotel without the form', async () => {
+    // The history ends …, hotel, login with returnUrl, register, hotel: the
+    // login made the last entry replace /login?registered=1.
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await page.goBack();
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+test('a signed-in guest who registers again from Back gets the new account hand-off', async ({ page }) => {
+  const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  const first: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
+  await test.step('create an account from the login page and log in', async () => {
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await registerGuest(page, { ...first, fullName: 'States Guest' });
+    await logIn(page, first.email, first.password);
+    await expect(page).toHaveURL(hotelPath);
+  });
+
+  const second: GuestCredentials = { email: uniqueEmail(), password: uniquePassword() };
+  await test.step('go Back to the register page and create a second account', async () => {
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await registerGuest(page, { ...second, fullName: 'Second Guest' });
+  });
+
+  await test.step('the login page shows the notice and the new email, not a redirect', async () => {
+    await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
+    await expectControlValue(page, 'login-email', second.email);
+    await expect(page).toHaveURL('/login?registered=1');
+  });
+
+  await test.step('logging in as the new account still returns to the hotel', async () => {
+    await logIn(page, second.email, second.password);
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+  });
+});
+
+test('Back to a used /login?registered=1 entry while signed in moves on without the form', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('leave the hand-off unused, then log in from the plain login page', async () => {
+    await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await page.getByTestId('login-link').click();
+    await expect(page).toHaveURL('/login');
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+  });
+
+  await test.step('Back twice reaches /login?registered=1, which has no email waiting and moves on', async () => {
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await page.goBack();
+    await expect(page).toHaveURL('/search');
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+test('Back after logging in from a Book redirect does not show the login form', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+  const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  await test.step('log in and land on the hotel', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    // The heading renders only once the hotel's details load, and takes focus then.
+    await expect(page.getByTestId('hotel-name')).toBeFocused();
+  });
+
+  await test.step('Back returns to the hotel entry before the login', async () => {
+    // The login replaced its own entry, so one step back is the hotel page
+    // that sent the guest to log in.
+    await page.goBack();
+    await expect(page).toHaveURL(hotelPath);
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+for (const returnUrl of REFUSED_RETURN_URLS) {
+  // Quoted as a JSON string, so the tab and the backslash read plainly in the title.
+  test(`logging in with the refused return URL ${JSON.stringify(returnUrl)} lands on the search page`, async ({
+    page,
+  }) => {
+    const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+    await test.step('log in from a login URL carrying the refused return URL', async () => {
+      await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+      await logIn(page, email, password);
+      await expect(page).toHaveURL('/search');
+      await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeVisible();
+      await expect(page.getByTestId('login-submit')).toHaveCount(0);
+    });
+  });
+}
+
+test('logging in with a return URL whose query holds encoded values lands there with the query intact', async ({
+  page,
+}) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+  // An encoded space, a non-ASCII letter and an encoded `/` and `\`: in a
+  // query value they are data, which the login page keeps as given.
+  const city = 'São Paulo/\\';
+  const [checkIn, checkOut] = utcDates(30, 32);
+  const returnUrl = `/search?city=${encodeURIComponent(city)}&checkIn=${checkIn}&checkOut=${checkOut}&guests=1`;
+
+  await test.step('log in from a login URL carrying that return URL', async () => {
+    await page.goto(`/login?returnUrl=${encodeURIComponent(returnUrl)}`);
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(returnUrl);
+    expect(new URL(page.url()).searchParams.get('city')).toBe(city);
+  });
+
+  await test.step('the search runs for the decoded city and shows it in the form', async () => {
+    await expect(page.getByTestId('search-empty')).toHaveText(
+      `No hotels with available rooms in ${city} for these dates.`,
+    );
+    await expectControlValue(page, 'search-city', city);
+  });
+});
+
+test('Back to a login entry whose return URL is the login page moves on to search', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('open a login URL returning to login, then log in from the nav link', async () => {
+    await page.goto(`/login?returnUrl=${encodeURIComponent('/login')}`);
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await page.getByTestId('nav-login').click();
+    await expect(page).toHaveURL('/login');
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+  });
+
+  await test.step('Back twice reaches the old login entry, which shows search, not a blank page', async () => {
+    await page.goBack();
+    await expect(page).toHaveURL('/register');
+    await page.goBack();
+    await expect(page).toHaveURL('/search');
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeVisible();
+    await expect(page.getByTestId('login-submit')).toHaveCount(0);
+  });
+});
+
+test('after a signed-out reload of My bookings, logging in returns there and Back never shows the login form', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  await test.step('log in and open My bookings', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/search');
+    await page.getByTestId('nav-bookings').click();
+    await expect(page).toHaveURL('/bookings');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+  });
+
+  const entries = await test.step('the reload starts signed out and the guard sends it to log in', async () => {
+    await page.reload();
+    await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
+    await expect(page.getByTestId('login-submit')).toBeVisible();
+    return page.evaluate(() => history.length);
+  });
+
+  await test.step('logging in returns to My bookings in place of the login entry', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/bookings');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+    expect(await page.evaluate(() => history.length), 'history entries after the login').toBe(entries);
+  });
+
+  await test.step('Back reaches the search page before the reload within two steps, never the login form', async () => {
+    // The guard's redirect after the reload adds the login entry after the
+    // reloaded /bookings entry, so the first Back can land on that /bookings
+    // entry, where the router may skip a navigation to the URL it shows.
+    for (let step = 1; step <= 2 && new URL(page.url()).pathname !== '/search'; step++) {
+      await page.goBack();
+      const heading = new URL(page.url()).pathname === '/search' ? 'Find a hotel' : 'My bookings';
+      await expect(page.getByRole('heading', { level: 1 }), `the heading after Back ${step}`).toHaveText(heading);
+      await expect(page.getByTestId('login-submit'), `the login form after Back ${step}`).toHaveCount(0);
+    }
+    await expect(page).toHaveURL('/search');
+  });
+});
+
+/**
+ * Returns the `title` and `detail` of a ProblemDetails body, requiring each to
+ * be a string with text, so a test can require the page to show the server's
+ * own words rather than a client fallback such as "Request failed (400).".
+ */
+function problemTitleAndDetail(body: unknown): { title: string; detail: string } {
+  const title = isRecord(body) ? body['title'] : undefined;
+  const detail = isRecord(body) ? body['detail'] : undefined;
+  if (typeof title !== 'string' || title.trim() === '' || typeof detail !== 'string' || detail.trim() === '') {
+    throw new Error('The response body carries no ProblemDetails title and detail.');
+  }
+  return { title, detail };
+}
+
+test('register with a too-short password shows the 400 field error inline and stays put', async ({ page }) => {
+  await page.goto('/register');
+
+  const response = await test.step('register with a 7-character password', async () => {
+    // The form sends the password unchanged, so only the server's 8 to 128
+    // rule can reject it; the rejection creates no account.
+    await fillBound(page, 'register-email', uniqueEmail());
+    await fillBound(page, 'register-password', 'x'.repeat(7));
+    await fillBound(page, 'register-full-name', 'States Guest');
+    // The method filter keeps a CORS preflight from matching.
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('register-submit').click();
+    const res = await registration;
+    expect(res.status()).toBe(400);
+    return res;
+  });
+
+  await test.step('the 400 shows inline and marks only the password', async () => {
+    const { title, detail } = problemTitleAndDetail(await response.json());
+    const alert = page.getByTestId('inline-error').getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(title);
+    await expect(alert.locator('p')).toHaveText(detail);
+    // The field error names its field by the visible label, never by the API's key.
+    await expect(alert.locator('li')).toHaveText(['Password: The value must be 8 to 128 characters long.']);
+
+    const password = page.getByTestId('register-password');
+    await expect(password).toHaveAttribute('aria-invalid', 'true');
+    await expect(password).toHaveAccessibleDescription('The value must be 8 to 128 characters long.');
+    await expect(page.getByTestId('register-email')).not.toHaveAttribute('aria-invalid');
+    await expect(page.getByTestId('register-full-name')).not.toHaveAttribute('aria-invalid');
+  });
+
+  await test.step('stay on the register page, ready to submit again', async () => {
+    await expect(page).toHaveURL(/\/register$/);
+    await expect(page.getByTestId('register-submit')).toBeEnabled();
+  });
+});
+
+// A contract test of the login page's 400 renderer. The form always sends an
+// object of two strings, which the API binds and answers with 200 or 401, so
+// the login 400 (a JSON body that fails binding) cannot come from the form's
+// normal requests. The route rewrites the body of the page's own POST so that
+// the real API rejects it, and the test checks how the unchanged page renders
+// that genuine 400.
+test('login page shows an API 400 inline (contract test: rewritten request body)', async ({ page }) => {
+  const { email, password } = await test.step('register a guest', () => registerNewGuest(page));
+
+  const response = await test.step('log in with the request body rewritten to an unbindable email', async () => {
+    // Only the POST is rewritten; a CORS preflight goes on unchanged. The
+    // replacement holds no credential: a JSON number for `email`, which the
+    // API's binding rejects before any credential check.
+    await page.route(isLoginApi, (route) =>
+      route.request().method() === 'POST'
+        ? route.continue({ postData: JSON.stringify({ email: 5, password: 'x' }) })
+        : route.continue(),
+    );
+    // The form's own credentials are valid, so without the rewrite this login
+    // would succeed.
+    await fillBound(page, 'login-email', email);
+    await fillBound(page, 'login-password', password);
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('login-submit').click();
+    const res = await login;
+    expect(res.status()).toBe(400);
+    return res;
+  });
+
+  await test.step('the 400 shows inline with its field error on the email', async () => {
+    const { title, detail } = problemTitleAndDetail(await response.json());
+    const alert = page.getByTestId('inline-error').getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(title);
+    await expect(alert.locator('p')).toHaveText(detail);
+    // The JSON path `$.email` is labelled with the email input's visible name.
+    await expect(alert.locator('li')).toHaveText(['Email: The JSON value is not valid.']);
+
+    // The JSON path `$.email` names the email input, which is marked and
+    // described by the message; the password input is not.
+    const emailInput = page.getByTestId('login-email');
+    await expect(emailInput).toHaveAttribute('aria-invalid', 'true');
+    await expect(emailInput).toHaveAccessibleDescription('The JSON value is not valid.');
+    await expect(page.getByTestId('login-password')).not.toHaveAttribute('aria-invalid');
+
+    // Only a 401 reads as wrong credentials.
+    await expect(page.getByText('Email or password is incorrect.')).toHaveCount(0);
+  });
+
+  await test.step('stay on the login page, signed out', async () => {
+    await expect(page).toHaveURL(/\/login(?:\?|$)/);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    await expect(page.getByTestId('login-submit')).toBeEnabled();
+  });
+});
+
+for (const c of DEADLINE_CASES) {
+  test(`a ${c.form} the API never answers ends at the deadline as unreachable`, async ({ page }) => {
+    // Installed before the app loads, so the request deadline's timer runs on
+    // a clock the test can move past the 30 seconds.
+    await page.clock.install();
+    await page.route(c.isEndpoint, () => {
+      // Never fulfilled, continued or aborted: the POST stays pending as if
+      // the API had stopped answering.
+    });
+
+    await page.goto(`/${c.form}`);
+    await c.fill(page);
+    const submit = page.getByTestId(`${c.form}-submit`);
+    const indicator = page.getByTestId('loading-indicator');
+
+    await test.step('submit, and the request stays pending', async () => {
+      const sent = page.waitForRequest((r) => c.isEndpoint(new URL(r.url())) && r.method() === 'POST');
+      await submit.click();
+      await sent;
+      await expect(indicator).toBeVisible();
+      await expect(submit).toBeDisabled();
+    });
+
+    await test.step('past the deadline the wait ends with the error inline', async () => {
+      await page.clock.fastForward('00:31');
+      await expect(page.getByTestId('inline-error')).toContainText(UNREACHABLE_TITLE);
+      await expect(indicator).toBeHidden();
+      await expect(submit).toBeEnabled();
+      await expect(page).toHaveURL(new RegExp(`/${c.form}$`));
+    });
+  });
+}
+
+for (const c of UNUSABLE_LOGIN_BODIES) {
+  test(`a login 200 with ${c.title} shows inline and signs nobody in`, async ({ page }) => {
+    await page.route(isLoginApi, (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: c.body }),
+    );
+
+    await page.goto('/login');
+    await fillBound(page, 'login-email', uniqueEmail());
+    await fillBound(page, 'login-password', uniquePassword());
+    const login = page.waitForResponse(
+      (r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('login-submit').click();
+    expect((await login).status()).toBe(200);
+
+    await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+    await expect(page).toHaveURL(/\/login$/);
+    await expect(page.getByTestId('nav-login')).toHaveText('Log in');
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+}
+
+for (const c of UNUSABLE_READ_CASES) {
+  test(`${c.title} shows inline and renders no hotel`, async ({ page }) => {
+    const [checkIn, checkOut, laterDate] = utcDates(30, 32, 32 + 3 * 365);
+    const fill = (text: string): string =>
+      text
+        .replace(/\{stay\}/g, 'checkIn={checkIn}&checkOut={checkOut}')
+        .replace(/\{checkIn\}/g, checkIn)
+        .replace(/\{checkOut\}/g, checkOut)
+        .replace(/\{laterDate\}/g, laterDate);
+    const body = fill(c.body);
+    await page.route(
+      (url) => isApiEndpoint(url, c.endpoint),
+      (route) => route.fulfill({ status: 200, contentType: 'application/json', body }),
+    );
+
+    const read = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), c.endpoint) && r.request().method() === 'GET',
+    );
+    await page.goto(fill(c.url));
+    expect((await read).status()).toBe(200);
+
+    await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+    await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="hotel-name"]`)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+    await expect(page.locator(BOOK_BUTTONS)).toHaveCount(0);
+  });
+}
+
+for (const { title, text } of LENIENT_GUESTS_TEXTS) {
+  test(`a detail deep link with guests ${title}, which the API reads as 3, shows the hotel for 3 guests`, async ({
+    page,
+  }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const read = page.waitForResponse((r) => isApiEndpoint(r.url(), '/hotels/1') && r.request().method() === 'GET');
+    await page.goto(`/hotels/1?checkIn=${checkIn}&checkOut=${checkOut}&guests=${encodeURIComponent(text)}`);
+    const response = await read;
+    expect(new URL(response.url()).searchParams.get('guests')).toBe(text);
+    expect(response.status()).toBe(200);
+
+    await expect(page.getByTestId('hotel-name')).toHaveText(/\S/);
+    await expect(page.locator('.hotel-stay')).toContainText(`${displayDate(checkIn)} to ${displayDate(checkOut)}`);
+    await expect(page.locator('.hotel-stay')).toContainText('2 nights, 3 guests');
+    await expect(page.locator(BOOK_BUTTONS)).not.toHaveCount(0);
+    await expectNoInlineError(page);
+  });
+}
+
+test('opening My bookings while signed out redirects to login', async ({ page }) => {
+  await page.goto('/search');
+  await page.getByTestId('nav-bookings').click();
+
+  await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Log in');
+});
+
+test('server 401 on entering My bookings redirects with session-expired', async ({ page }) => {
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  await test.step('open My bookings with a token the API rejects', async () => {
+    await rejectBookingsToken(page);
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status()).toBe(401);
+  });
+
+  await test.step('land on login with the session-expired notice, signed out', async () => {
+    await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings&reason=session-expired$/);
+    await expect(page.getByTestId('login-notice')).toHaveText('Your session has expired. Log in again.');
+    await expect(page.getByTestId('nav-login')).toHaveText('Log in');
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+});
+
+test('server 401 on entering My bookings stays there with an inline error when the redirect to login fails', async ({ page }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  // Every uncaught exception, and every error the app reports to the console,
+  // such as Angular's report of a promise rejection nothing handled. The
+  // browser's own line for the entry GET's 401 is expected and left out. Only
+  // fixed labels are kept, an exception's error type or "console error", so
+  // no browser error text, which can carry URLs, tokens or email addresses,
+  // reaches the test output.
+  const reported: string[] = [];
+  page.on('pageerror', (error) => {
+    reported.push(`uncaught ${error.name}`);
+  });
+  page.on('console', (message) => {
+    const source = new URL(message.location().url || 'about:blank');
+    if (
+      message.type() !== 'error' ||
+      (message.text().startsWith('Failed to load resource:') && isBookingsCollection(source))
+    ) {
+      return;
+    }
+    reported.push('console error');
+  });
+
+  await test.step('make the history update of the redirect to login throw', async () => {
+    // The router writes the login URL with `replaceState` just before it
+    // activates the login page; Safari throws this `SecurityError` when a page
+    // updates history too often. The navigation then ends with an error, the
+    // router rejects its promise and restores `/bookings`, and My bookings
+    // stays active. Every other history update goes through unchanged.
+    await page.evaluate(() => {
+      const replaceState = History.prototype.replaceState;
+      (window as unknown as Record<string, unknown>)['__originalReplaceState'] = replaceState;
+      History.prototype.replaceState = function (
+        this: History,
+        data: unknown,
+        unused: string,
+        url?: string | URL | null,
+      ): void {
+        if (String(url ?? '').includes('reason=session-expired')) {
+          throw new DOMException('History updates are throttled.', 'SecurityError');
+        }
+        replaceState.call(this, data, unused, url);
+      };
+    });
+  });
+
+  await test.step('open My bookings with a token the API rejects', async () => {
+    await rejectBookingsToken(page);
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the API rejects the entry GET').toBe(401);
+  });
+
+  await test.step('stay on My bookings with the 401 inline, signed out', async () => {
+    const error = page.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    await expect(error.getByRole('alert').locator('strong')).toHaveText('Unauthorized');
+    await expect(error.getByRole('alert').locator('p')).toHaveText('A valid bearer token is required.');
+    // The inline error holds the only recovery link: the session-ended notice
+    // stays hidden, and no list was loaded.
+    const loginAgain = error.getByTestId('login-again');
+    await expect(loginAgain).toHaveText('Log in again');
+    await expect(loginAgain).toHaveAttribute('href', '/login?returnUrl=%2Fbookings');
+    await expect(page.getByTestId('login-again')).toHaveCount(1);
+    await expect(page.getByTestId('bookings-signed-out')).toHaveCount(0);
+    await expect(page.getByTestId('bookings-table')).toHaveCount(0);
+    await expect(page.getByTestId('bookings-empty')).toHaveCount(0);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+    await expect(page.getByTestId('nav-login')).toHaveText('Log in');
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+
+  await test.step('"Log in again" returns to My bookings once history updates work again', async () => {
+    await page.unroute(isBookingsApi);
+    await page.evaluate(() => {
+      History.prototype.replaceState = (window as unknown as Record<string, unknown>)[
+        '__originalReplaceState'
+      ] as History['replaceState'];
+    });
+    await page.getByTestId('login-again').click();
+    await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await logIn(page, credentials.email, credentials.password);
+    expect((await list).status(), 'the list GET after logging in again returns 200').toBe(200);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByTestId('bookings-empty')).toBeVisible();
+    await expect(page.getByTestId('inline-error')).toHaveCount(0);
+  });
+});
+
+test('server 401 on Book stays on the page with an inline error', async ({ page }) => {
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  const hotelUrl = await test.step('open a Seattle hotel', async () => {
+    const [checkIn, checkOut] = utcDates(25, 27);
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+    await page.locator('[data-testid^="view-rooms-"]').first().click();
+    await expect(page.getByTestId('hotel-name')).toBeVisible();
+    await expect(page).toHaveURL(/\/hotels\/\d+\?/);
+    return page.url();
+  });
+
+  await test.step('click Book with a token the API rejects', async () => {
+    const book = page.locator('[data-testid^="book-"]:enabled').first();
+    await expect(book).toBeVisible();
+
+    await rejectBookingsToken(page);
+    // The 401 to the POST itself proves the server refused the booking, so
+    // none was created.
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await book.click();
+    expect((await created).status()).toBe(401);
+  });
+
+  await test.step('stay on the hotel page with the 401 inline, signed out', async () => {
+    const error = page.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    await expect(error.getByTestId('login-again')).toHaveText('Log in again');
+    // Focus moves from the disabled "Book" to the recovery link.
+    await expect(error.getByTestId('login-again')).toBeFocused();
+    await expect(page).toHaveURL(hotelUrl);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+});
+
+test('server 401 on Cancel stays on My bookings with an inline error', async ({ page, request }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  const { session, id } = await test.step('book a later Seattle stay for the guest through the API', async () => {
+    const [checkIn, checkOut] = utcDates(120, 122);
+    const stay: Stay = { checkIn, checkOut, guests: 1 };
+
+    const search = await fixtureRequest('searching hotels', () =>
+      apiRequest(request, 'GET', '/hotels', { params: { city: 'Seattle', ...stay } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const hotels: unknown = await search.json();
+    const hotel: unknown = Array.isArray(hotels) ? (hotels as unknown[])[0] : undefined;
+    const hotelId = isRecord(hotel) ? hotel['id'] : undefined;
+    expect(typeof hotelId === 'number' && Number.isInteger(hotelId), 'the fixture search returns a hotel').toBe(true);
+
+    const free = (await apiRoomTypes(request, Number(hotelId), stay)).find((rt) => rt.availableRooms > 0);
+    expect(free !== undefined, 'the hotel has a free room type').toBe(true);
+
+    const guest = await apiSignIn(request, credentials);
+    const bookingId = await apiBook(request, guest, {
+      hotelId: Number(hotelId),
+      roomTypeId: Number(free?.id),
+      ...stay,
+    });
+    return { session: guest, id: bookingId };
+  });
+
+  const bookingsUrl = await test.step('open My bookings with a token the API accepts', async () => {
+    // The entry GET must succeed: its own 401 is the redirect branch, which
+    // the entry case covers.
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the entry GET returns 200').toBe(200);
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByTestId(`booking-row-${id}`)).toBeVisible();
+    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+    return page.url();
+  });
+
+  const sent = await test.step('click Cancel with a token the API rejects', async () => {
+    // Only the DELETE carries a token the API rejects; every other bookings
+    // request keeps the app's own, so the 401 can only be Cancel's.
+    await page.route(isBookingsApi, (route) => {
+      const routed = route.request();
+      return routed.method() === 'DELETE'
+        ? route.continue({ headers: { ...routed.headers(), authorization: 'Bearer not-a-valid-token' } })
+        : route.continue();
+    });
+    const recorded = recordApiRequests(page);
+    const cancelled = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/bookings/${id}`) && r.request().method() === 'DELETE',
+    );
+    await page.getByTestId(`cancel-${id}`).click();
+    expect((await cancelled).status(), 'the API rejects the DELETE').toBe(401);
+    return recorded;
+  });
+
+  await test.step('stay on My bookings with the 401 inline, signed out', async () => {
+    const error = page.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    await expect(error.getByRole('alert').locator('strong')).toHaveText('Unauthorized');
+    await expect(error.getByRole('alert').locator('p')).toHaveText('A valid bearer token is required.');
+    // The 401 signed the guest out, so none of their bookings stay on screen;
+    // the inline error holds the only recovery link.
+    await expect(page.getByTestId('bookings-table')).toHaveCount(0);
+    await expect(page.getByTestId(`booking-row-${id}`)).toHaveCount(0);
+    await expect(page.getByTestId(`cancel-${id}`)).toHaveCount(0);
+    await expect(page.getByTestId('bookings-signed-out')).toHaveCount(0);
+    await expect(page.getByTestId('login-again')).toHaveCount(1);
+    const loginAgain = error.getByTestId('login-again');
+    await expect(loginAgain).toHaveText('Log in again');
+    await expect(loginAgain).toHaveAttribute('href', '/login?returnUrl=%2Fbookings');
+    // The clicked "Cancel" held focus, so the settled cancel hands it to the
+    // recovery link.
+    await expect(loginAgain).toBeFocused();
+    await expect(page).toHaveURL(bookingsUrl);
+    await expect(page.getByTestId('nav-login')).toHaveText('Log in');
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+
+  await test.step('the booking stays Confirmed on the server', async () => {
+    // A rejected cancel reloads nothing: the DELETE is the only API request.
+    expect(
+      sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
+      'the API requests after the click',
+    ).toEqual([`DELETE /api/bookings/${id}`]);
+    expect(await apiBookingStatus(request, session, id), 'the server status of the booking').toBe('Confirmed');
+    // Still there after the server round trip, so no late redirect followed.
+    await expect(page).toHaveURL(bookingsUrl);
+  });
+
+  await test.step('"Log in again" returns to My bookings with Cancel still offered', async () => {
+    await page.getByTestId('login-again').click();
+    await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await logIn(page, credentials.email, credentials.password);
+    expect((await list).status(), 'the list GET after logging in again returns 200').toBe(200);
+    await expect(page).toHaveURL(bookingsUrl);
+    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+  });
+});
+
+for (const c of UNUSABLE_BOOKING_LISTS) {
+  test(`entering My bookings answered with ${c.title} shows inline and lists no booking`, async ({ page }) => {
+    await test.step('register and log in', () => registerAndLogIn(page));
+
+    await test.step('open My bookings while its list is stubbed', async () => {
+      await page.route(isBookingsCollection, (route) =>
+        route.request().method() === 'GET'
+          ? route.fulfill({ status: c.status, contentType: 'application/json', body: c.body })
+          : route.fallback(),
+      );
+      const list = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await page.getByTestId('nav-bookings').click();
+      expect((await list).status(), 'the stubbed list answers its status').toBe(c.status);
+    });
+
+    await test.step('the unexpected response shows inline, with no row and no empty-list message', async () => {
+      await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+      await expect(page.locator('[data-testid^="booking-row-"]')).toHaveCount(0);
+      await expect(page.getByTestId('bookings-empty')).toHaveCount(0);
+      // A success status ends no session: the guest stays signed in on the page.
+      await expect(page).toHaveURL(/\/bookings$/);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+    });
+  });
+}
+
+for (const c of WRONG_STATUS_BOOK_ANSWERS) {
+  test(`Book answered with ${c.title} shows inline and stays on the hotel page`, async ({ page, request }) => {
+    const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+    // Should the stub ever miss, the real POST books a room, which the
+    // reconciliation after the test then cancels.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, credentials));
+
+    const hotelUrl = await test.step('open a Seattle hotel', async () => {
+      const [checkIn, checkOut] = utcDates(25, 27);
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+      await openHotel(page, page.locator(VIEW_ROOMS).first());
+      return page.url();
+    });
+
+    await test.step('click Book while its POST is stubbed', async () => {
+      const book = page.locator(`${BOOK_BUTTONS}:enabled`).first();
+      await expect(book).toBeVisible();
+      await page.route(isBookingsCollection, (route) =>
+        route.request().method() === 'POST'
+          ? route.fulfill({ status: c.status, contentType: 'application/json', body: c.body })
+          : route.fallback(),
+      );
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await book.click();
+      expect((await created).status(), 'the stubbed POST answers its status').toBe(c.status);
+    });
+
+    await test.step('the unexpected response shows inline on the same hotel page', async () => {
+      await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+      await expect(page).toHaveURL(hotelUrl);
+      await expect(page.getByTestId('hotel-name')).toBeVisible();
+      await expect(page.getByTestId('booking-confirmation')).toHaveCount(0);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+    });
+  });
+}
+
+test('Cancel answered with a 200 instead of 204 shows inline and keeps the row Confirmed', async ({ page, request }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  const { session, id } = await test.step('book a later Seattle stay for the guest through the API', async () => {
+    const [checkIn, checkOut] = utcDates(160, 162);
+    const stay: Stay = { checkIn, checkOut, guests: 1 };
+
+    const search = await fixtureRequest('searching hotels', () =>
+      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', ...stay } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const hotels: unknown = await search.json();
+    const hotel: unknown = Array.isArray(hotels) ? (hotels as unknown[])[0] : undefined;
+    const hotelId = isRecord(hotel) ? hotel['id'] : undefined;
+    expect(typeof hotelId === 'number' && Number.isInteger(hotelId), 'the fixture search returns a hotel').toBe(true);
+
+    const free = (await apiRoomTypes(request, Number(hotelId), stay)).find((rt) => rt.availableRooms > 0);
+    expect(free !== undefined, 'the hotel has a free room type').toBe(true);
+
+    const guest = await apiSignIn(request, credentials);
+    const bookingId = await apiBook(request, guest, {
+      hotelId: Number(hotelId),
+      roomTypeId: Number(free?.id),
+      ...stay,
+    });
+    return { session: guest, id: bookingId };
+  });
+
+  await test.step('open My bookings: the booking is Confirmed and offers Cancel', async () => {
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the entry GET returns 200').toBe(200);
+    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+  });
+
+  const sent = await test.step('click Cancel while its DELETE is stubbed with a 200', async () => {
+    // The stubbed DELETE never reaches the API, so the booking stays
+    // Confirmed there; only a client that took the 200 for a cancellation
+    // would show it otherwise.
+    await page.route(
+      (url) => isApiEndpoint(url, `/bookings/${id}`),
+      (route) =>
+        route.request().method() === 'DELETE'
+          ? route.fulfill({ status: 200, contentType: 'application/json', body: '' })
+          : route.fallback(),
+    );
+    const recorded = recordApiRequests(page);
+    const answered = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/bookings/${id}`) && r.request().method() === 'DELETE',
+    );
+    await page.getByTestId(`cancel-${id}`).click();
+    expect((await answered).status(), 'the stubbed DELETE answers 200').toBe(200);
+    return recorded;
+  });
+
+  await test.step('the unexpected response shows inline and the row stays Confirmed with Cancel', async () => {
+    await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+    await expect(page.getByTestId('bookings-announcement')).not.toContainText('Booking cancelled');
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+  });
+
+  await test.step('no reload follows, and the booking stays Confirmed on the server', async () => {
+    expect(
+      sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
+      'the API requests after the click',
+    ).toEqual([`DELETE /api/bookings/${id}`]);
+    expect(await apiBookingStatus(request, session, id), 'the server status of the booking').toBe('Confirmed');
+  });
+});
+
+test('Cancel answering a real 409 shows it above the list and reloads the row as Cancelled', async ({ page, request }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  const { session, stale, other } = await test.step('book two later Seattle stays for the guest through the API', async () => {
+    const [staleIn, staleOut, otherIn, otherOut] = utcDates(124, 126, 128, 130);
+    const staleStay: Stay = { checkIn: staleIn, checkOut: staleOut, guests: 1 };
+    const otherStay: Stay = { checkIn: otherIn, checkOut: otherOut, guests: 1 };
+
+    const search = await fixtureRequest('searching hotels', () =>
+      apiRequest(request, 'GET', '/hotels', { params: { city: 'Seattle', ...staleStay } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const hotels: unknown = await search.json();
+    const hotel: unknown = Array.isArray(hotels) ? (hotels as unknown[])[0] : undefined;
+    const hotelId = isRecord(hotel) ? hotel['id'] : undefined;
+    expect(typeof hotelId === 'number' && Number.isInteger(hotelId), 'the fixture search returns a hotel').toBe(true);
+
+    // One room type with a free room on both stays, so both bookings succeed.
+    const freeLater = new Set(
+      (await apiRoomTypes(request, Number(hotelId), otherStay)).filter((rt) => rt.availableRooms > 0).map((rt) => rt.id),
+    );
+    const free = (await apiRoomTypes(request, Number(hotelId), staleStay)).find(
+      (rt) => rt.availableRooms > 0 && freeLater.has(rt.id),
+    );
+    expect(free !== undefined, 'the hotel has a room type free on both stays').toBe(true);
+
+    const guest = await apiSignIn(request, credentials);
+    const book = (stay: Stay): Promise<number> =>
+      apiBook(request, guest, { hotelId: Number(hotelId), roomTypeId: Number(free?.id), ...stay });
+    const staleId = await book(staleStay);
+    return { session: guest, stale: staleId, other: await book(otherStay) };
+  });
+
+  const bookingsUrl = await test.step('open My bookings: both bookings are Confirmed and offer Cancel', async () => {
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the entry GET returns 200').toBe(200);
+    await expect(page).toHaveURL(/\/bookings$/);
+    for (const id of [stale, other]) {
+      await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+      await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+    }
+    return page.url();
+  });
+
+  await test.step('cancel the booking elsewhere: the open page still offers it', async () => {
+    // The guest's other tab or device; nothing tells this page about it.
+    const cancelled = await fixtureRequest('cancelling a booking', () =>
+      apiRequest(request, 'DELETE', `/bookings/${stale}`, { headers: session.headers }),
+    );
+    expect(cancelled.status(), 'the cancel elsewhere returns 204').toBe(204);
+    await expect(page.getByTestId(`booking-status-${stale}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${stale}`)).toBeEnabled();
+  });
+
+  const sent = await test.step('click Cancel: the API answers 409 and the list reloads', async () => {
+    const recorded = recordApiRequests(page);
+    const refused = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/bookings/${stale}`) && r.request().method() === 'DELETE',
+    );
+    const reloaded = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId(`cancel-${stale}`).click();
+    // Awaited together, so a waiter that fails after the other is still handled.
+    const [refusal, reload] = await Promise.all([refused, reloaded]);
+    expect(refusal.status(), 'the API refuses the DELETE').toBe(409);
+    expect(reload.status(), 'the reload GET returns 200').toBe(200);
+    return recorded;
+  });
+
+  await test.step('the 409 stays inline above the list, which shows the server status', async () => {
+    const error = page.getByTestId('inline-error');
+    await expect(error).toBeVisible();
+    await expect(error.getByRole('alert').locator('strong')).toHaveText('Booking already cancelled');
+    await expect(error.getByRole('alert').locator('p')).toHaveText('This booking has already been cancelled.');
+    // Cancel errors show at the top of the list: the alert precedes the table.
+    const aboveTable = await error.evaluate((el) => {
+      const table = el.ownerDocument.querySelector('[data-testid="bookings-table"]');
+      return table !== null && (el.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    });
+    expect(aboveTable, 'the inline error precedes the bookings table').toBe(true);
+    // The reloaded row reads the server's status, and the refused "Cancel" is
+    // gone; the other booking keeps its own.
+    await expect(page.getByTestId(`booking-status-${stale}`)).toHaveText('Cancelled');
+    await expect(page.getByTestId(`cancel-${stale}`)).toHaveCount(0);
+    await expect(page.getByTestId(`booking-status-${other}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${other}`)).toBeEnabled();
+    // The clicked "Cancel" held focus and is gone, so focus moves to its row's
+    // status.
+    await expect(page.getByTestId(`booking-status-${stale}`)).toBeFocused();
+    await expect(page).toHaveURL(bookingsUrl);
+    // A 409 ends no session: the guest stays signed in with the rows shown.
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    await expect(page.getByTestId('bookings-signed-out')).toHaveCount(0);
+  });
+
+  await test.step('the reload is the only request after the DELETE', async () => {
+    expect(
+      sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
+      'the API requests after the click',
+    ).toEqual([`DELETE /api/bookings/${stale}`, 'GET /api/bookings']);
+    expect(await apiBookingStatus(request, session, stale), 'the server status of the refused booking').toBe('Cancelled');
+    expect(await apiBookingStatus(request, session, other), 'the server status of the other booking').toBe('Confirmed');
+  });
+});
+
+test('token expiry signs the guest out of the nav bar without a request', async ({ page }) => {
+  // Installed before the app loads, so the app's Date and timers run on a clock
+  // the test can move forward. Until then it keeps pace with real time, so the
+  // server's expiresAt lies 60 minutes after the login on both clocks.
+  await page.clock.install();
+
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  const apiRequests: string[] = [];
+  page.on('request', (request) => {
+    if (isApi(new URL(request.url()))) {
+      apiRequests.push(`${request.method()} ${request.url()}`);
+    }
+  });
+
+  await test.step('59 minutes later the guest is still signed in', async () => {
+    await page.clock.fastForward('59:00');
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    await expect(page.getByTestId('nav-logout')).toBeVisible();
+  });
+
+  await test.step('past the 60 minutes the nav offers "Log in" on the same page', async () => {
+    // A keyboard guest left on "Log out" keeps focus in the nav when the
+    // button is removed at expiry.
+    await page.getByTestId('nav-logout').focus();
+    await expect(page.getByTestId('nav-logout')).toBeFocused();
+
+    await page.clock.fastForward('02:00');
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-login')).toBeFocused();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    await expect(page).toHaveURL(/\/search$/);
+  });
+
+  expect(apiRequests).toEqual([]);
+});
+
+/** An event after which the app compares the clock with the session's expiry, as its timer would. */
+interface ExpiryCheckCase {
+  /** The event, for the test title. */
+  title: string;
+  /** Makes the event happen on the page. */
+  fire(page: Page): Promise<void>;
+}
+
+/** The events, one test each. */
+const EXPIRY_CHECK_CASES: readonly ExpiryCheckCase[] = [
+  // The heading is no control, so no handler answers the click; the app
+  // compares the clock on the task after it.
+  { title: 'a click on the page', fire: (page) => page.getByRole('heading', { level: 1 }).click() },
+  {
+    title: 'the tab becoming visible',
+    fire: (page) => page.evaluate(() => void document.dispatchEvent(new Event('visibilitychange'))),
+  },
+  { title: 'window focus', fire: (page) => page.evaluate(() => void window.dispatchEvent(new FocusEvent('focus'))) },
+  {
+    title: 'the page shown again',
+    fire: (page) =>
+      page.evaluate(() => void window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))),
+  },
+];
+
+for (const c of EXPIRY_CHECK_CASES) {
+  test(`${c.title} after an undelivered expiry signs the guest out without a request`, async ({ page }) => {
+    // Installed before the app loads, as in the test above.
+    await page.clock.install();
+    const { expiresAt } = await test.step('register and log in', () => registerAndLogInWithExpiry(page));
+    const sent = recordApiRequests(page);
+
+    await test.step('the clock passes the expiry while its timer stays pending: still signed in', async () => {
+      await passExpiryWithoutTimers(page, expiresAt, 5_000);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+    });
+
+    await test.step(`${c.title} shows the guest signed out on the same page`, async () => {
+      await c.fire(page);
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      await expect(page).toHaveURL(/\/search$/);
+    });
+
+    expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+  });
+}
+
+/** How the guest activates nav "Log out". */
+interface LogoutActivationCase {
+  /** The activation, for the test title. */
+  title: string;
+  /** Activates the button. */
+  activate(button: Locator): Promise<void>;
+}
+
+/**
+ * The activations, one test each. Enter clicks a button at the key's press
+ * and Space at its release, so a check of the expiry before the click would
+ * remove "Log out" before it is activated.
+ */
+const LOGOUT_ACTIVATION_CASES: readonly LogoutActivationCase[] = [
+  { title: 'a pointer click', activate: (button) => button.click() },
+  { title: 'Enter', activate: (button) => button.press('Enter') },
+  { title: 'Space', activate: (button) => button.press('Space') },
+];
+
+for (const c of LOGOUT_ACTIVATION_CASES) {
+  test(`"Log out" by ${c.title} after an undelivered expiry still reaches the search page signed out`, async ({ page }) => {
+    // Installed before the app loads, as in the tests above.
+    await page.clock.install();
+    const [checkIn, checkOut] = utcDates(178, 180);
+    const logout = page.getByTestId('nav-logout');
+    const { expiresAt } = await test.step('register and log in', () => registerAndLogInWithExpiry(page));
+
+    await test.step('open a Seattle hotel', async () => {
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      await openHotel(page, page.locator(VIEW_ROOMS).first());
+    });
+
+    await test.step('the clock passes the expiry while its timer stays pending: "Log out" still shows', async () => {
+      await passExpiryWithoutTimers(page, expiresAt, 5_000);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+      await expect(logout).toBeVisible();
+    });
+
+    const visited = recordVisitedPaths(page);
+    const sent = recordApiRequests(page);
+
+    await test.step(`"Log out" by ${c.title} leaves for the search page, signed out`, async () => {
+      await c.activate(logout);
+      await expect(page).toHaveURL(/\/search$/);
+      await expect(page.getByRole('heading', { level: 1 })).toHaveText('Find a hotel');
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      expect(visited, 'the paths the tab visited since the expiry').toEqual(['/search']);
+      // Logging out calls no endpoint, and bare /search runs no search.
+      expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+    });
+  });
+}
+
+/** The inventory {@link apiLeaveFreeRooms} arranged. */
+interface HeldRoomType {
+  /** The fixture guest holding the bookings, which can book the rooms left too. */
+  session: ApiSession;
+  /** The room type whose free rooms the fixture guest booked, as read before. */
+  roomType: FixtureRoomType;
+  /** One room of that room type for the stay, as the fixture guest booked it. */
+  booking: FixtureBookingRequest;
+  /** The hotel's other room types, as the API counted them afterwards. */
+  others: FixtureRoomType[];
+}
+
+/**
+ * Has a fixture guest of its own book rooms of the hotel's first room type for
+ * the stay through the API until exactly `left` of them are free, and confirms
+ * that count with the API. Every booking is cancelled after the test.
+ */
+async function apiLeaveFreeRooms(
+  request: APIRequestContext,
+  hotelId: number,
+  stay: Stay,
+  left: number,
+): Promise<HeldRoomType> {
+  const [roomType, ...others] = await apiRoomTypes(request, hotelId, stay);
+  expect(others.length, 'the hotel has more than one room type').toBeGreaterThan(0);
+  expect(roomType.availableRooms, 'the room type has the rooms to leave free').toBeGreaterThanOrEqual(left);
+
+  const session = await apiSignIn(request, await apiRegisterGuest(request));
+  const booking: FixtureBookingRequest = { hotelId, roomTypeId: roomType.id, ...stay };
+  for (let free = roomType.availableRooms; free > left; free -= 1) {
+    await apiBook(request, session, booking);
+  }
+
+  const after = await apiRoomTypes(request, hotelId, stay);
+  expect(after.find((rt) => rt.id === roomType.id)?.availableRooms, 'the fixture left the planned rooms free').toBe(left);
+  return { session, roomType, booking, others: after.filter((rt) => rt.id !== roomType.id) };
+}
+
+/**
+ * Runs a hotel search through the search page's form and returns the id of
+ * the first hotel it lists, read from its `view-rooms-<id>` hook.
+ */
+async function searchFirstHotelId(page: Page, criteria: Stay & { city: string }): Promise<number> {
+  await searchHotels(page, criteria);
+  const testId = (await page.locator(VIEW_ROOMS).first().getAttribute('data-testid')) ?? '';
+  expect(testId).toMatch(/^view-rooms-\d+$/);
+  return Number(testId.slice('view-rooms-'.length));
+}
+
+test('Book while signed out returns to the same stay after login', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(130, 132);
+  // The account exists, but the browser never signs in before "Book".
+  const { email, password } = await test.step('register a guest through the API', () => apiRegisterGuest(request));
+
+  const hotel = await test.step('open a Seattle hotel for the stay, signed out', async () => {
+    await page.goto('/search');
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+    const opened = await openHotel(page, page.locator(VIEW_ROOMS).first());
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    return opened;
+  });
+  const shown = new URL(page.url());
+  const stayPath = `${shown.pathname}${shown.search}`;
+  expect(shown.searchParams.get('checkIn')).toBe(checkIn);
+  expect(shown.searchParams.get('checkOut')).toBe(checkOut);
+  expect(shown.searchParams.get('guests')).toBe('2');
+
+  // Every method, so a preflight would count too: signed out, nothing goes
+  // there. Any origin, so a request to another stack's API counts as well.
+  const bookingsRequests: string[] = [];
+  page.on('request', (sent) => {
+    const url = new URL(sent.url());
+    if (url.pathname === '/api/bookings' || url.pathname.startsWith('/api/bookings/')) {
+      bookingsRequests.push(`${sent.method()} ${url.origin}${url.pathname}`);
+    }
+  });
+
+  const bookId = await test.step('click an enabled Book: login opens with this stay as its return URL', async () => {
+    const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+    expect(testId).toMatch(/^book-\d+$/);
+    await page.getByTestId(testId).click();
+    await expect(page).toHaveURL(`/login?returnUrl=${encodeURIComponent(stayPath)}`);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Log in');
+    expect(bookingsRequests, 'Book while signed out sends no bookings request').toEqual([]);
+    return testId;
+  });
+
+  await test.step('log in: the same hotel and stay come back, with Book enabled', async () => {
+    await logIn(page, email, password);
+    await expect(page).toHaveURL(stayPath);
+    await expect(page.getByTestId('hotel-name')).toHaveText(hotel.name);
+    await expect(page.locator('.hotel-stay')).toHaveText(
+      `${displayDate(checkIn)} to ${displayDate(checkOut)}, 2 nights, 2 guests`,
+    );
+    await expect(page.getByTestId(bookId)).toBeEnabled();
+  });
+
+  expect(bookingsRequests, 'no booking was requested').toEqual([]);
+});
+
+test('Book is disabled on room types too small for the party', async ({ page }) => {
+  const [checkIn, checkOut] = utcDates(135, 137);
+  // Signed in, so a disabled "Book" cannot be about the session.
+  await test.step('register and log in', () => registerAndLogIn(page));
+
+  await test.step('open a New York hotel for three guests', async () => {
+    await searchHotels(page, { city: 'New York', checkIn, checkOut, guests: 3 });
+    await openHotel(page, page.locator(VIEW_ROOMS).first());
+    await expect(page.locator('.hotel-stay')).toHaveText(
+      `${displayDate(checkIn)} to ${displayDate(checkOut)}, 2 nights, 3 guests`,
+    );
+  });
+
+  await test.step('Book is disabled exactly where max guests is below 3', async () => {
+    const rows = page.locator('[data-testid^="room-type-row-"]');
+    await expect(rows).not.toHaveCount(0);
+    const tooSmall: string[] = [];
+    const largeEnough: string[] = [];
+    for (const row of await rows.all()) {
+      const id = ((await row.getAttribute('data-testid')) ?? '').slice('room-type-row-'.length);
+      expect(id).toMatch(/^\d+$/);
+      const maxGuests = Number((await row.locator('td').nth(1).innerText()).trim());
+      expect(Number.isInteger(maxGuests), `room type ${id} shows a whole max guests`).toBe(true);
+      // Every room type has free rooms, so only capacity can disable its "Book".
+      await expect(page.getByTestId(`available-count-${id}`)).toHaveText(/^\s*[1-9]\d*\s*$/);
+      const book = page.getByTestId(`book-${id}`);
+      if (maxGuests < 3) {
+        await expect(book).toBeDisabled();
+        tooSmall.push(id);
+      } else {
+        await expect(book).toBeEnabled();
+        largeEnough.push(id);
+      }
+    }
+    expect(tooSmall.length, 'a room type is too small for three').toBeGreaterThan(0);
+    expect(largeEnough.length, 'a room type takes three').toBeGreaterThan(0);
+  });
+});
+
+test('Book is disabled on a sold-out room type', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(140, 142);
+  const stay: Stay = { checkIn, checkOut, guests: 1 };
+  // Signed in, so a disabled "Book" cannot be about the session.
+  await test.step('register and log in', () => registerAndLogIn(page));
+  const hotelId = await test.step('search Chicago for the stay', () =>
+    searchFirstHotelId(page, { city: 'Chicago', ...stay }),
+  );
+
+  const held = await test.step('a fixture guest books every free room of one room type', () =>
+    apiLeaveFreeRooms(request, hotelId, stay, 0),
+  );
+
+  await test.step('open the hotel: that room type shows 0 and its Book is disabled', async () => {
+    await openHotel(page, page.getByTestId(`view-rooms-${hotelId}`));
+    await expect(page.getByTestId(`available-count-${held.roomType.id}`)).toHaveText('0');
+    await expect(page.getByTestId(`book-${held.roomType.id}`)).toBeDisabled();
+  });
+
+  await test.step('the other room types keep their counts and an enabled Book', async () => {
+    for (const other of held.others) {
+      await expect(page.getByTestId(`available-count-${other.id}`)).toHaveText(String(other.availableRooms));
+      await expect(page.getByTestId(`book-${other.id}`)).toBeEnabled();
+    }
+  });
+});
+
+test('Book answering a real 409 shows it above the room table and refreshes the counts', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(150, 152);
+  const stay: Stay = { checkIn, checkOut, guests: 1 };
+  await test.step('register and log in', async () => {
+    // Recorded before "Book" is clicked, so a booking the API wrongly accepts
+    // is cancelled after the test, whatever this test reads of its answer.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, await registerAndLogIn(page)));
+  });
+  const hotelId = await test.step('search Seattle for the stay', () =>
+    searchFirstHotelId(page, { city: 'Seattle', ...stay }),
+  );
+
+  const held = await test.step('a fixture guest leaves one room of one room type free', () =>
+    apiLeaveFreeRooms(request, hotelId, stay, 1),
+  );
+  const book = page.getByTestId(`book-${held.roomType.id}`);
+  const count = page.getByTestId(`available-count-${held.roomType.id}`);
+
+  const hotelUrl = await test.step('open the hotel: one room is left and its Book is enabled', async () => {
+    await openHotel(page, page.getByTestId(`view-rooms-${hotelId}`));
+    await expect(count).toHaveText('1');
+    await expect(book).toBeEnabled();
+    for (const other of held.others) {
+      await expect(page.getByTestId(`available-count-${other.id}`)).toHaveText(String(other.availableRooms));
+    }
+    return page.url();
+  });
+
+  // The page has rendered the last room as free; only now does it go.
+  await test.step('the fixture guest books that last room', () => apiBook(request, held.session, held.booking));
+
+  const reads: { status: number; url: URL }[] = [];
+  page.on('response', (response) => {
+    const url = new URL(response.url());
+    if (isApiEndpoint(url, `/hotels/${hotelId}`) && response.request().method() === 'GET') {
+      reads.push({ status: response.status(), url });
+    }
+  });
+
+  await test.step('click Book: the API answers 409', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await book.click();
+    expect((await created).status(), 'Book answers 409').toBe(409);
+  });
+
+  await test.step('the conflict shows above the room table, on the same page', async () => {
+    const table = page.getByTestId('rooms-scroll');
+    // The hotel content holding the table; the late-booking notice sits outside it.
+    const error = table.locator('xpath=..').getByTestId('inline-error');
+    await expect(error.getByRole('alert').locator('strong')).toHaveText('No room available');
+    await expect(error.getByRole('alert').locator('p')).toHaveText(
+      `No ${held.roomType.name} room is free from ${checkIn} to ${checkOut}.`,
+    );
+    await expect(page.getByTestId('inline-error')).toHaveCount(1);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    // Both rectangles are read in one evaluation, because focus can scroll the page between separate reads.
+    const errorAboveTable = await table.evaluate(
+      (tableEl, errorEl) =>
+        // An element that is hidden or no longer in the document has no client rects.
+        errorEl !== null &&
+        errorEl.getClientRects().length > 0 &&
+        tableEl.getClientRects().length > 0 &&
+        errorEl.getBoundingClientRect().bottom <= tableEl.getBoundingClientRect().top,
+      await error.elementHandle(),
+    );
+    expect(errorAboveTable, 'the error sits above the room table').toBe(true);
+    await expect(page).toHaveURL(hotelUrl);
+    await expect(page.getByTestId('nav-logout')).toBeVisible();
+  });
+
+  await test.step('the page reads the stay again: 0 left, Book disabled, other counts unchanged', async () => {
+    await expect.poll(() => reads.length, { message: 'the page reads the hotel once more' }).toBe(1);
+    const [read] = reads;
+    expect(read.status, 'the revalidation GET returns 200').toBe(200);
+    expect(read.url.searchParams.get('checkIn')).toBe(checkIn);
+    expect(read.url.searchParams.get('checkOut')).toBe(checkOut);
+    expect(read.url.searchParams.get('guests')).toBe('1');
+    await expect(count).toHaveText('0');
+    await expect(book).toBeDisabled();
+    for (const other of held.others) {
+      await expect(page.getByTestId(`available-count-${other.id}`)).toHaveText(String(other.availableRooms));
+      await expect(page.getByTestId(`book-${other.id}`)).toBeEnabled();
+    }
+    // The conflict stays shown beside the fresh counts.
+    await expect(page.getByTestId('inline-error')).toContainText('No room available');
+    expect(reads).toHaveLength(1);
+  });
+});

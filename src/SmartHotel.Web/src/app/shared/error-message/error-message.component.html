@@ -1,0 +1,12 @@
+<div *ngIf="shownError() as e" class="inline-error" data-testid="inline-error">
+  <div class="inline-error__message" role="alert">
+    <strong>{{ e.title }}</strong>
+    <p *ngIf="e.detail !== null">{{ e.detail }}</p>
+    <ul *ngIf="e.fieldErrors.length > 0">
+      <ng-container *ngFor="let fe of e.fieldErrors; let i = index">
+        <li *ngFor="let message of fe.messages; let j = index"><span *ngIf="fieldLabel(fe.field) as label" class="inline-error__field">{{ label }}: </span><span [attr.id]="messageId(i, j)">{{ message }}</span></li>
+      </ng-container>
+    </ul>
+  </div>
+  <ng-content />
+</div>

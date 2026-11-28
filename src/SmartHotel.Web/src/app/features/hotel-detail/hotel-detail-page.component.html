@@ -1,0 +1,200 @@
+<!-- The answer to a booking made for another hotel or stay than the one on
+     screen, or a 201 for the stay on screen whose navigation to My bookings
+     did not open that page, as when its code failed to load; focus then
+     moves to the link, never back to "Book". It renders only while the
+     session state it was settled for is current: the session that sent the
+     booking, or the signed-out state of that booking's own 401. "Log out" or
+     the session's expiry removes it in
+     the render that shows the change, so it never shows after its session,
+     and an answer whose session ended before it was settled never shows
+     here at all. For the sending session it names the room type, hotel and
+     dates; a 401 has signed the guest out, so its notice keeps no attempt
+     and names no booking, showing only the 401 and "Log in again". It sits
+     outside the hotel content, so it shows in every state of the current
+     view, and it never navigates or puts an error above the current room
+     table; when it is a 201 or a 409 for rooms that table counts (same
+     hotel, overlapping dates), the page revalidates them. The link hands
+     over the created booking in memory, so My bookings shows the same
+     confirmation as after a booking on the current view; its click handler
+     checks again that the session is current and unexpired, and otherwise
+     drops the notice and opens My bookings with no state, so the guard asks
+     for a login. When the link's navigation does not open My bookings, the
+     notice stays and says why inline below the link. A click with a
+     modifier key or another button is left to the browser, whose new tab
+     gets neither the booking nor the session. -->
+<div #lateNotice *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
+  <p role="status" data-testid="late-booking-message">
+    <ng-container *ngIf="late.attempt as attempt; else unnamedBooking">
+      Your booking of {{ attempt.roomType.name }} at {{ attempt.hotel.name }}
+      from <time [attr.datetime]="attempt.hotel.checkIn">{{ attempt.hotel.checkIn | date }}</time>
+      to <time [attr.datetime]="attempt.hotel.checkOut">{{ attempt.hotel.checkOut | date }}</time>
+      {{ late.error === null ? 'is confirmed. No payment is taken online in this version.' : 'could not be confirmed.' }}
+    </ng-container>
+    <ng-template #unnamedBooking>Your booking could not be confirmed.</ng-template>
+  </p>
+  <a
+    #lateBookingLink
+    *ngIf="late.confirmation"
+    href="/bookings"
+    (click)="openLateBooking($event, late)"
+    data-testid="late-booking-bookings"
+  >View it in My bookings</a>
+  <app-error-message [error]="late.linkError"></app-error-message>
+  <app-error-message [error]="late.error">
+    <a
+      *ngIf="late.error?.status === 401"
+      routerLink="/login"
+      [queryParams]="{ returnUrl: router.url }"
+      data-testid="late-booking-login-again"
+    >Log in again</a>
+  </app-error-message>
+</div>
+
+<!-- A booking answered after the session that sent it had ended, at "Log out"
+     or its expiry. Only the guest who logs in again may see that booking, so
+     this names no hotel, room type, dates or status, and it never says the
+     booking was cancelled, which leaving cannot do. The next load or booking
+     clears it. -->
+<div *ngIf="sessionEnded()" class="session-ended">
+  <p role="status" data-testid="booking-session-ended">
+    Your session ended before this booking was answered. Log in and open My bookings to see whether it was made
+    before you book again.
+  </p>
+</div>
+
+<!-- While a load runs, loadError is null and the previous hotel, if any, is
+     hidden below: the app-wide loading indicator shows progress. A load
+     clears the booking error when it starts, so the two show together only
+     when the hotel's GET that answered after a booking error failed, such as
+     the revalidation after a 409: the conflict stays visible beside the
+     reason the fresh counts are missing. Only one of this block and the hotel
+     content below renders at a time, so both can carry the booking error's
+     "Log in again" link under one test hook. The heading takes focus from
+     script only: on entry from within the app when the load failed, after a
+     booking answer whose revalidation failed has removed the room table and
+     the pressed "Book" with it, and after a "Retry" that failed again.
+     "Retry" loads the URL's hotel and stay again, keeping the booking
+     outcomes shown for it; it leaves with this block while the request
+     runs. -->
+<ng-container *ngIf="loadError() as e">
+  <h1 #loadErrorHeading tabindex="-1" data-testid="load-error-heading">Hotel</h1>
+  <app-error-message [error]="e">
+    <button type="button" data-testid="load-retry" (click)="retry()">Retry</button>
+  </app-error-message>
+  <app-error-message [error]="bookError()">
+    <a
+      *ngIf="bookError()?.status === 401"
+      routerLink="/login"
+      [queryParams]="{ returnUrl: router.url }"
+      data-testid="login-again"
+    >Log in again</a>
+  </app-error-message>
+</ng-container>
+
+<!-- A newer load keeps the previous hotel here but hidden, so none of it can be
+     seen, focused or clicked, and the new detail then reuses its room rows by
+     id. A plain div, whose display no style sets, so the [hidden] rule of the
+     browser's own style sheet applies. -->
+<div *ngIf="hotel() as hotel" [hidden]="loadPending()">
+  <header class="hotel-header">
+    <h1 #hotelHeading tabindex="-1" data-testid="hotel-name">{{ hotel.name }}</h1>
+    <p class="hotel-meta">{{ hotel.city }}</p>
+    <p class="hotel-meta">{{ hotel.address }}</p>
+    <p class="hotel-description">{{ hotel.description }}</p>
+    <p class="hotel-stay">
+      <time [attr.datetime]="hotel.checkIn">{{ hotel.checkIn | date }}</time>
+      to <time [attr.datetime]="hotel.checkOut">{{ hotel.checkOut | date }}</time>,
+      {{ hotel.nights }} {{ hotel.nights === 1 ? 'night' : 'nights' }},
+      {{ hotel.guests }} {{ hotel.guests === 1 ? 'guest' : 'guests' }}
+    </p>
+  </header>
+
+  <!-- A 401 here is the inline branch of the app's 401 rule: the page stays put
+       and offers a way back to this URL after logging in again. A 409 stays
+       here while the page revalidates the stay, and the table below then
+       shows the fresh counts. -->
+  <app-error-message [error]="bookError()">
+    <a
+      #loginAgain
+      *ngIf="bookError()?.status === 401"
+      routerLink="/login"
+      [queryParams]="{ returnUrl: router.url }"
+      data-testid="login-again"
+    >Log in again</a>
+  </app-error-message>
+
+  <!-- Six columns are wider than a phone screen. The component CSS gives this
+       wrapper overflow-x: auto, so the table scrolls inside it instead of
+       widening the page, and position: relative, so it also clips the
+       absolutely positioned visually hidden "Actions" text. When the wrapper
+       is narrow, the CSS pins the room type and Book columns to its edges, so
+       every Book shows without scrolling and keeps its row's name, and shades
+       their inner edges while columns are hidden beneath. Every Book button
+       can be disabled, so the wrapper itself is a focusable region named by the
+       caption: Tab reaches it and the arrow keys scroll it. -->
+  <div
+    #roomsScroll
+    *ngIf="hotel.roomTypes.length > 0"
+    class="rooms-scroll"
+    role="region"
+    aria-labelledby="rooms-caption"
+    tabindex="0"
+    data-testid="rooms-scroll"
+  >
+    <table class="rooms">
+      <caption id="rooms-caption">Rooms</caption>
+      <thead>
+        <tr>
+          <th scope="col">Room type</th>
+          <th scope="col" class="num">Max guests</th>
+          <th scope="col" class="num">Nightly price</th>
+          <th scope="col" class="num">Available</th>
+          <th scope="col" class="num">Stay total</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        <!-- Server order (by nightly price). "Available" counts free rooms whatever
+             the party size; capacity applies only through the disabled "Book".
+             A "Book" disabled by its room type says why below it, "Sold out"
+             before "Max N guests", and its description names that reason, as
+             a disabled button is skipped by Tab. A pending booking disables
+             every "Book" briefly and shows no reason. -->
+        <tr *ngFor="let rt of hotel.roomTypes; trackBy: trackById" [attr.data-testid]="'room-type-row-' + rt.id">
+          <td [attr.id]="'room-type-name-' + rt.id">{{ rt.name }}</td>
+          <td class="num">{{ rt.maxGuests }}</td>
+          <td class="num">{{ rt.nightlyPrice | currency: 'USD' }}</td>
+          <td class="num" [attr.data-testid]="'available-count-' + rt.id">{{ rt.availableRooms }}</td>
+          <td class="num" [attr.data-testid]="'stay-total-' + rt.id">{{ rt.stayTotal | currency: 'USD' }}</td>
+          <td class="actions">
+            <button
+              type="button"
+              [attr.data-testid]="'book-' + rt.id"
+              [attr.aria-describedby]="'room-type-name-' + rt.id + (rt.availableRooms === 0 || hotel.guests > rt.maxGuests ? ' book-reason-' + rt.id : '')"
+              [disabled]="rt.availableRooms === 0 || hotel.guests > rt.maxGuests || bookingPending()"
+              (click)="book(rt)"
+            >Book</button>
+            <span
+              *ngIf="rt.availableRooms === 0 || hotel.guests > rt.maxGuests"
+              class="book-reason"
+              [attr.id]="'book-reason-' + rt.id"
+              [attr.data-testid]="'book-reason-' + rt.id"
+            >{{ rt.availableRooms === 0 ? 'Sold out' : 'Max ' + rt.maxGuests + (rt.maxGuests === 1 ? ' guest' : ' guests') }}</span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Always mounted, directly after the hotel content: assistive technology
+     announces a change to an existing live region, not a region inserted with
+     its text. It holds only the load outcome; the room table stays outside it.
+     It is empty while a load runs, as the hidden content above is, so it
+     never shows the previous stay and every completed load is announced. -->
+<div role="status" aria-live="polite">
+  <ng-container *ngIf="!loadPending() && hotel() as hotel">
+    <p *ngIf="hotel.roomTypes.length > 0" class="visually-hidden">{{ hotel.name }}: {{ hotel.roomTypes.length }} {{ hotel.roomTypes.length === 1 ? 'room type' : 'room types' }} for this stay.</p>
+    <p *ngIf="hotel.roomTypes.length === 0" class="rooms-empty"><span class="visually-hidden">{{ hotel.name }}:</span> This hotel has no room types to book.</p>
+  </ng-container>
+</div>

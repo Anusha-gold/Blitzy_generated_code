@@ -1,0 +1,1435 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
+
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+
+using Npgsql;
+
+using SmartHotel.Api.Infrastructure;
+using SmartHotel.Data;
+
+namespace SmartHotel.Api.IntegrationTests.Infrastructure;
+
+/// <summary>
+/// Hosts the real API pipeline in-process for one test class, on a PostgreSQL database, a database login role and a
+/// JWT signing key of its own: an xUnit v3 class fixture built on <see cref="WebApplicationFactory{TEntryPoint}"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="InitializeAsync"/> creates the database <see cref="DatabaseName"/> and its login role on the
+/// <see cref="TestPostgres"/> server and starts the host, so the API migrates and seeds that database during fixture
+/// setup. <see cref="DisposeAsync"/> refuses every request that arrives from then on, waits for the requests still
+/// running on any of its hosts, ends the database access of those that outlive their abort, stops the hosts and drops
+/// the database and the role.
+/// </para>
+/// <para>
+/// Every host built from this factory, the loopback listener and a variant derived through
+/// <see cref="WebApplicationFactory{TEntryPoint}.WithWebHostBuilder"/> included, counts the requests its pipeline is
+/// running. A client task does not show that its request's server work has stopped: the in-process server completes it
+/// once the response has started or the request is aborted, while the API's handler and its database commands may go
+/// on, and a test that stops waiting for a client task at a deadline leaves that work running. The server-side count
+/// is what <see cref="DrainRequestsAsync"/> waits on, so a test, and the factory's own dispose, can establish that no
+/// request is still at work before the database goes away. A test's own drain leaves the hosts admitting requests, so
+/// a request whose client task is still pending after it can still start work, but only until the factory's dispose,
+/// which refuses it without passing it to the API.
+/// </para>
+/// <para>
+/// A test that must reach the real server, such as its rejection of a malformed request, which the in-process server
+/// never parses, starts a second host of the same API through <see cref="StartLoopbackListenerAsync"/>. It is built
+/// from this factory's own host builder: a variant derived through
+/// <see cref="WebApplicationFactory{TEntryPoint}.WithWebHostBuilder"/> builds its host through this factory's
+/// <see cref="CreateHost"/> as well, but never replaces the builder the listener uses.
+/// </para>
+/// <para>
+/// The host runs in the Development environment with in-memory <c>Cors:AllowedOrigin</c> configuration, and its
+/// <see cref="ISecretSource"/> is replaced by one that holds this factory's connection string and signing key. The
+/// connection string authenticates as this factory's own role with a random password, never as the server user, and
+/// no process environment variable is read for a secret or set, so no credential is shared with another test class.
+/// </para>
+/// <para>
+/// Every member is safe to call concurrently once the host has started. The connection string and the signing key are
+/// test credentials; they are never written to output.
+/// </para>
+/// </remarks>
+public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    private const string DatabaseNamePrefix = "smarthotel_it_";
+    private const string WebOrigin = "http://localhost:4200";
+    private const int SigningKeyLength = 64;
+
+    // Port 0 lets the operating system choose a free port, so concurrent test runs never collide.
+    private const string LoopbackListenerUrl = "http://127.0.0.1:0";
+
+    private static readonly TimeSpan ListenerStartTimeout = TimeSpan.FromMinutes(1);
+
+    // How long DisposeAsync's drain waits, its abort grace included: ten seconds for the requests still running, then
+    // what the abort's callbacks leave of five for those it aborted to stop. A test drains its own requests, so any
+    // still running here outlived the test that started them.
+    private static readonly TimeSpan DisposeDrainLimit = TimeSpan.FromSeconds(15);
+
+    // How much of a drain's limit is kept for the abort and for the requests it aborted to stop: half of a limit
+    // shorter than twice this.
+    private static readonly TimeSpan AbortGrace = TimeSpan.FromSeconds(5);
+
+    // How long DisposeAsync may take to end the database access of the requests its drain left running: to open its
+    // own session, refuse new sessions, end the others and confirm that none is left and a new one is refused.
+    private static readonly TimeSpan DatabaseAccessEndLimit = TimeSpan.FromSeconds(10);
+
+    // How often that confirmation reads the database's sessions again.
+    private static readonly TimeSpan SessionPollInterval = TimeSpan.FromMilliseconds(50);
+
+    // How long DisposeAsync then waits for those requests to stop, now that their database commands fail at once.
+    private static readonly TimeSpan HandlerExitLimit = TimeSpan.FromSeconds(10);
+
+    private readonly TestPostgres _postgres;
+
+    // The requests the pipeline of each host built from this factory is running. It is registered as that host's
+    // outermost startup filter and holds no service, so draining it never builds or reads a host.
+    private readonly InFlightRequests _inFlight = new();
+
+    // Serializes starting the listener and stopping it, so it is started at most once and never outlives the factory.
+    // It is never disposed: without its wait handle it holds no unmanaged resource, and a disposed gate would fail a
+    // caller that is still waiting for it with the wrong exception.
+    private readonly SemaphoreSlim _listenerGate = new(1, 1);
+
+    // Set to 1 by the first DisposeAsync. The base class's synchronous Dispose also calls DisposeAsync, so the
+    // shutdown and the drop must run only once however the factory is disposed.
+    private int _disposed;
+
+    // Set once InitializeAsync has created the database and the role. Until then no host can have served a request
+    // against them, so DisposeAsync has no database access to end.
+    private bool _databaseCreated;
+
+    // The builder of each host CreateHost built, keyed by that host's services. A variant derived through
+    // WithWebHostBuilder builds its host through this factory's CreateHost too, so the listener takes the builder keyed
+    // by this factory's own Services, never whichever builder came last. The keys are weak, so the entry of a disposed
+    // variant keeps nothing alive.
+    private readonly ConditionalWeakTable<IServiceProvider, IHostBuilder> _hostBuilders = new();
+
+    // The listening host built from this factory's own builder, and its address.
+    private IHost? _listener;
+    private Uri? _listenerAddress;
+
+    /// <summary>
+    /// Creates a factory with a new database name, a new random password for the login role of the same name, and a
+    /// new random signing key. Nothing is created or started until <see cref="InitializeAsync"/> runs.
+    /// </summary>
+    /// <param name="postgres">The assembly's PostgreSQL server fixture, which xUnit v3 injects.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="postgres"/> is <see langword="null"/>.</exception>
+    /// <exception cref="InvalidOperationException">The server fixture has not been initialized.</exception>
+    public SmartHotelApiFactory(TestPostgres postgres)
+    {
+        ArgumentNullException.ThrowIfNull(postgres);
+
+        _postgres = postgres;
+        DatabaseName = DatabaseNamePrefix + Guid.NewGuid().ToString("N");
+        DatabaseConnectionString = postgres.CreateDatabaseConnectionString(DatabaseName);
+        SigningKey = RandomNumberGenerator.GetHexString(SigningKeyLength, lowercase: true);
+        AllowedOrigin = WebOrigin;
+    }
+
+    /// <summary>
+    /// The name of this factory's database: <c>smarthotel_it_</c> followed by 32 lowercase hex digits.
+    /// </summary>
+    public string DatabaseName { get; }
+
+    /// <summary>
+    /// The Npgsql connection string for <see cref="DatabaseName"/>, the one the API uses, for tests that open their
+    /// own connections. It authenticates as the database's owner, a login role named <see cref="DatabaseName"/> with a
+    /// random password, so it must never be written to output.
+    /// </summary>
+    public string DatabaseConnectionString { get; }
+
+    /// <summary>
+    /// The HS256 signing key the API issues and validates tokens with: 64 random lowercase hex characters, which is
+    /// 64 bytes in UTF-8. Tests forge tokens with it.
+    /// </summary>
+    public string SigningKey { get; }
+
+    /// <summary>
+    /// The single origin the API's CORS policy allows, <c>http://localhost:4200</c>: a serialized <c>http</c> origin,
+    /// which the Development environment accepts.
+    /// </summary>
+    public string AllowedOrigin { get; }
+
+    /// <summary>
+    /// Replaces further services after the API's own registrations and the test secret source, such as a
+    /// <see cref="TimeProvider"/> that throws. It is read when the host is built, during <see cref="InitializeAsync"/>,
+    /// so a value set in an object initializer applies.
+    /// </summary>
+    public Action<IServiceCollection>? ServiceOverrides { get; init; }
+
+    /// <summary>
+    /// The token issuer (<c>iss</c>) the host issues and validates, read from its validated options.
+    /// </summary>
+    public string JwtIssuer => Services.GetRequiredService<IOptions<JwtOptions>>().Value.Issuer;
+
+    /// <summary>
+    /// The token audience (<c>aud</c>) the host issues and validates, read from its validated options.
+    /// </summary>
+    public string JwtAudience => Services.GetRequiredService<IOptions<JwtOptions>>().Value.Audience;
+
+    /// <summary>
+    /// Creates <see cref="DatabaseName"/> and its login role, then builds and starts the host, which validates its
+    /// options, applies the migrations and seeds the catalogue before it serves requests.
+    /// </summary>
+    /// <remarks>
+    /// When the API fails to start, its exception is replaced by an <see cref="InvalidOperationException"/> with no
+    /// inner exception, because provider and host messages can quote the username, the database or a configuration
+    /// value. Its message names only the operation, the exception types and any SQLSTATE, and says which server the
+    /// database is on, naming <c>SMARTHOTEL_TEST_POSTGRES</c> without its value. Invalid options, or a connection
+    /// string the data layer refuses, are reported by their own exception types. When database initialization fails,
+    /// for example on a failed migration, the API writes its sanitized initialization-failure record, disposes its
+    /// host and returns from its entry point without serving, so the reported type is the
+    /// <see cref="ObjectDisposedException"/> of the disposed host rather than the original failure's. Disposing the
+    /// factory attempts to drop the database and the role and reports a drop that fails; xUnit also disposes a fixture
+    /// whose initialization threw. A creation that fails partway attempts both drops itself before it reports the
+    /// failure, and that failure's message says when they did not succeed.
+    /// </remarks>
+    /// <returns>A task that completes once the host is serving requests.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The database could not be created, or the host failed to start. The message carries only the operation, the
+    /// exception types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">The test run was cancelled.</exception>
+    public async ValueTask InitializeAsync()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+
+        // Outside the try below: a failure here is already described by TestPostgres.
+        await _postgres.CreateDatabaseAsync(DatabaseConnectionString, cancellationToken);
+        Volatile.Write(ref _databaseCreated, true);
+
+        try
+        {
+            // Reading Server builds and starts the host synchronously; Task.Run keeps that start off xUnit's
+            // synchronization context.
+            await Task.Run(() => _ = Server, cancellationToken);
+        }
+        catch (Exception) when (cancellationToken.IsCancellationRequested)
+        {
+            // Raised afresh, so that no host exception rides along as its inner exception.
+            throw new OperationCanceledException(cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            throw new InvalidOperationException(
+                _postgres.DescribeServerFailure("Starting the API host failed.", exception));
+        }
+    }
+
+    /// <summary>
+    /// Starts, on the first call, a second host of the API that serves this factory's database through Kestrel on a
+    /// loopback port the operating system chooses, and returns its address. Later calls return the same address.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The in-process host is built and started first, if it is not running yet. The listener is then built from the
+    /// builder of that host, so <c>Program</c> runs again with every override of this factory: its migration and seed
+    /// find the database ready and change nothing. A variant derived through
+    /// <see cref="WebApplicationFactory{TEntryPoint}.WithWebHostBuilder"/>, such as one in another environment, never
+    /// supplies that builder, whichever host was built first. The two hosts share the database and the signing key, so
+    /// a token one issues is valid on the other.
+    /// </para>
+    /// <para>
+    /// The listener answers real HTTP/1.1 connections, so a test can send bytes the in-process server never parses,
+    /// such as an over-long request line or a malformed header. <see cref="DisposeAsync"/> stops and disposes it before
+    /// the in-process host. Concurrent calls are safe; they start one listener.
+    /// </para>
+    /// </remarks>
+    /// <param name="cancellationToken">Cancels waiting for the in-process host and for the listener to start.</param>
+    /// <returns>The listener's base address, such as <c>http://127.0.0.1:41234/</c>.</returns>
+    /// <exception cref="ObjectDisposedException">The factory has been disposed.</exception>
+    /// <exception cref="TimeoutException">The listener did not start within one minute.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The listener failed to start or reported no single bound address. The message carries only the operation, the
+    /// exception types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c>, and no inner
+    /// exception, because provider and host messages can quote the username or the database.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<Uri> StartLoopbackListenerAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+
+        await _listenerGate.WaitAsync(cancellationToken);
+        try
+        {
+            // Checked again under the gate: DisposeAsync may have stopped the hosts while this call waited.
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+            if (_listenerAddress is not null)
+            {
+                return _listenerAddress;
+            }
+
+            // Reading Server builds and starts the in-process host, which records its builder in CreateHost. It runs
+            // synchronously, so Task.Run keeps it off xUnit's synchronization context. Services is that host's own
+            // provider, so the builder found is never a variant's, whichever host was built first.
+            await Task.Run(() => _ = Server, cancellationToken);
+            if (!_hostBuilders.TryGetValue(Services, out IHostBuilder? builder))
+            {
+                throw new InvalidOperationException("The in-process host was not built from a host builder.");
+            }
+
+            // Kestrel replaces the in-process server in the services of the next build, and the URL replaces the
+            // default listening ports.
+            builder.ConfigureWebHost(static web => web.UseKestrel().UseUrls(LoopbackListenerUrl));
+            IHost? listener = null;
+            try
+            {
+                listener = await Task.Run(builder.Build, cancellationToken);
+                Uri address = await WaitForListenerAddressAsync(listener, cancellationToken);
+                _listener = listener;
+                _listenerAddress = address;
+                return address;
+            }
+            catch (Exception exception)
+            {
+                if (listener is not null)
+                {
+                    await StopListenerAsync(listener);
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    // Raised afresh, so that no host exception rides along as its inner exception.
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
+                if (exception is TimeoutException)
+                {
+                    throw;
+                }
+
+                // As for the in-process host: Program's startup failures can quote the username or the database.
+                throw new InvalidOperationException(
+                    _postgres.DescribeServerFailure("Starting the loopback listener failed.", exception));
+            }
+        }
+        finally
+        {
+            _listenerGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Refuses every request that reaches a host of this factory from now on, waits for the requests still running on
+    /// any of them, aborting those still running after ten seconds and then waiting for what is left of fifteen
+    /// seconds: five seconds less the time the abort's cancellation callbacks took, which is not bounded and can leave
+    /// nothing. It then ends the database access of the requests still running, stops and disposes the loopback
+    /// listener, if one was started, then the in-process host and its clients, and finally drops
+    /// <see cref="DatabaseName"/> and its login role, even when a step before throws or <see cref="InitializeAsync"/>
+    /// never created them. Calls after the first do nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Admission closes before the drain begins, under the lock that admits each request, so a request that races it
+    /// is either counted, and so waited for, or aborted without being passed to the API: no request starts work once
+    /// the drain has begun. The drain comes next because the in-process server's stop does not wait for the requests
+    /// it is running, and stopping a host disposes the services those requests still use.
+    /// </para>
+    /// <para>
+    /// When requests outlive their abort and the database exists, a session of this factory's role, which owns the
+    /// database and is not a superuser, sets the database's connection limit to zero, which refuses every new session
+    /// of the role, and terminates the role's other sessions of the database, so the requests' database commands fail
+    /// at once. Within ten seconds it must then find no other session of the role and have a new one refused. Then it
+    /// waits up to ten seconds for the requests to stop. The database is dropped once every request has stopped, or
+    /// once that confirmation holds, and also when ending the access failed, because every factory drops its database;
+    /// its forced drop ends whatever session is left.
+    /// </para>
+    /// <para>
+    /// No step reads <see cref="WebApplicationFactory{TEntryPoint}.Services"/>, so a factory whose host never started
+    /// has nothing to wait for, ends no database access and builds no host, even after its initialization failed.
+    /// </para>
+    /// </remarks>
+    /// <returns>
+    /// A task that completes once no request is running, both hosts are stopped and neither the database nor the role
+    /// exists.
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown once the database and the role have been dropped, or their drop has failed, when requests were still
+    /// running after they were aborted, a cancellation callback threw while they were aborted, ending the requests'
+    /// database access failed, a host failed to stop, or the database or the role could not be dropped. Its message
+    /// names every one of these failures by the operation, the number of requests still running, whether their
+    /// database access had been ended before the drop, the exception types, any SQLSTATE and the server note naming
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c>, and it carries no inner exception.
+    /// </exception>
+    public override async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
+        // First of all, so that no request starts work once the drain has begun.
+        _inFlight.CloseAdmission();
+
+        // Each entry is a value-free sentence, reported together once the database has been dropped.
+        List<string> failures = [];
+        int stillRunning = 0;
+        bool databaseAccessEnded = false;
+        bool endingAccessFailed = false;
+        try
+        {
+            try
+            {
+                stillRunning = await DrainRequestsAsync(DisposeDrainLimit);
+            }
+            catch (InvalidOperationException exception)
+            {
+                // Its message is already free of values. The requests it left running are counted now.
+                failures.Add(exception.Message);
+                stillRunning = _inFlight.Count;
+            }
+
+            // Only a request that is still running can still reach the database, and none has reached one that was
+            // never created.
+            if (stillRunning > 0 && Volatile.Read(ref _databaseCreated))
+            {
+                try
+                {
+                    await EndDatabaseAccessAsync();
+                    databaseAccessEnded = true;
+                    stillRunning = await _inFlight.WaitForIdleAsync(HandlerExitLimit) ? 0 : _inFlight.Count;
+                }
+                catch (Exception exception)
+                {
+                    endingAccessFailed = true;
+                    failures.Add(_postgres.DescribeServerFailure(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Ending the database access of the {stillRunning} requests still running on the API's "
+                            + $"hosts after their abort failed; the database's drop was attempted regardless."),
+                        exception));
+                }
+            }
+
+            try
+            {
+                try
+                {
+                    await DisposeListenerAsync();
+                }
+                finally
+                {
+                    await base.DisposeAsync();
+                }
+            }
+            catch (Exception exception)
+            {
+                failures.Add(_postgres.DescribeServerFailure("Stopping the API host failed.", exception));
+            }
+        }
+        finally
+        {
+            try
+            {
+                // Not the test's token: the database and the role must be dropped even when the run is being
+                // cancelled.
+                await _postgres.DropDatabaseAsync(DatabaseConnectionString, CancellationToken.None);
+            }
+            catch (InvalidOperationException exception)
+            {
+                failures.Add(exception.Message);
+            }
+        }
+
+        if (stillRunning > 0 && databaseAccessEnded)
+        {
+            // The database was dropped while these requests still run, because every factory drops its database on
+            // dispose and that outranks leaving it to them. They can no longer reach it: it had no session of its role
+            // left and refused new ones before the drop.
+            failures.Add(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{stillRunning} requests were still running on the API's hosts after they were aborted; their "
+                + $"database access had been ended before the database's drop."));
+        }
+        else if (stillRunning > 0 && !endingAccessFailed)
+        {
+            failures.Add(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{stillRunning} requests were still running on the API's hosts after they were aborted; the "
+                + $"factory's database had never been created."));
+        }
+
+        if (failures.Count > 0)
+        {
+            throw new InvalidOperationException(string.Join(" ", failures));
+        }
+    }
+
+    /// <summary>
+    /// Waits until no request is running on any host built from this factory, aborting the requests still running
+    /// once all but the abort's grace of <paramref name="limit"/> has passed, and returns when they have stopped or
+    /// <paramref name="limit"/> has passed since the call began. The abort's cancellation callbacks can make the call
+    /// outlast <paramref name="limit"/>, by the time they take beyond what was left of it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A request counts as running from the moment it enters its host's pipeline, ahead of every other middleware,
+    /// until the whole pipeline has returned for it, so its handler and every database command it awaited have
+    /// finished. A client task alone does not show that: the in-process server completes it once the response has
+    /// started or the request is aborted, while the handler may go on. A request that starts during the wait is waited
+    /// for as well.
+    /// </para>
+    /// <para>
+    /// <paramref name="limit"/> is the call's wait budget, the abort's grace included: the grace is five seconds, or
+    /// half of a limit shorter than ten seconds, and the requests are aborted once all but the grace has passed.
+    /// Aborting a request cancels its <see cref="HttpContext.RequestAborted"/> token, which the API passes to every
+    /// database command. The abort runs synchronously, and the token's cancellation callbacks can run on the caller's
+    /// thread. Their time comes out of the grace, but nothing bounds it, so slow callbacks shorten the wait that
+    /// follows, down to none, and can make the call outlast <paramref name="limit"/>. A request whose abort runs a
+    /// cancellation callback that throws is still aborted, and so are the requests after it.
+    /// </para>
+    /// <para>
+    /// It leaves the hosts admitting requests, so a test can go on using the factory afterwards, and a request whose
+    /// client task is still pending can still start work after it returns. Only <see cref="DisposeAsync"/> refuses
+    /// requests, from the moment it begins.
+    /// </para>
+    /// <para>
+    /// It takes no cancellation token by design: it is cleanup that must run in full while the test, or the run, is
+    /// being cancelled, so <paramref name="limit"/> alone bounds its waiting. It reads only this factory's own count,
+    /// never <see cref="WebApplicationFactory{TEntryPoint}.Services"/>, so it builds no host and returns at once when
+    /// no host has started.
+    /// </para>
+    /// </remarks>
+    /// <param name="limit">
+    /// The call's wait budget, measured from its start: how long it waits for the requests to stop, before their abort
+    /// and after it, the abort's grace included. The abort's cancellation callbacks take their time out of it but are
+    /// not bounded by it. Zero aborts the requests still running at once and gives them no grace.
+    /// </param>
+    /// <returns>
+    /// The number of requests still running when the wait after their abort ends: once <paramref name="limit"/> has
+    /// passed since the call began, or at once after the abort when its cancellation callbacks used up what was left
+    /// of <paramref name="limit"/>. Zero once every request has stopped.
+    /// </returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="limit"/> is negative or longer than <see cref="int.MaxValue"/> milliseconds.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// A cancellation callback threw while the requests were aborted. It is thrown once the wait after the abort has
+    /// ended, when the count the return value describes is taken, and its message carries only the number of requests
+    /// still running then, the exception types, any SQLSTATE and the server note naming
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c>, and no inner exception.
+    /// </exception>
+    public async Task<int> DrainRequestsAsync(TimeSpan limit)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, TimeSpan.FromMilliseconds(int.MaxValue));
+
+        long started = Stopwatch.GetTimestamp();
+        TimeSpan grace = limit / 2 < AbortGrace ? limit / 2 : AbortGrace;
+        if (await _inFlight.WaitForIdleAsync(limit - grace))
+        {
+            return 0;
+        }
+
+        List<Exception> abortFailures = _inFlight.AbortAll();
+
+        // What is left of the limit, so the time the abort's callbacks took comes out of the grace.
+        TimeSpan remaining = limit - Stopwatch.GetElapsedTime(started);
+        bool stopped = await _inFlight.WaitForIdleAsync(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+        int stillRunning = stopped ? 0 : _inFlight.Count;
+        if (abortFailures.Count > 0)
+        {
+            throw new InvalidOperationException(_postgres.DescribeServerFailure(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Aborting the running requests failed; {stillRunning} were still running at the end of the "
+                    + $"{limit.TotalSeconds} s drain."),
+                new AggregateException(abortFailures)));
+        }
+
+        return stillRunning;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="action"/> with a <see cref="SmartHotelDbContext"/> from a new service scope, to arrange
+    /// data or assert results. No transaction is opened, and nothing tracked survives the call.
+    /// </summary>
+    /// <param name="action">The work to run; it receives the context and <paramref name="cancellationToken"/>.</param>
+    /// <param name="cancellationToken">Passed to <paramref name="action"/> for its database calls.</param>
+    /// <returns>A task that completes once <paramref name="action"/> has completed and the scope is disposed.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="action"/> is <see langword="null"/>.</exception>
+    public async Task ExecuteDbAsync(
+        Func<SmartHotelDbContext, CancellationToken, Task> action,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        await using AsyncServiceScope scope = Services.CreateAsyncScope();
+        SmartHotelDbContext db = scope.ServiceProvider.GetRequiredService<SmartHotelDbContext>();
+        await action(db, cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="action"/> with a <see cref="SmartHotelDbContext"/> from a new service scope and returns
+    /// its result. No transaction is opened, and nothing tracked survives the call.
+    /// </summary>
+    /// <typeparam name="T">The result type.</typeparam>
+    /// <param name="action">The work to run; it receives the context and <paramref name="cancellationToken"/>.</param>
+    /// <param name="cancellationToken">Passed to <paramref name="action"/> for its database calls.</param>
+    /// <returns>The result of <paramref name="action"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="action"/> is <see langword="null"/>.</exception>
+    public async Task<T> ExecuteDbAsync<T>(
+        Func<SmartHotelDbContext, CancellationToken, Task<T>> action,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
+        await using AsyncServiceScope scope = Services.CreateAsyncScope();
+        SmartHotelDbContext db = scope.ServiceProvider.GetRequiredService<SmartHotelDbContext>();
+        return await action(db, cancellationToken);
+    }
+
+    /// <summary>
+    /// Opens a new connection of the test's own to <see cref="DatabaseName"/>, outside the host's services, for a
+    /// session the API does not control, such as one that holds a row lock in a transaction of its own or one that
+    /// observes the server's activity.
+    /// </summary>
+    /// <remarks>
+    /// The connection is unpooled: it is <see cref="DatabaseConnectionString"/> with <c>Pooling</c> off, so it never
+    /// takes one of the sessions the API's pool may open, and disposing it ends its session on the server. A test that
+    /// must tell a server without a free connection slot apart from other failures uses
+    /// <see cref="TryOpenDatabaseConnectionAsync"/> instead.
+    /// </remarks>
+    /// <param name="cancellationToken">Cancels the open.</param>
+    /// <returns>The open connection, with no transaction begun; the caller disposes it.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The connection could not be opened, including when the server has no connection slot free for it. The message
+    /// names only the operation, the exception types, any SQLSTATE and the server note naming
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c> without its value, and carries no inner exception, because a provider message
+    /// can quote the username or the database.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<NpgsqlConnection> OpenDatabaseConnectionAsync(CancellationToken cancellationToken)
+    {
+        // Never null: a refusal for want of a free slot is described and thrown like any other failure here.
+        return (await OpenConnectionAsync(pooled: false, refusalReturnsNull: false, cancellationToken))!;
+    }
+
+    /// <summary>
+    /// Opens a new connection of the test's own to <see cref="DatabaseName"/>, outside the host's services, unless the
+    /// server has no connection slot free for it: an unpooled one for a session the API does not control, such as one
+    /// that holds a row lock in a transaction of its own, or one from the API's own pool.
+    /// </summary>
+    /// <remarks>
+    /// An unpooled connection is <see cref="DatabaseConnectionString"/> with <c>Pooling</c> off, so it never takes one
+    /// of the sessions the API's pool may open, and disposing it ends its session on the server. A pooled one uses
+    /// <see cref="DatabaseConnectionString"/> as it is, the string the API's database context opens its connections
+    /// with, so it comes from the pool the API's requests draw from, and disposing it returns its session to that pool,
+    /// open and idle.
+    /// </remarks>
+    /// <param name="pooled">Whether the connection comes from the API's own pool.</param>
+    /// <param name="cancellationToken">Cancels the open.</param>
+    /// <returns>
+    /// The open connection, with no transaction begun, which the caller disposes; or <see langword="null"/> when the
+    /// server refused the session because no connection slot is free for the login role or the database
+    /// (SQLSTATE 53300, too_many_connections).
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// The connection could not be opened for any other reason. The message names only the operation, the exception
+    /// types, any SQLSTATE and the server note naming <c>SMARTHOTEL_TEST_POSTGRES</c> without its value, and carries no
+    /// inner exception, because a provider message can quote the username or the database.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public Task<NpgsqlConnection?> TryOpenDatabaseConnectionAsync(
+        bool pooled,
+        CancellationToken cancellationToken)
+    {
+        return OpenConnectionAsync(pooled, refusalReturnsNull: true, cancellationToken);
+    }
+
+    // Opens a connection to this factory's database, unpooled or from the API's pool. A refusal for want of a free
+    // connection slot (SQLSTATE 53300) returns null when refusalReturnsNull is set, and is described like any other
+    // failure otherwise.
+    private async Task<NpgsqlConnection?> OpenConnectionAsync(
+        bool pooled,
+        bool refusalReturnsNull,
+        CancellationToken cancellationToken)
+    {
+        NpgsqlConnection connection = new(pooled
+            ? DatabaseConnectionString
+            : new NpgsqlConnectionStringBuilder(DatabaseConnectionString) { Pooling = false }.ConnectionString);
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+            return connection;
+        }
+        catch (Exception exception)
+        {
+            // A connection that failed to open is never handed out, so it is disposed here.
+            await connection.DisposeAsync();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // Raised afresh, so that no provider exception rides along as its inner exception.
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            // A refusal for want of a free slot, when the caller handles it, is returned, not described. The server's
+            // message, which names the role or the database, is dropped with the exception.
+            if (refusalReturnsNull
+                && exception is PostgresException { SqlState: PostgresErrorCodes.TooManyConnections })
+            {
+                return null;
+            }
+
+            throw new InvalidOperationException(
+                _postgres.DescribeServerFailure("Opening a connection to the test database failed.", exception));
+        }
+    }
+
+    /// <summary>
+    /// Creates a request helper over a new client of the in-process host. The client does not follow redirects, so
+    /// tests see each response exactly as the API sends it.
+    /// </summary>
+    /// <returns>A new <see cref="ApiTestClient"/>; the factory disposes its client.</returns>
+    public ApiTestClient CreateApiClient()
+    {
+        return new ApiTestClient(CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false }));
+    }
+
+    /// <summary>
+    /// Looks up a seeded hotel's id by its catalogue name, so tests never hard-code ids.
+    /// </summary>
+    /// <param name="hotelName">The hotel's name, such as <c>SmartHotel Seattle Downtown</c>.</param>
+    /// <param name="cancellationToken">Cancels the query.</param>
+    /// <returns>The hotel's id.</returns>
+    /// <exception cref="ArgumentException"><paramref name="hotelName"/> is <see langword="null"/> or empty.</exception>
+    /// <exception cref="InvalidOperationException">No hotel, or more than one, has that name.</exception>
+    public async Task<int> GetHotelIdAsync(string hotelName, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(hotelName);
+
+        int? id = await ExecuteDbAsync(
+            (db, ct) => db.Hotels
+                .AsNoTracking()
+                .Where(hotel => hotel.Name == hotelName)
+                .Select(static hotel => (int?)hotel.Id)
+                .SingleOrDefaultAsync(ct),
+            cancellationToken);
+
+        return id ?? throw new InvalidOperationException($"No seeded hotel is named '{hotelName}'.");
+    }
+
+    /// <summary>
+    /// Looks up a seeded room type by its hotel's name and its own name, so tests never hard-code ids or prices.
+    /// </summary>
+    /// <param name="hotelName">The hotel's name, such as <c>SmartHotel Seattle Downtown</c>.</param>
+    /// <param name="roomTypeName">
+    /// The room type's name: <c>Standard</c>, <c>Deluxe</c>, <c>Family</c> or <c>Suite</c>.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the query.</param>
+    /// <returns>The room type's ids, nightly price and capacity.</returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="hotelName"/> or <paramref name="roomTypeName"/> is <see langword="null"/> or empty.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">No room type, or more than one, matches both names.</exception>
+    internal async Task<SeededRoomType> GetRoomTypeAsync(
+        string hotelName,
+        string roomTypeName,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(hotelName);
+        ArgumentException.ThrowIfNullOrEmpty(roomTypeName);
+
+        SeededRoomType? roomType = await ExecuteDbAsync(
+            (db, ct) => db.RoomTypes
+                .AsNoTracking()
+                .Where(type => type.Hotel.Name == hotelName && type.Name == roomTypeName)
+                .Select(static type => new SeededRoomType(type.Id, type.HotelId, type.NightlyPrice, type.MaxGuests))
+                .SingleOrDefaultAsync(ct),
+            cancellationToken);
+
+        return roomType ?? throw new InvalidOperationException(
+            $"No seeded room type is named '{roomTypeName}' in hotel '{hotelName}'.");
+    }
+
+    /// <summary>
+    /// Lists the rooms of one room type, ordered by room number.
+    /// </summary>
+    /// <param name="roomTypeId">The room type's id.</param>
+    /// <param name="cancellationToken">Cancels the query.</param>
+    /// <returns>
+    /// The rooms in ordinal room-number order, which for the seeded three-digit numbers is <c>x01</c> to <c>x10</c>;
+    /// empty when no room has that type.
+    /// </returns>
+    internal async Task<IReadOnlyList<SeededRoom>> GetRoomsAsync(int roomTypeId, CancellationToken cancellationToken)
+    {
+        List<SeededRoom> rooms = await ExecuteDbAsync(
+            (db, ct) => db.Rooms
+                .AsNoTracking()
+                .Where(room => room.RoomTypeId == roomTypeId)
+                .Select(static room => new SeededRoom(room.Id, room.RoomNumber))
+                .ToListAsync(ct),
+            cancellationToken);
+
+        // Sorted here, not in SQL, so the order is ordinal whatever the database's collation.
+        return [.. rooms.OrderBy(static room => room.RoomNumber, StringComparer.Ordinal)];
+    }
+
+    /// <summary>
+    /// Creates a factory for a host of its own, with a new database on the same server and a new signing key, whose
+    /// log records also reach <paramref name="capture"/>. Nothing is created or started until
+    /// <see cref="InitializeAsync"/> runs, and the caller disposes the new factory.
+    /// </summary>
+    /// <remarks>
+    /// Each of <paramref name="captureRules"/> becomes a filter rule that names the capture provider, so for the
+    /// categories it covers it outranks every rule that names no provider, <c>appsettings.json</c>'s included. Every
+    /// other category reaches the capture at the host's configured level, as it reaches the console.
+    /// </remarks>
+    /// <param name="capture">The provider that keeps the new host's records.</param>
+    /// <param name="captureRules">
+    /// Category names or prefixes, each with the lowest level the capture receives for it.
+    /// </param>
+    /// <param name="additionalOverrides">
+    /// Further service replacements, applied after the capture and its rules are registered, or
+    /// <see langword="null"/>.
+    /// </param>
+    /// <returns>The new factory, not yet started.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="capture"/> or <paramref name="captureRules"/> is <see langword="null"/>.
+    /// </exception>
+    internal SmartHotelApiFactory CreateLogCaptureVariant(
+        LogCapture capture,
+        IReadOnlyList<(string Category, LogLevel Level)> captureRules,
+        Action<IServiceCollection>? additionalOverrides)
+    {
+        ArgumentNullException.ThrowIfNull(capture);
+        ArgumentNullException.ThrowIfNull(captureRules);
+
+        // Copied now, so a later change to the caller's list cannot alter the host it builds.
+        (string Category, LogLevel Level)[] rules = [.. captureRules];
+
+        return new SmartHotelApiFactory(_postgres)
+        {
+            ServiceOverrides = services =>
+            {
+                services.AddSingleton<ILoggerProvider>(capture);
+                services.Configure<LoggerFilterOptions>(options =>
+                {
+                    foreach ((string category, LogLevel level) in rules)
+                    {
+                        options.AddFilter<LogCapture>(category, level);
+                    }
+                });
+
+                additionalOverrides?.Invoke(services);
+            },
+        };
+    }
+
+    /// <summary>
+    /// Builds and starts the in-process host as the base class does, then records <paramref name="builder"/> against
+    /// that host's services, so <see cref="StartLoopbackListenerAsync"/> builds the listener from the builder of this
+    /// factory's own host.
+    /// </summary>
+    /// <remarks>
+    /// A variant derived through <see cref="WebApplicationFactory{TEntryPoint}.WithWebHostBuilder"/> builds its host
+    /// through this method as well. Its builder is recorded against the variant's own host, so it never replaces the
+    /// builder the listener uses, whether the variant is built before or after this factory's host.
+    /// </remarks>
+    /// <param name="builder">The host builder that runs the API's <c>Program</c> with this factory's overrides.</param>
+    /// <returns>The started in-process host.</returns>
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        IHost host = base.CreateHost(builder);
+        _hostBuilders.AddOrUpdate(host.Services, builder);
+        return host;
+    }
+
+    // The deferred host that Build returns shares its start signal with the in-process host, which has already started,
+    // so its own StartAsync returns at once. Program starts the listener itself, and Kestrel has bound its address only
+    // once the listener's lifetime reports that it started. A Program that fails before it starts the host never
+    // signals, so the wait is bounded.
+    private static async Task<Uri> WaitForListenerAddressAsync(IHost listener, CancellationToken cancellationToken)
+    {
+        IHostApplicationLifetime lifetime = listener.Services.GetRequiredService<IHostApplicationLifetime>();
+        TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (lifetime.ApplicationStarted.Register(
+            static state => ((TaskCompletionSource)state!).TrySetResult(),
+            started))
+        {
+            await started.Task.WaitAsync(ListenerStartTimeout, cancellationToken);
+        }
+
+        ICollection<string>? addresses = listener.Services
+            .GetRequiredService<IServer>()
+            .Features
+            .Get<IServerAddressesFeature>()?
+            .Addresses;
+
+        return addresses is { Count: 1 }
+            ? new Uri(addresses.Single())
+            : throw new InvalidOperationException("The listener reported no single bound address.");
+    }
+
+    // Waits for a start in progress, so a listener it creates is stopped as well.
+    private async Task DisposeListenerAsync()
+    {
+        await _listenerGate.WaitAsync(CancellationToken.None);
+        try
+        {
+            IHost? listener = _listener;
+            _listener = null;
+            if (listener is not null)
+            {
+                await StopListenerAsync(listener);
+            }
+        }
+        finally
+        {
+            _listenerGate.Release();
+        }
+    }
+
+    private static async Task StopListenerAsync(IHost listener)
+    {
+        try
+        {
+            await listener.StopAsync(CancellationToken.None);
+        }
+        finally
+        {
+            if (listener is IAsyncDisposable asyncDisposable)
+            {
+                await asyncDisposable.DisposeAsync();
+            }
+            else
+            {
+                listener.Dispose();
+            }
+        }
+    }
+
+    // Ends the database access of the requests a drain left running, from a session of this factory's role, which
+    // owns the database and is not a superuser. A connection limit of zero refuses every new session of the role;
+    // PostgreSQL refuses ALLOW_CONNECTIONS false from a session of the database itself, but not a connection limit.
+    // Each of the role's other sessions of the database, which include every one the API opened, is then terminated
+    // until pg_stat_activity lists none, so the requests' database commands fail at once. A role may terminate its own
+    // sessions only, so a superuser's session or an autovacuum worker is left to the forced drop. A new session of the
+    // role must then be refused, and the sessions are listed once more after that refusal, so a session that passed
+    // the limit before it took effect is terminated as well. Every step shares one deadline and none takes the test's
+    // token: this is cleanup that must run in full while the run is being cancelled. It never reads Services.
+    private async Task EndDatabaseAccessAsync()
+    {
+        // Unpooled, so this session is never handed to the API and is closed when this returns. The limit, once set,
+        // stays until the database is dropped.
+        string unpooled = new NpgsqlConnectionStringBuilder(DatabaseConnectionString) { Pooling = false }
+            .ConnectionString;
+        using CancellationTokenSource deadline = new(DatabaseAccessEndLimit);
+
+        await using NpgsqlConnection session = new(unpooled);
+        await session.OpenAsync(deadline.Token);
+
+        // The name is the factory's own smarthotel_it_<32 hex digits>, which TestPostgres validated when it built the
+        // connection string, quoted as TestPostgres quotes it.
+        await using (NpgsqlCommand refuseSessions = new(
+            $"ALTER DATABASE \"{DatabaseName}\" CONNECTION LIMIT 0",
+            session))
+        {
+            await refuseSessions.ExecuteNonQueryAsync(deadline.Token);
+        }
+
+        // Each poll is its own autocommit statement, so it reads a fresh pg_stat_activity snapshot. It counts the
+        // sessions it found, each of which it has just signalled to terminate.
+        await using NpgsqlCommand terminateSessions = new(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+            + "WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid()",
+            session);
+        bool refusalConfirmed = false;
+        while (true)
+        {
+            long remaining = (long)(await terminateSessions.ExecuteScalarAsync(deadline.Token))!;
+            if (remaining == 0)
+            {
+                if (refusalConfirmed)
+                {
+                    return;
+                }
+
+                await ConfirmSessionRefusedAsync(unpooled, deadline.Token);
+                refusalConfirmed = true;
+                continue;
+            }
+
+            await Task.Delay(SessionPollInterval, deadline.Token);
+        }
+    }
+
+    // Opens a new session of the role and requires PostgreSQL to refuse it for the database's connection limit. The
+    // exception thrown otherwise names no value.
+    private static async Task ConfirmSessionRefusedAsync(string unpooled, CancellationToken cancellationToken)
+    {
+        await using NpgsqlConnection probe = new(unpooled);
+        try
+        {
+            await probe.OpenAsync(cancellationToken);
+        }
+        catch (PostgresException refused) when (refused.SqlState == PostgresErrorCodes.TooManyConnections)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            "The database accepted a new session of its role after its connection limit was set to zero.");
+    }
+
+    // The overrides below are in time for everything the API checks at startup. Program.cs reads no configuration
+    // and resolves no service before Build(): AddSmartHotelData's connection-string callback, the JwtBearer options,
+    // the JwtOptions signing-key post-configuration and the CORS policy all resolve the secret source and the options
+    // through DI. WebApplicationFactory's deferred host applies these registrations while Program builds its host,
+    // then lets the entry point continue past Build(), so options validation and DatabaseInitializer (migrate, then
+    // seed) run against them before app.Run() starts the TestServer. Removing Program's EnvironmentSecretSource means
+    // it is never constructed, so the process environment is never read for a secret.
+
+    /// <summary>
+    /// Selects the Development environment, adds the allowed origin as in-memory configuration, and replaces the
+    /// secret source with this factory's credentials, followed by <see cref="ServiceOverrides"/>. Last, it puts this
+    /// factory's request count first among the startup filters, so every host built through this method counts its
+    /// requests for <see cref="DrainRequestsAsync"/> and refuses them once <see cref="DisposeAsync"/> has begun.
+    /// </summary>
+    /// <param name="builder">The API's web host builder.</param>
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        builder.UseEnvironment("Development");
+
+        // Added after the API's own configuration sources, so it wins over any Cors__AllowedOrigin variable.
+        string allowedOriginKey = ConfigurationPath.Combine(
+            ApiCorsOptions.SectionName,
+            nameof(ApiCorsOptions.AllowedOrigin));
+        builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
+            new Dictionary<string, string?> { [allowedOriginKey] = AllowedOrigin }));
+
+        builder.ConfigureTestServices(services =>
+        {
+            services.RemoveAll<ISecretSource>();
+            services.AddSingleton<ISecretSource>(new TestSecretSource(DatabaseConnectionString, SigningKey));
+            ServiceOverrides?.Invoke(services);
+
+            // The host applies its startup filters in registration order, each wrapping those after it, so the first
+            // one's middleware runs ahead of every other, the framework's own filters included.
+            services.Insert(0, ServiceDescriptor.Singleton<IStartupFilter>(_inFlight));
+        });
+    }
+
+    /// <summary>
+    /// A seeded room type, as <see cref="GetRoomTypeAsync"/> returns it.
+    /// </summary>
+    /// <param name="Id">The room type's id.</param>
+    /// <param name="HotelId">The owning hotel's id.</param>
+    /// <param name="NightlyPrice">The price per night in USD.</param>
+    /// <param name="MaxGuests">The largest party one room of this type can host.</param>
+    internal sealed record SeededRoomType(int Id, int HotelId, decimal NightlyPrice, int MaxGuests);
+
+    /// <summary>
+    /// A seeded room, as <see cref="GetRoomsAsync"/> returns it.
+    /// </summary>
+    /// <param name="Id">The room's id, the <c>RoomId</c> of its bookings.</param>
+    /// <param name="RoomNumber">The room's number, unique within its hotel, such as <c>101</c>.</param>
+    internal sealed record SeededRoom(int Id, string RoomNumber);
+
+    /// <summary>
+    /// One record as <see cref="LogCapture"/> received it, rendered when it was written.
+    /// </summary>
+    /// <param name="Category">The logger's category.</param>
+    /// <param name="Level">The record's level.</param>
+    /// <param name="EventId">The record's numeric event id.</param>
+    /// <param name="Message">The formatted message.</param>
+    /// <param name="Text">The formatted message followed by every state value, the exception and the scopes.</param>
+    /// <param name="Scopes">The scopes the provider saw around the record.</param>
+    /// <param name="HasException">Whether the record carried an exception.</param>
+    internal sealed record CapturedLog(
+        string Category,
+        LogLevel Level,
+        int EventId,
+        string Message,
+        string Text,
+        string Scopes,
+        bool HasException)
+    {
+        /// <summary>
+        /// Names the record by its level, category and event id only, so an assertion that prints it never repeats a
+        /// logged value.
+        /// </summary>
+        /// <returns>
+        /// The level, category and event id, such as <c>Warning SmartHotel.Api.Modules.Auth.AuthService[1002]</c>.
+        /// </returns>
+        public override string ToString()
+        {
+            return string.Create(CultureInfo.InvariantCulture, $"{Level} {Category}[{EventId}]");
+        }
+    }
+
+    /// <summary>
+    /// A log provider that keeps every record it receives, in arrival order, as a console provider configured to show
+    /// everything would print it: the message, every state value, the exception and the scopes.
+    /// </summary>
+    /// <remarks>
+    /// Records are only ever added, so a <see cref="Count"/> read before an action marks where that action's records
+    /// begin. The provider keeps recording after the host disposes it, so the records a stopping host writes are kept
+    /// too. Configuration names it by <see cref="Alias"/>, as <c>Logging:Console</c> names the console provider. Every
+    /// member is safe to call concurrently.
+    /// </remarks>
+    [ProviderAlias(Alias)]
+    internal sealed class LogCapture : ILoggerProvider, ISupportExternalScope
+    {
+        /// <summary>
+        /// The name configuration addresses this provider by, as in <c>LogCapture:LogLevel:Default</c>.
+        /// </summary>
+        public const string Alias = "LogCapture";
+
+        private readonly ConcurrentQueue<CapturedLog> _records = new();
+        private IExternalScopeProvider? _scopeProvider;
+
+        /// <summary>
+        /// Capture rules that admit EF Core's categories at every level and the application's from Information,
+        /// whatever <c>appsettings.json</c> sets for them, so the data layer and the API's own records are held to
+        /// their outcomes at any verbosity.
+        /// </summary>
+        public static IReadOnlyList<(string Category, LogLevel Level)> DataLayerRules { get; } =
+        [
+            ("Microsoft.EntityFrameworkCore", LogLevel.Trace),
+            ("SmartHotel", LogLevel.Information),
+        ];
+
+        /// <summary>
+        /// The number of records received so far.
+        /// </summary>
+        public int Count => _records.Count;
+
+        /// <summary>
+        /// Every record received so far, in arrival order.
+        /// </summary>
+        public IReadOnlyList<CapturedLog> Records => [.. _records];
+
+        /// <summary>
+        /// Fails the test when any of <paramref name="records"/> matches <paramref name="forbidden"/>, naming each
+        /// distinct match by its level, category and event id only, never by its text.
+        /// </summary>
+        /// <param name="records">The records to check.</param>
+        /// <param name="forbidden">Selects the records that must not exist.</param>
+        /// <param name="description">What the forbidden records are, completing "Expected no ...".</param>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name="records"/> or <paramref name="forbidden"/> is <see langword="null"/>.
+        /// </exception>
+        public static void AssertNone(
+            IEnumerable<CapturedLog> records,
+            Func<CapturedLog, bool> forbidden,
+            string description)
+        {
+            ArgumentNullException.ThrowIfNull(records);
+            ArgumentNullException.ThrowIfNull(forbidden);
+
+            string[] offending =
+            [
+                .. records
+                    .Where(forbidden)
+                    .Select(static record => record.ToString())
+                    .Distinct(StringComparer.Ordinal),
+            ];
+            if (offending.Length > 0)
+            {
+                Assert.Fail($"Expected no {description}, but found: {string.Join("; ", offending)}.");
+            }
+        }
+
+        /// <summary>
+        /// Returns the records received after the first <paramref name="mark"/> ones, in arrival order.
+        /// </summary>
+        /// <param name="mark">A <see cref="Count"/> read earlier.</param>
+        /// <returns>The records written since that count was read.</returns>
+        public IReadOnlyList<CapturedLog> Since(int mark)
+        {
+            // The queue enumerates a snapshot in arrival order, so the records from mark on are those written after it.
+            return [.. _records.Skip(mark)];
+        }
+
+        /// <summary>
+        /// Creates the logger that keeps the records of one category.
+        /// </summary>
+        /// <param name="categoryName">The category the logger factory asks for.</param>
+        /// <returns>The capturing logger for <paramref name="categoryName"/>.</returns>
+        public ILogger CreateLogger(string categoryName)
+        {
+            return new CapturingLogger(this, categoryName);
+        }
+
+        /// <summary>
+        /// Receives the logger factory's scope provider, from which the scopes around each record are read.
+        /// </summary>
+        /// <param name="scopeProvider">The factory's scope provider.</param>
+        public void SetScopeProvider(IExternalScopeProvider scopeProvider)
+        {
+            Volatile.Write(ref _scopeProvider, scopeProvider);
+        }
+
+        /// <summary>
+        /// Does nothing: the records stay readable, and later records are still kept, after the host disposes its
+        /// providers.
+        /// </summary>
+        public void Dispose()
+        {
+        }
+
+        private sealed class CapturingLogger(LogCapture provider, string categoryName) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull
+            {
+                return Volatile.Read(ref provider._scopeProvider)?.Push(state);
+            }
+
+            // The logger factory has already applied the filter rules, so every level that reaches here is kept.
+            public bool IsEnabled(LogLevel logLevel)
+            {
+                return logLevel != LogLevel.None;
+            }
+
+            public void Log<TState>(
+                LogLevel logLevel,
+                EventId eventId,
+                TState state,
+                Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                ArgumentNullException.ThrowIfNull(formatter);
+
+                string message = formatter(state, exception);
+                StringBuilder text = new(message);
+                if (state is IEnumerable<KeyValuePair<string, object?>> values)
+                {
+                    foreach (KeyValuePair<string, object?> value in values)
+                    {
+                        text.Append(" | ").Append(value.Key).Append('=')
+                            .Append(Convert.ToString(value.Value, CultureInfo.InvariantCulture));
+                    }
+                }
+
+                if (exception is not null)
+                {
+                    text.Append(" | ").Append(exception);
+                }
+
+                StringBuilder scopes = new();
+                Volatile.Read(ref provider._scopeProvider)?.ForEachScope(
+                    static (scope, builder) => builder
+                        .Append(Convert.ToString(scope, CultureInfo.InvariantCulture))
+                        .Append(" => "),
+                    scopes);
+                text.Append(" | ").Append(scopes);
+
+                provider._records.Enqueue(new CapturedLog(
+                    categoryName,
+                    logLevel,
+                    eventId.Id,
+                    message,
+                    text.ToString(),
+                    scopes.ToString(),
+                    exception is not null));
+            }
+        }
+    }
+
+    // A class rather than a record: a record's synthesized ToString would print the credentials.
+    private sealed class TestSecretSource(string databaseConnectionString, string jwtSigningKey) : ISecretSource
+    {
+        public string? DatabaseConnectionString { get; } = databaseConnectionString;
+
+        public string? JwtSigningKey { get; } = jwtSigningKey;
+    }
+
+    // The requests the pipelines of this factory's hosts are running. As a host's first startup filter it adds the
+    // outermost middleware, which counts a request from before any other middleware sees it until the whole pipeline
+    // has returned for it, however it ends. Once admission is closed, the middleware aborts each request that arrives
+    // instead and never passes it on, so it reaches no other middleware and no part of the API. Admitting a request
+    // and closing admission take the same lock, so a request that races the close is either counted, and so waited
+    // for, or refused. The middleware writes nothing and logs nothing, and an exception passes through it unchanged.
+    // One instance serves every host the factory builds. Every member is safe to call concurrently.
+    private sealed class InFlightRequests : IStartupFilter
+    {
+        private readonly object _gate = new();
+        private readonly HashSet<RunningRequest> _running = [];
+
+        // Created by a wait that finds a request running, and completed and cleared when the last one ends.
+        private TaskCompletionSource? _idle;
+
+        // Set by the factory's dispose, and never cleared.
+        private bool _closed;
+
+        public int Count
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _running.Count;
+                }
+            }
+        }
+
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next)
+        {
+            return app =>
+            {
+                app.Use(TrackAsync);
+                next(app);
+            };
+        }
+
+        // Refuses every request that arrives from now on. The requests already counted run on until they end or are
+        // aborted.
+        public void CloseAdmission()
+        {
+            lock (_gate)
+            {
+                _closed = true;
+            }
+        }
+
+        // Whether no request was running at some moment within limit.
+        public async Task<bool> WaitForIdleAsync(TimeSpan limit)
+        {
+            Task idle;
+            lock (_gate)
+            {
+                if (_running.Count == 0)
+                {
+                    return true;
+                }
+
+                _idle ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                idle = _idle.Task;
+            }
+
+            try
+            {
+                // Not a test's token: a drain must run in full while the test is being cancelled.
+                await idle.WaitAsync(limit, CancellationToken.None);
+                return true;
+            }
+            catch (TimeoutException)
+            {
+                return false;
+            }
+        }
+
+        // Aborts every request still running, each even when aborting an earlier one threw, and returns what threw.
+        public List<Exception> AbortAll()
+        {
+            RunningRequest[] running;
+            lock (_gate)
+            {
+                running = [.. _running];
+            }
+
+            List<Exception> failures = [];
+            foreach (RunningRequest request in running)
+            {
+                try
+                {
+                    request.Abort();
+                }
+                catch (AggregateException failure)
+                {
+                    // The cancellation took effect before its callbacks ran; the drain reports the failure once it
+                    // knows whether the requests stopped.
+                    failures.Add(failure);
+                }
+            }
+
+            return failures;
+        }
+
+        private async Task TrackAsync(HttpContext context, RequestDelegate next)
+        {
+            RunningRequest request = new(context);
+            bool admitted;
+            lock (_gate)
+            {
+                admitted = !_closed;
+                if (admitted)
+                {
+                    _running.Add(request);
+                }
+            }
+
+            if (!admitted)
+            {
+                // Outside the lock, because an abort can run the request's cancellation callbacks on this thread. The
+                // server ends the request without a response, and its client sees it fail.
+                context.Abort();
+                return;
+            }
+
+            try
+            {
+                await next(context);
+            }
+            finally
+            {
+                request.End();
+                TaskCompletionSource? idle = null;
+                lock (_gate)
+                {
+                    _running.Remove(request);
+                    if (_running.Count == 0)
+                    {
+                        idle = _idle;
+                        _idle = null;
+                    }
+                }
+
+                idle?.TrySetResult();
+            }
+        }
+    }
+
+    // One request a pipeline is running. Its context is aborted only until the pipeline has returned for it, so a
+    // context the server has since reused for another request is never aborted. Aborting can run the callbacks of the
+    // request's RequestAborted token on the calling thread, as the in-process server does.
+    private sealed class RunningRequest(HttpContext context)
+    {
+        private readonly object _gate = new();
+        private bool _ended;
+
+        public void Abort()
+        {
+            lock (_gate)
+            {
+                if (!_ended)
+                {
+                    context.Abort();
+                }
+            }
+        }
+
+        public void End()
+        {
+            lock (_gate)
+            {
+                _ended = true;
+            }
+        }
+    }
+}

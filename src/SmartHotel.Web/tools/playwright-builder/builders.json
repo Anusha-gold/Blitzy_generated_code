@@ -1,0 +1,10 @@
+{
+  "$schema": "../../node_modules/@angular-devkit/architect/src/builders-schema.json",
+  "builders": {
+    "test": {
+      "implementation": "./index.js",
+      "schema": "./schema.json",
+      "description": "Runs Playwright Test with the workspace configuration."
+    }
+  }
+}

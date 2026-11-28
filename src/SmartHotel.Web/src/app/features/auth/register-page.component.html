@@ -1,0 +1,56 @@
+<section class="auth-page">
+  <h1 #heading tabindex="-1">Register</h1>
+
+  <form [formGroup]="form" (ngSubmit)="submit()">
+    <div class="field">
+      <label for="register-email">Email</label>
+      <input
+        #emailInput
+        id="register-email"
+        data-testid="register-email"
+        type="email"
+        formControlName="email"
+        autocomplete="email"
+        required
+        [attr.aria-invalid]="fieldErrors().has('email') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('email') ?? null"
+      />
+    </div>
+
+    <div class="field">
+      <label for="register-password">Password</label>
+      <input
+        #passwordInput
+        id="register-password"
+        data-testid="register-password"
+        type="password"
+        formControlName="password"
+        autocomplete="new-password"
+        required
+        [attr.aria-invalid]="fieldErrors().has('password') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('password') ?? null"
+      />
+    </div>
+
+    <div class="field">
+      <label for="register-full-name">Full name</label>
+      <input
+        #fullNameInput
+        id="register-full-name"
+        data-testid="register-full-name"
+        type="text"
+        formControlName="fullName"
+        autocomplete="name"
+        required
+        [attr.aria-invalid]="fieldErrors().has('fullName') ? 'true' : null"
+        [attr.aria-describedby]="fieldErrors().get('fullName') ?? null"
+      />
+    </div>
+
+    <app-error-message [error]="error()" [fieldErrorIdPrefix]="errorIdPrefix"></app-error-message>
+
+    <button #submitButton type="submit" data-testid="register-submit" [disabled]="pending()">Create account</button>
+  </form>
+
+  <p><a routerLink="/login" [queryParams]="loginLinkQuery" data-testid="login-link">Already registered? Log in</a></p>
+</section>
