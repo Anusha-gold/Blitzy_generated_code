@@ -3,7 +3,11 @@
  * `globalSetup` by `playwright.config.ts`. A fresh run, the default, pins
  * this machine's local Docker daemon, builds the acceptance stack and holds
  * this host's acceptance-run lock while it owns it; a barrier file keeps
- * later fresh runs out after a Compose command it could not see finish.
+ * later fresh runs out after a Compose command it could not see finish. A
+ * run interrupted while such a command runs, by a stop signal or by its
+ * process exiting, stops the command's process tree first, on POSIX the
+ * whole process group the command runs in, and deletes the file once that
+ * tree is confirmed gone, so the next fresh run proceeds.
  * Reuse mode (`E2E_REUSE_STACK=1`) only probes a running stack. The target
  * is the one `./support/stack-target` resolves for the configuration too.
  * Its own messages hold fixed text and validated values only, never a raw
@@ -50,7 +54,8 @@ interface ComposeResult {
   /**
    * Whether the command's end was confirmed: the `docker` CLI exited and its
    * output pipes closed and, after a timeout, on POSIX the stop step
-   * ({@link createProcessTreeStop}) found its whole process tree gone, or on
+   * ({@link createProcessTreeStop}) found its whole process tree, its process
+   * group included, gone, or on
    * Windows `taskkill /T /F` exited 0. It is `false` when the drain deadline
    * ({@link COMPOSE_DRAIN_TIMEOUT_MS}) ended the wait first, a command that
    * exited on its own but whose pipes stayed open until then included, and
@@ -91,9 +96,9 @@ const COMPOSE_DOWN_TIMEOUT_MS = 5 * 60_000;
 const COMPOSE_UP_TIMEOUT_MS = 30 * 60_000;
 
 /**
- * How long a Compose command that outlived its deadline, the `docker` CLI and
- * every process it started, gets to exit after SIGTERM before what is left of
- * it is sent SIGKILL.
+ * How long a Compose command that outlived its deadline or whose run was
+ * interrupted, the `docker` CLI and every process it started, gets to exit
+ * after SIGTERM before what is left of it is sent SIGKILL.
  */
 const COMPOSE_KILL_GRACE_MS = 10_000;
 
@@ -103,21 +108,23 @@ const COMPOSE_KILL_GRACE_MS = 10_000;
  * every process of its tree to be gone. A process it started, such as the
  * Compose plugin, can hold the pipes open after it; they are then closed from
  * this side, and the command's end counts as unconfirmed
- * ({@link ComposeResult.ended}).
+ * ({@link ComposeResult.ended}). The stop of an interrupted run waits as long
+ * for the tree alone ({@link stopProcessTreeNow}).
  */
 const COMPOSE_DRAIN_TIMEOUT_MS = 10_000;
 
 /**
- * How often the process tree of a timed-out Compose command is read again
- * while it is stopped and drained, so a process it starts meanwhile is
- * signalled too and the wait ends soon after the whole tree is gone.
+ * How often the process tree of a timed-out or interrupted Compose command is
+ * read again while it is stopped and drained, so a process it starts
+ * meanwhile is signalled too and the wait ends soon after the whole tree is
+ * gone.
  */
 const COMPOSE_STOP_POLL_INTERVAL_MS = 250;
 
 /**
- * Upper bound for one run of `ps` or `taskkill` while a timed-out Compose
- * command is stopped. Both run synchronously, so a hung one must not stall
- * the stop.
+ * Upper bound for one run of `ps` or `taskkill` while a timed-out or
+ * interrupted Compose command is stopped. Both run synchronously, so a hung
+ * one must not stall the stop.
  */
 const PROCESS_TOOL_TIMEOUT_MS = 2_000;
 
@@ -125,10 +132,10 @@ const PROCESS_TOOL_TIMEOUT_MS = 2_000;
 const PROCESS_LIST_MAX_BYTES = 16 * 1_048_576;
 
 /**
- * The most times the process tree of a timed-out Compose command is read
- * again while it is frozen before SIGKILL. A frozen process starts no other,
- * so each read finds only processes started just before their parent was
- * frozen, and a read or two normally finds no new one.
+ * The most times the process tree of a timed-out or interrupted Compose
+ * command is read again while it is frozen before SIGKILL. A frozen process
+ * starts no other, so each read finds only processes started just before
+ * their parent was frozen, and a read or two normally finds no new one.
  */
 const PROCESS_TREE_FREEZE_MAX_PASSES = 10;
 
@@ -953,6 +960,12 @@ interface ProcessEntry {
   /** The parent's process id. */
   ppid: number;
   /**
+   * The id of the process group the process belongs to. A process inherits
+   * its parent's group and keeps it after that parent has died, unless it
+   * moves itself to another.
+   */
+  pgrp: number;
+  /**
    * When the process started, as the table reports it: clock ticks since boot
    * on Linux, the `ps` start time elsewhere. With the process id it identifies
    * the process, so a process that reuses the id of one that ended is not
@@ -967,7 +980,8 @@ interface ProcessEntry {
  * Reads the process table on Linux from `/proc/<pid>/stat`. The command name
  * in that line is in parentheses and can hold spaces and parentheses itself,
  * so fields are counted from the last `)`: the state is the first after it,
- * the parent's id the second and the start time the twentieth.
+ * the parent's id the second, the process group's id the third and the
+ * start time the twentieth.
  *
  * @returns Every process that could be read, by process id.
  * @throws Error when `/proc` cannot be listed.
@@ -987,9 +1001,10 @@ function readProcTable(): Map<number, ProcessEntry> {
     }
     const fields = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
     const ppid = Number(fields[1]);
+    const pgrp = Number(fields[2]);
     const started = fields[19];
-    if (Number.isInteger(ppid) && started !== undefined) {
-      table.set(Number(name), { ppid, started, exited: fields[0] === 'Z' || fields[0] === 'X' });
+    if (Number.isInteger(ppid) && Number.isInteger(pgrp) && started !== undefined) {
+      table.set(Number(name), { ppid, pgrp, started, exited: fields[0] === 'Z' || fields[0] === 'X' });
     }
   }
   return table;
@@ -997,14 +1012,14 @@ function readProcTable(): Map<number, ProcessEntry> {
 
 /**
  * Reads the process table on POSIX systems other than Linux, such as macOS,
- * with `ps -A -o pid=,ppid=,stat=,lstart=`, within
+ * with `ps -A -o pid=,ppid=,pgid=,stat=,lstart=`, within
  * {@link PROCESS_TOOL_TIMEOUT_MS}.
  *
  * @returns Every listed process by process id, or `undefined` when `ps`
  *   cannot be run, fails or lists nothing.
  */
 function readPsTable(): Map<number, ProcessEntry> | undefined {
-  const result = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,stat=,lstart='], {
+  const result = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,stat=,lstart='], {
     encoding: 'utf8',
     maxBuffer: PROCESS_LIST_MAX_BYTES,
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -1015,9 +1030,14 @@ function readPsTable(): Map<number, ProcessEntry> | undefined {
   }
   const table = new Map<number, ProcessEntry>();
   for (const line of result.stdout.split('\n')) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S.*?)\s*$/.exec(line);
     if (match !== null) {
-      table.set(Number(match[1]), { ppid: Number(match[2]), started: match[4], exited: match[3].startsWith('Z') });
+      table.set(Number(match[1]), {
+        ppid: Number(match[2]),
+        pgrp: Number(match[3]),
+        started: match[5],
+        exited: match[4].startsWith('Z'),
+      });
     }
   }
   return table.size > 0 ? table : undefined;
@@ -1071,51 +1091,106 @@ function collectDescendants(table: Map<number, ProcessEntry>, roots: number[]): 
   return descendants;
 }
 
-/** A signal the process tree of a timed-out Compose command is sent: SIGTERM first, then SIGKILL. */
+/**
+ * A signal the process tree of a timed-out or interrupted Compose command is
+ * sent: SIGTERM first, then SIGKILL.
+ */
 type StopSignal = 'SIGTERM' | 'SIGKILL';
 
 /**
- * Prepares the stop of a timed-out Compose command's whole process tree on
- * POSIX: the `docker` CLI, the Compose plugin it runs as a child process, and
- * every process either of them started.
+ * Prepares the stop of a timed-out or interrupted Compose command's whole
+ * process tree on POSIX: the `docker` CLI, the Compose plugin it runs as a
+ * child process, and every process either of them started. {@link runCompose}
+ * spawns the CLI detached, so the CLI leads a process group (and session) of
+ * its own whose id is the CLI's process id. Every process the command starts
+ * joins that group and stays in it after its parent has died, because
+ * neither the CLI nor Compose moves a process to another group, so the tree
+ * is the CLI, its descendants and every member of its group.
  *
  * Each call of the returned function reads the process table again and adds
- * to the tree the descendants of the CLI while it runs and of every member
- * still alive, so a process started during the stop is found while its
- * parent lives, and a member stays in the tree after its parent has died.
- * Members are recorded with their start time: a process holding a member's
- * id with another start time is a different process, is never signalled and
- * leaves that member counted as gone. The call then sends `signal` to the CLI
- * and to every live member not yet sent it or SIGKILL, so each process gets
- * each signal once. Before SIGKILL the tree is frozen with SIGSTOP and read
- * again, up to {@link PROCESS_TREE_FREEZE_MAX_PASSES} times, until every
- * member a read shows is frozen: a stopped process cannot start another, and
- * one started just before its parent stopped shows under that parent in the
- * next read, so no process the tree starts at the last moment escapes the
- * kill.
+ * to the tree every live member of the CLI's group, and the descendants of
+ * the CLI while it runs and of every member still alive. A process started
+ * during the stop is therefore found, and so is one whose parent has died,
+ * whether the CLI still runs, awaits reaping or has been reaped. Members are
+ * recorded with their start time and group as a read shows them: a process
+ * holding a member's id with another start time is a different process, is
+ * never signalled and leaves that member counted as gone. The CLI counts as
+ * running while its handle reports no exit and no read has shown it gone:
+ * exited and awaiting reaping, absent, or under its id with another start
+ * time than the first read showed. The handle learns of the exit only when
+ * the event loop runs, which the stop of an interrupted run
+ * ({@link stopProcessTreeNow}) holds up while it waits. The call then sends
+ * `signal` to the CLI and to every live member not yet sent it or SIGKILL,
+ * so each process gets each signal once. Before SIGKILL the tree is frozen
+ * with SIGSTOP and read again, up to {@link PROCESS_TREE_FREEZE_MAX_PASSES}
+ * times, until every member a read shows is frozen: a stopped process cannot
+ * start another, and one started just before its parent stopped shows in the
+ * next read. The group is then also sent SIGKILL once as a whole, which
+ * reaches a member however recently it started.
  *
- * Nothing else is signalled. The CLI is not detached, so it and its tree stay
- * in the process group a stopped `ng test` stops as a whole, and no group is
- * addressed here, only these process ids. When the table cannot be read,
- * only the CLI is signalled, through its handle.
+ * The system reuses neither a process id nor a process group id while a
+ * process of that group remains, the CLI awaiting reaping included, so the
+ * group's id names the command's group for as long as the group exists. Once
+ * Node has reaped the CLI, a process the table shows under the CLI's id is
+ * another one, which shows that the command's group has ended: the search by
+ * group and every signal to the group then stop. The group is signalled as a
+ * whole only while the CLI is unreaped or a member of it was just found, by a
+ * read or by signal 0, and nothing outside the tree is signalled.
  *
- * @param child - The `docker` CLI process of the command.
+ * When the table cannot be read, the group is signalled as a whole, each
+ * signal once, while the CLI is unreaped, or, once Node has reaped it, while
+ * signal 0 shows that the group still has a member. Only the latter can
+ * confirm the end: signal 0 failing with ESRCH shows that the group is empty,
+ * and with it every recorded member that was in the group when last read,
+ * whereas a CLI awaiting reaping keeps its group in existence, so whether
+ * anything else of it still runs cannot be told.
+ *
+ * @param child - The `docker` CLI process of the command, spawned detached.
  * @returns The stop step: it signals as above and returns `true` once the
  *   tree is gone, that is the CLI has exited and no member is alive, an
  *   exited one awaiting reaping counting as gone; `false` while any of it
- *   runs or the table cannot be read to tell. It never throws.
+ *   runs or it cannot be told. It never throws.
  */
 function createProcessTreeStop(child: ChildProcess): (signal: StopSignal) => boolean {
-  const members = new Map<number, { started: string; frozen: boolean; sent?: StopSignal }>();
+  const cliPid = child.pid;
+  // Each member's start time and group as the last read showed them, whether
+  // a read has shown it gone, and what it was sent.
+  const members = new Map<
+    number,
+    { started: string; pgrp: number; gone: boolean; frozen: boolean; sent?: StopSignal }
+  >();
   let cliFrozen = false;
   let cliSent: StopSignal | undefined;
-  const cliRunning = () => child.exitCode === null && child.signalCode === null;
+  // The CLI's start time as the first read showed it, and whether a read has
+  // shown it gone since.
+  let cliStarted: string | undefined;
+  let cliGone = false;
+  // The strongest signal the group was sent as a whole, and whether a read
+  // has shown that the group's id no longer names the command's group.
+  let groupSent: StopSignal | undefined;
+  let groupEnded = false;
+  const cliReaped = () => child.exitCode !== null || child.signalCode !== null;
+  const cliRunning = () => !cliGone && !cliReaped();
+  const observeCli = (table: Map<number, ProcessEntry>) => {
+    if (cliPid === undefined) {
+      return;
+    }
+    const entry = table.get(cliPid);
+    if (entry !== undefined && (cliReaped() || (cliStarted !== undefined && entry.started !== cliStarted))) {
+      // Another process holds the CLI's id, which the system reuses only once
+      // the CLI's group has ended.
+      cliGone = true;
+      groupEnded = true;
+    } else if (entry === undefined || entry.exited) {
+      cliGone = true;
+    } else {
+      cliStarted ??= entry.started;
+    }
+  };
   const needs = (sent: StopSignal | undefined, signal: StopSignal) =>
     sent === undefined || (sent === 'SIGTERM' && signal === 'SIGKILL');
-  const isLive = (table: Map<number, ProcessEntry>, pid: number, started: string) => {
-    const entry = table.get(pid);
-    return entry !== undefined && entry.started === started && !entry.exited;
-  };
+  // Members not yet shown gone, as the last successful read left them.
+  const liveMembers = () => [...members].filter(([, member]) => !member.gone);
   const signalCli = (signal: 'SIGSTOP' | StopSignal) => {
     try {
       child.kill(signal);
@@ -1132,37 +1207,113 @@ function createProcessTreeStop(child: ChildProcess): (signal: StopSignal) => boo
       // signalled; the bounded drain still ends the wait.
     }
   };
-  // Reads the table and records the descendants of the CLI while it runs and
-  // of every live member.
-  const discover = (): Map<number, ProcessEntry> | undefined => {
-    const table = readProcessTable();
-    if (table !== undefined) {
-      const roots = [...members].filter(([pid, member]) => isLive(table, pid, member.started)).map(([pid]) => pid);
-      if (cliRunning() && child.pid !== undefined) {
-        roots.push(child.pid);
+  // Sends `signal` to the group whose id is `pgid` as a whole, and counts it
+  // as sent to the CLI and to every live member in that group.
+  const signalGroup = (pgid: number, signal: StopSignal) => {
+    groupSent = signal;
+    if (needs(cliSent, signal)) {
+      cliSent = signal;
+    }
+    for (const [, member] of liveMembers()) {
+      if (member.pgrp === pgid && needs(member.sent, signal)) {
+        member.sent = signal;
       }
-      for (const pid of collectDescendants(table, roots)) {
-        const started = table.get(pid)?.started;
-        if (started !== undefined && members.get(pid)?.started !== started) {
-          members.set(pid, { started, frozen: false });
+    }
+    try {
+      // A negative id addresses the process group with that id.
+      process.kill(-pgid, signal);
+    } catch {
+      // Deliberately ignored: the group emptied since, or a member cannot be
+      // signalled; the bounded drain still ends the wait.
+    }
+  };
+  // Whether signal 0 finds the group whose id is `pgid` empty (ESRCH); any
+  // other outcome, EPERM included, means a member remains.
+  const groupEmpty = (pgid: number) => {
+    try {
+      process.kill(-pgid, 0);
+      return false;
+    } catch (err) {
+      return errorCode(err) === 'ESRCH';
+    }
+  };
+  // Reads the table, marks the members it shows gone, and records every live
+  // member of the CLI's group and the descendants of the CLI while it runs
+  // and of every live member. Returns whether the table could be read; a
+  // failed read changes nothing.
+  const discover = (): boolean => {
+    const table = readProcessTable();
+    if (table === undefined) {
+      return false;
+    }
+    observeCli(table);
+    for (const [pid, member] of liveMembers()) {
+      const entry = table.get(pid);
+      if (entry === undefined || entry.exited || entry.started !== member.started) {
+        member.gone = true;
+      } else {
+        member.pgrp = entry.pgrp;
+      }
+    }
+    const record = (pid: number) => {
+      const entry = table.get(pid);
+      if (entry !== undefined && !entry.exited && members.get(pid)?.started !== entry.started) {
+        members.set(pid, { started: entry.started, pgrp: entry.pgrp, gone: false, frozen: false });
+      }
+    };
+    const roots = liveMembers().map(([pid]) => pid);
+    if (cliRunning() && cliPid !== undefined) {
+      roots.push(cliPid);
+    }
+    for (const pid of collectDescendants(table, roots)) {
+      record(pid);
+    }
+    if (cliPid !== undefined && !groupEnded) {
+      for (const [pid, entry] of table) {
+        if (pid !== cliPid && entry.pgrp === cliPid) {
+          record(pid);
         }
       }
     }
-    return table;
+    return true;
+  };
+  // One step while the table cannot be read: only the group as a whole can be
+  // signalled without risk to another process, and only signal 0 can tell
+  // its end, once Node has reaped the CLI.
+  const stepUnread = (signal: StopSignal): boolean => {
+    if (cliPid === undefined) {
+      return !cliRunning();
+    }
+    if (!cliReaped()) {
+      if (!groupEnded && needs(groupSent, signal)) {
+        signalGroup(cliPid, signal);
+      }
+      return false;
+    }
+    if (groupEnded || groupEmpty(cliPid)) {
+      // A member last read outside the group may still run.
+      return liveMembers().every(([, member]) => member.pgrp === cliPid);
+    }
+    if (needs(groupSent, signal)) {
+      signalGroup(cliPid, signal);
+    }
+    return false;
   };
   return (signal) => {
     try {
-      let table = discover();
+      if (!discover()) {
+        return stepUnread(signal);
+      }
       const passes = signal === 'SIGKILL' ? PROCESS_TREE_FREEZE_MAX_PASSES : 0;
-      for (let pass = 0; table !== undefined && pass < passes; pass += 1) {
+      for (let pass = 0; pass < passes; pass += 1) {
         let froze = false;
         if (cliRunning() && !cliFrozen) {
           cliFrozen = true;
           froze = true;
           signalCli('SIGSTOP');
         }
-        for (const [pid, member] of members) {
-          if (!member.frozen && isLive(table, pid, member.started)) {
+        for (const [pid, member] of liveMembers()) {
+          if (!member.frozen) {
             member.frozen = true;
             froze = true;
             signalMember(pid, 'SIGSTOP');
@@ -1171,30 +1322,33 @@ function createProcessTreeStop(child: ChildProcess): (signal: StopSignal) => boo
         if (!froze) {
           break;
         }
-        // A failed read keeps the last table, so every frozen member is
-        // still killed below.
-        table = discover() ?? table;
+        // A failed read keeps the members as the last read left them, so
+        // every frozen member is still killed below.
+        discover();
+      }
+      // The group's id is the command's while the CLI is unreaped or a member
+      // of the group was just read.
+      if (
+        signal === 'SIGKILL' &&
+        groupSent !== 'SIGKILL' &&
+        cliPid !== undefined &&
+        !groupEnded &&
+        (!cliReaped() || liveMembers().some(([, member]) => member.pgrp === cliPid))
+      ) {
+        signalGroup(cliPid, 'SIGKILL');
       }
       if (cliRunning() && needs(cliSent, signal)) {
         cliSent = signal;
         signalCli(signal);
       }
-      let anyLive = false;
-      if (table !== undefined) {
-        for (const [pid, member] of members) {
-          if (!isLive(table, pid, member.started)) {
-            continue;
-          }
-          anyLive = true;
-          if (needs(member.sent, signal)) {
-            member.sent = signal;
-            signalMember(pid, signal);
-          }
+      const live = liveMembers();
+      for (const [pid, member] of live) {
+        if (needs(member.sent, signal)) {
+          member.sent = signal;
+          signalMember(pid, signal);
         }
       }
-      // Without a table the members' state is unknown; with none recorded
-      // only the CLI is waited for, as only it was signalled.
-      return !cliRunning() && !anyLive && (table !== undefined || members.size === 0);
+      return !cliRunning() && live.length === 0;
     } catch {
       return false;
     }
@@ -1202,19 +1356,79 @@ function createProcessTreeStop(child: ChildProcess): (signal: StopSignal) => boo
 }
 
 /**
- * Stops a timed-out Compose command's whole process tree on Windows, which
- * has neither POSIX signals nor process groups to address: runs
- * `taskkill /PID <pid> /T /F`, which ends the `docker` CLI and every process
- * it started, as forcefully as Node's own kill does there, within
- * {@link PROCESS_TOOL_TIMEOUT_MS}. When `taskkill` cannot be run or fails,
- * the CLI alone is ended through its handle. It never throws.
+ * The cell {@link sleepSync} waits on. Nothing ever changes it, so every wait
+ * lasts its full timeout.
+ */
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Blocks the calling thread for `ms` milliseconds, for a stop that must end
+ * before the function running it returns. Node lets its main thread wait on
+ * a shared cell.
+ *
+ * @param ms - How long to wait.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(SLEEP_CELL, 0, 0, ms);
+}
+
+/**
+ * Stops an interrupted Compose command's whole process tree on POSIX, its
+ * process group included, before it returns, with the steps and bounds of
+ * the stop at a deadline ({@link runCompose}): `stopTree` sends SIGTERM and
+ * is called again every {@link COMPOSE_STOP_POLL_INTERVAL_MS}; once
+ * {@link COMPOSE_KILL_GRACE_MS} has passed it freezes what is left and sends
+ * SIGKILL, and is called again the same way for up to
+ * {@link COMPOSE_DRAIN_TIMEOUT_MS}. It returns as soon as the tree is gone.
+ * The waits block the thread ({@link sleepSync}), because setup's process can
+ * exit as soon as this returns. The same steps serve a command whose `docker`
+ * CLI has already exited, whatever is left of its group being stopped.
+ *
+ * @param stopTree - The stop step {@link createProcessTreeStop} prepared for
+ *   the command.
+ * @returns `true` once the tree is gone; `false` when any of it still runs
+ *   after the drain, or the process table could not be read while the CLI
+ *   awaited reaping, so it could not be told. It never throws.
+ */
+function stopProcessTreeNow(stopTree: (signal: StopSignal) => boolean): boolean {
+  let signal: StopSignal = 'SIGTERM';
+  let deadline = performance.now() + COMPOSE_KILL_GRACE_MS;
+  for (;;) {
+    if (stopTree(signal)) {
+      return true;
+    }
+    if (performance.now() < deadline) {
+      sleepSync(COMPOSE_STOP_POLL_INTERVAL_MS);
+    } else if (signal === 'SIGTERM') {
+      // The grace is over: the next step freezes and kills what is left.
+      signal = 'SIGKILL';
+      deadline = performance.now() + COMPOSE_DRAIN_TIMEOUT_MS;
+    } else {
+      return false;
+    }
+  }
+}
+
+/**
+ * Stops a timed-out or interrupted Compose command's whole process tree on
+ * Windows, which has neither POSIX signals nor process groups to address:
+ * runs `taskkill /PID <pid> /T /F`, which ends the `docker` CLI and every
+ * process it started, as forcefully as Node's own kill does there, within
+ * {@link PROCESS_TOOL_TIMEOUT_MS}. It runs synchronously, so it also serves
+ * a stop that must end before setup's process does. When `taskkill` cannot be
+ * run or fails, the CLI alone is ended through its handle. It never throws.
  *
  * @param child - The `docker` CLI process of the command.
- * @returns `true` when `taskkill` ran and exited 0; `false` when it could not
- *   be run or failed, so at most the CLI was ended and the rest of its tree
- *   may still run.
+ * @param acceptExitedCli - Whether a failed `taskkill` still confirms the end
+ *   when the CLI is shown to have exited before the fallback ends it. Only
+ *   the stop of an interrupted run sets it, because the interrupt reaches the
+ *   CLI as well, so a CLI that exits just before `taskkill` runs is expected.
+ * @returns `true` when `taskkill` ran and exited 0, or, with
+ *   `acceptExitedCli`, when it failed after the CLI had exited; `false`
+ *   otherwise, so at most the CLI was ended and the rest of its tree may
+ *   still run.
  */
-function stopWindowsProcessTree(child: ChildProcess): boolean {
+function stopWindowsProcessTree(child: ChildProcess, acceptExitedCli = false): boolean {
   let ended = false;
   try {
     if (child.pid !== undefined) {
@@ -1228,6 +1442,24 @@ function stopWindowsProcessTree(child: ChildProcess): boolean {
   } catch {
     ended = false;
   }
+  if (!ended && acceptExitedCli && child.pid !== undefined) {
+    // Node exposes no enumeration of a process group or job on Windows, so
+    // the CLI's own exit is the only evidence of its tree's end there. It
+    // suffices: the docker CLI runs the Compose plugin as a child process
+    // and exits only once that has exited, as only repeated interrupts force
+    // it out sooner and those reach Compose too, and Compose waits for or
+    // kills the processes it starts before it exits. So a CLI that has
+    // exited shows that its tree has ended. Node holds the CLI's process
+    // handle until the event loop reaps it, so its id is not reused
+    // meanwhile, and signal 0 failing with ESRCH shows that this very
+    // process has exited. It is checked before the fallback below, which
+    // would end the CLI itself.
+    try {
+      process.kill(child.pid, 0);
+    } catch (err) {
+      ended = errorCode(err) === 'ESRCH';
+    }
+  }
   if (!ended) {
     try {
       child.kill('SIGKILL');
@@ -1237,6 +1469,21 @@ function stopWindowsProcessTree(child: ChildProcess): boolean {
   }
   return ended;
 }
+
+/**
+ * The outcome of the stop an interrupted run gets for its running Compose
+ * command ({@link runCompose}): `ended` when the command's end is confirmed;
+ * otherwise why it is not. `tree`: on POSIX part of the command's process
+ * tree, its process group included, still ran after SIGKILL and the drain,
+ * or the process table could not be read while the `docker` CLI awaited
+ * reaping, so it could not be told ({@link stopProcessTreeNow}). `taskkill`:
+ * on Windows `taskkill /T /F` could not be confirmed to have ended the tree
+ * ({@link stopWindowsProcessTree}). `pipes`: on Windows the CLI had already
+ * exited and Node had closed its handle, but the command's output pipes were
+ * still open, so a process the command started may still hold them and run,
+ * and Windows lets Node find no such process to stop.
+ */
+type InterruptedStopOutcome = 'ended' | 'tree' | 'taskkill' | 'pipes';
 
 /**
  * Upper bound for the `docker context inspect` call that reports which Docker
@@ -1436,9 +1683,13 @@ function resolveDockerEndpoint(): Promise<string> {
  * it after {@link COMPOSE_KILL_GRACE_MS}, processes started meanwhile
  * included, is frozen with SIGSTOP and sent SIGKILL. The table is read again
  * every {@link COMPOSE_STOP_POLL_INTERVAL_MS}, so a tree that is gone earlier
- * ends the grace early. The CLI is not detached, so the tree stays in the
- * process group a stopped `ng test` stops as a whole. On Windows the tree is
- * ended at the deadline with `taskkill /T /F` ({@link stopWindowsProcessTree}).
+ * ends the grace early. The CLI is spawned detached on POSIX, so the command
+ * runs in a process group (and session) of its own, which the tree includes
+ * and which keeps every process the command starts after its parent has
+ * died. A stop signal sent to the run's own process group, as `ng test`
+ * forwards one, therefore no longer reaches the command; setup stops it
+ * itself. On Windows the tree is ended at the deadline with `taskkill /T /F`
+ * ({@link stopWindowsProcessTree}).
  *
  * The drain follows: {@link COMPOSE_DRAIN_TIMEOUT_MS} for the pipes to close
  * and, after a timeout on POSIX, for every process of the tree to be gone.
@@ -1453,18 +1704,45 @@ function resolveDockerEndpoint(): Promise<string> {
  * barrier file or releasing the acceptance-run lock, checks it first
  * ({@link commandCompleted}).
  *
+ * A run interrupted while the command runs cannot wait for the event loop,
+ * so `onStart` receives a stop that ends the same tree before it returns: on
+ * POSIX with the same steps and bounds ({@link stopProcessTreeNow}),
+ * continuing a stop that a deadline began, and equally once Node has
+ * processed the CLI's exit while the command's pipes are still open, as its
+ * process group still holds whatever the command left behind; on Windows
+ * with `taskkill /T /F` ({@link stopWindowsProcessTree}), unless the deadline
+ * already ran it. On Windows an interruption once Node has processed the
+ * CLI's exit stops nothing, because Node has closed the CLI's handle, so its
+ * id may already belong to another process, and Windows lets Node enumerate
+ * no process group or job: only closed output pipes then confirm the end.
+ *
  * @param root - The repository root.
  * @param endpoint - The local Docker endpoint {@link resolveDockerEndpoint}
  *   returned, passed as `--host` so the command acts on that daemon only.
  * @param args - The Compose subcommand and its arguments.
  * @param deadlineMs - How long the command may run before it is stopped.
+ * @param onStart - Called once, right after `docker` is spawned, with that
+ *   synchronous stop. The stop returns `ended` when the command's end is
+ *   confirmed: the CLI never started, its tree is gone, on POSIX its process
+ *   group included, or on Windows `taskkill` ended it
+ *   ({@link stopWindowsProcessTree}) or the CLI had already exited and its
+ *   pipes closed. Otherwise it returns why not
+ *   ({@link InterruptedStopOutcome}): `tree` or `taskkill` when that stop
+ *   failed, `pipes` on Windows when the CLI had already exited but its pipes
+ *   were still open. It never throws.
  * @returns The exit code, whether the command timed out, whether its end was
  *   confirmed, the kept output and whether earlier output was dropped.
  * @throws Error when `docker` cannot be started at all. Its message is fixed
  *   text with at most a validated error code, such as `EACCES`, never the
  *   system's own message.
  */
-function runCompose(root: string, endpoint: string, args: string[], deadlineMs: number): Promise<ComposeResult> {
+function runCompose(
+  root: string,
+  endpoint: string,
+  args: string[],
+  deadlineMs: number,
+  onStart?: (stopNow: () => InterruptedStopOutcome) => void,
+): Promise<ComposeResult> {
   return new Promise((resolve, reject) => {
     let settled = false;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1483,8 +1761,14 @@ function runCompose(root: string, endpoint: string, args: string[], deadlineMs: 
       finish();
     };
     try {
+      // On POSIX `detached` makes the CLI the leader of a new process group
+      // and session, whose id is the CLI's process id and which every process
+      // the command starts joins, so the stop finds them by group
+      // ({@link createProcessTreeStop}). Windows keeps the CLI attached to the
+      // run's console.
       const child = spawn('docker', composeArgs(endpoint, root, ...args), {
         cwd: root,
+        detached: process.platform !== 'win32',
         env: composeEnvironment(),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -1549,6 +1833,33 @@ function runCompose(root: string, endpoint: string, args: string[], deadlineMs: 
         pollTimer = setInterval(stopStep, COMPOSE_STOP_POLL_INTERVAL_MS);
         stopStep();
       }, deadlineMs);
+      // The stop of an interrupted run. On POSIX it carries on the stop a
+      // deadline began, whose tree already holds the processes found so far,
+      // or starts one. Either finds the command's processes by group as well,
+      // so a command whose exit Node has already processed, with a process it
+      // left behind still holding the pipes, is stopped and confirmed gone
+      // like a running one. On Windows the outcome of a `taskkill` the
+      // deadline already ran stands, as the CLI may since have been ended
+      // alone. Without one, a CLI whose exit Node has already processed is not
+      // stopped there: Node has closed its handle, so its id may already
+      // belong to another process, and no group or job can be enumerated.
+      // Only closed output pipes then confirm the command's end, as for a
+      // command that ends on its own.
+      onStart?.(() => {
+        if (child.pid === undefined) {
+          return 'ended';
+        }
+        if (process.platform !== 'win32') {
+          return stopProcessTreeNow(stopTree ?? createProcessTreeStop(child)) ? 'ended' : 'tree';
+        }
+        if (windowsTreeStopped !== undefined) {
+          return windowsTreeStopped ? 'ended' : 'taskkill';
+        }
+        if (child.exitCode !== null || child.signalCode !== null) {
+          return pipesClosed ? 'ended' : 'pipes';
+        }
+        return stopWindowsProcessTree(child, true) ? 'ended' : 'taskkill';
+      });
 
       child.on('error', (err: unknown) => {
         // Without a pid the command never started. A started one reports
@@ -1931,8 +2242,10 @@ let resolvedBarrierPath: string | undefined;
  * running the tests, so every checkout that user runs on this host shares it.
  * Setup writes the file before each Compose command that changes the
  * acceptance project and deletes it once that command has completed
- * ({@link runProjectCommand}); while it exists, every fresh run of that user
- * refuses to start ({@link buildAcceptanceStack}). The path is resolved once
+ * ({@link runProjectCommand}), or once a run interrupted during it has
+ * stopped it and confirmed its end ({@link guardProjectCommand}); while it
+ * exists, every fresh run of that user refuses to start
+ * ({@link buildAcceptanceStack}). The path is resolved once
  * per run, so the file written, the file deleted and the file a message names
  * are always the same, and a call after the first never throws.
  *
@@ -2012,8 +2325,9 @@ function setBarrier(): void {
 
 /**
  * Deletes the barrier file ({@link barrierPath}) once the Compose command it
- * guards has completed ({@link commandCompleted}) or could not be started. A
- * file already gone counts as deleted.
+ * guards has completed ({@link commandCompleted}), could not be started, or
+ * was stopped by an interruption that confirmed its end
+ * ({@link guardProjectCommand}). A file already gone counts as deleted.
  *
  * @throws BarrierFileError naming the path and the failure's validated code
  *   when the file cannot be deleted, so the run fails instead of leaving a
@@ -2026,7 +2340,7 @@ function clearBarrier(): void {
   } catch (err) {
     if (errorCode(err) !== 'ENOENT') {
       throw new BarrierFileError(
-        `Could not delete the acceptance-run barrier file ${file}${errorCodeNote(err)} after the docker compose command it guards had completed or could not be started. While it exists, every fresh run by this user on this host refuses to start; delete it and run the tests again.`,
+        `Could not delete the acceptance-run barrier file ${file}${errorCodeNote(err)} after the docker compose command it guards had ended or could not be started. While it exists, every fresh run by this user on this host refuses to start; delete it and run the tests again.`,
       );
     }
   }
@@ -2045,16 +2359,270 @@ function commandCompleted(result: ComposeResult): boolean {
   return !result.timedOut && result.ended;
 }
 
+/** A stop signal setup listens for while a Compose command on the project runs ({@link INTERRUPT_SIGNALS}). */
+type InterruptSignal = 'SIGINT' | 'SIGTERM' | 'SIGHUP' | 'SIGQUIT' | 'SIGBREAK';
+
+/**
+ * The stop signals setup listens for while a Compose command that changes the
+ * acceptance project runs ({@link guardProjectCommand}). On POSIX they are
+ * SIGINT (Ctrl+C), SIGTERM, SIGHUP and SIGQUIT (Ctrl+\), the four `ng test`
+ * forwards to Playwright's process group; on Windows SIGINT, SIGBREAK
+ * (Ctrl+Break) and SIGHUP (the console window closing), the ones Node emits
+ * there.
+ */
+const INTERRUPT_SIGNALS: readonly InterruptSignal[] =
+  process.platform === 'win32' ? ['SIGINT', 'SIGBREAK', 'SIGHUP'] : ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'];
+
+/**
+ * How often {@link writeErrorSync} tries again to write to a stderr that
+ * cannot take more output yet, at most.
+ */
+const SYNC_WRITE_RETRIES = 100;
+
+/** The pause before each retry of {@link writeErrorSync}. */
+const SYNC_WRITE_RETRY_INTERVAL_MS = 10;
+
+/**
+ * Writes `text` and a line break to stderr before it returns, for a report
+ * made while setup's process can exit right after, when output still
+ * buffered would be lost. A stderr that cannot take more yet is tried again
+ * up to {@link SYNC_WRITE_RETRIES} times; any other failure drops the rest,
+ * because the report never decides the outcome.
+ *
+ * @param text - The report, fixed text with validated values only.
+ */
+function writeErrorSync(text: string): void {
+  const bytes = Buffer.from(`${text}\n`, 'utf8');
+  let offset = 0;
+  let retries = 0;
+  while (offset < bytes.length) {
+    try {
+      offset += fs.writeSync(2, bytes, offset, bytes.length - offset);
+    } catch (err) {
+      if (errorCode(err) !== 'EAGAIN' || retries >= SYNC_WRITE_RETRIES) {
+        return;
+      }
+      retries += 1;
+      sleepSync(SYNC_WRITE_RETRY_INTERVAL_MS);
+    }
+  }
+}
+
+/**
+ * How this run was interrupted, once a stop signal or the exit of setup's
+ * process arrived while a Compose command that changes the acceptance project
+ * ran ({@link guardProjectCommand}): fixed text naming the cause, the command
+ * as run, and whether its stop confirmed the command's end and the barrier
+ * file was deleted. Once it is set, no further Compose command starts
+ * ({@link runProjectCommand}).
+ */
+let interruption: { cause: string; operation: string; settled: boolean } | undefined;
+
+/**
+ * The error a Compose command of an interrupted run ({@link interruption})
+ * fails with: the one running when the interruption arrived, once its stop
+ * has ended, and every later one, which then does not start. Its message is
+ * fixed text naming the cause, the command and the project.
+ */
+class SetupInterruptedError extends Error {
+  /**
+   * Whether the stop confirmed the command's end and the barrier file was
+   * deleted. When not, the run keeps the acceptance-run lock until it ends.
+   */
+  readonly settled: boolean;
+
+  /**
+   * @param cause - What interrupted the run, as {@link interruption} holds it.
+   * @param operation - The Compose subcommand that was running then, with its
+   *   arguments, as run.
+   * @param settled - Whether the stop confirmed that command's end and the
+   *   barrier file was deleted.
+   */
+  constructor(cause: string, operation: string, settled: boolean) {
+    super(
+      `${cause} while docker compose ${operation} was running for project ${ACCEPTANCE_PROJECT}, so setup starts no further docker compose command.`,
+    );
+    this.name = 'SetupInterruptedError';
+    this.settled = settled;
+  }
+}
+
+/**
+ * Builds the error of an interrupted run from {@link interruption}. A call
+ * reads the variable afresh, which a check in an async function's body would
+ * not do once it had narrowed it.
+ *
+ * @returns The error, or `undefined` while the run has not been interrupted.
+ */
+function interruptionError(): SetupInterruptedError | undefined {
+  return interruption === undefined
+    ? undefined
+    : new SetupInterruptedError(interruption.cause, interruption.operation, interruption.settled);
+}
+
+/**
+ * Gives `signal` its default action once setup has stopped listening for it
+ * and no other listener is left, so setup's process ends as that signal
+ * would have ended it: on POSIX by raising it again; on Windows, where a
+ * process cannot raise a signal on itself, by exiting with the conventional
+ * code, 128 plus the signal's number. While another listener is left, such
+ * as Playwright's for SIGINT, which then ends the run with code 130 itself,
+ * nothing is done.
+ *
+ * @param signal - The signal that interrupted the run.
+ */
+function restoreSignalDefault(signal: InterruptSignal): void {
+  if (process.listenerCount(signal) > 0) {
+    return;
+  }
+  const exitCode = 128 + os.constants.signals[signal];
+  if (process.platform === 'win32') {
+    process.exit(exitCode);
+  }
+  try {
+    process.kill(process.pid, signal);
+  } catch {
+    process.exit(exitCode);
+  }
+}
+
+/**
+ * Guards one Compose command that changes the acceptance project against an
+ * interruption of the run, from the write of the barrier file until it is
+ * deleted or deliberately left ({@link runProjectCommand}). Only in that
+ * window does setup listen for {@link INTERRUPT_SIGNALS} and for its
+ * process's exit, which also covers Playwright exiting after its own SIGINT
+ * handling, a global timeout or an uncaught error; outside it Node's and
+ * Playwright's handling of those signals is untouched.
+ *
+ * The first of them stops the command and settles the barrier file before
+ * its listener returns, because Playwright exits right after its own SIGINT
+ * listener and an exit allows no waiting. The stop {@link runCompose}
+ * provided ends the command's whole process tree, on POSIX within
+ * {@link COMPOSE_KILL_GRACE_MS} plus {@link COMPOSE_DRAIN_TIMEOUT_MS}
+ * ({@link stopProcessTreeNow}), on Windows with `taskkill /T /F`
+ * ({@link stopWindowsProcessTree}). On POSIX that tree includes the
+ * command's own process group, so it is stopped and confirmed gone even
+ * once the `docker` CLI has exited; only on Windows does a CLI that had
+ * already exited, with the command's output pipes still open, leave the end
+ * unconfirmed. Once the end is confirmed the barrier file is deleted and one
+ * line says so; otherwise the file stays and the recovery guidance of an
+ * unsettled project is printed ({@link unsettledProjectMessage}) after fixed
+ * text naming why the end could not be confirmed
+ * ({@link InterruptedStopOutcome}): a process of the tree or group that
+ * outlived SIGKILL or a process table that could not be read, a `taskkill`
+ * that could not be confirmed, or, on Windows, output pipes a process the
+ * command started may still hold. Either is written to stderr before the
+ * listener returns ({@link writeErrorSync}). The run is then recorded as
+ * interrupted ({@link interruption}), so no further Compose command starts,
+ * every listener is removed, and a signal no other listener is left for gets
+ * its default action ({@link restoreSignalDefault}). This happens at most
+ * once, and not at all once the guard is released.
+ *
+ * @param root - The repository root, for the recovery guidance.
+ * @param endpoint - The local Docker endpoint the command names, for the
+ *   recovery guidance.
+ * @param operation - The Compose subcommand and its arguments, as run.
+ * @returns `attach`, which takes the stop {@link runCompose} passes to its
+ *   `onStart`, and `release`, which removes the listeners once the barrier
+ *   file has been deleted or deliberately left. Neither throws.
+ */
+function guardProjectCommand(
+  root: string,
+  endpoint: string,
+  operation: string,
+): { attach: (stopNow: () => InterruptedStopOutcome) => void; release: () => void } {
+  let stopCommand: (() => InterruptedStopOutcome) | undefined;
+  let guarding = true;
+  const signalListeners = new Map<InterruptSignal, () => void>();
+  const onExit = () => settle(undefined);
+  const removeListeners = () => {
+    for (const [signal, listener] of signalListeners) {
+      process.removeListener(signal, listener);
+    }
+    process.removeListener('exit', onExit);
+  };
+  const release = () => {
+    if (guarding) {
+      guarding = false;
+      removeListeners();
+    }
+  };
+  const settle = (signal: InterruptSignal | undefined) => {
+    if (!guarding) {
+      return;
+    }
+    guarding = false;
+    const cause = signal === undefined ? "Setup's process began to exit" : `Setup received ${signal}`;
+    const running = `${cause} while docker compose ${operation} was running for project ${ACCEPTANCE_PROJECT}`;
+    let outcome: InterruptedStopOutcome;
+    try {
+      // With no stop attached, docker was never spawned.
+      outcome = stopCommand === undefined ? 'ended' : stopCommand();
+    } catch {
+      outcome = process.platform === 'win32' ? 'taskkill' : 'tree';
+    }
+    let settled = false;
+    let report: string;
+    if (outcome === 'ended') {
+      try {
+        clearBarrier();
+        settled = true;
+        report = `${running}. Setup stopped that command, confirmed that its process tree has ended and deleted the acceptance-run barrier file ${barrierPath()}, so the next fresh run starts by removing the project with down -v.`;
+      } catch (err) {
+        report = `${running}. Setup stopped that command and confirmed that its process tree has ended. ${
+          err instanceof BarrierFileError ? err.message : 'The acceptance-run barrier file could not be deleted.'
+        }`;
+      }
+    } else {
+      let failure: string;
+      if (outcome === 'pipes') {
+        failure = `${running}, after its docker CLI had exited but before the command's output pipes had closed, so a process the command started may still hold them and run, which setup cannot find on Windows, and setup could not confirm that the command had ended.`;
+      } else if (outcome === 'taskkill') {
+        failure = `${running}, and taskkill /T /F could not be confirmed to have ended that command's process tree.`;
+      } else {
+        failure = `${running}, and stopped that command, but could not confirm within ${describeDuration(COMPOSE_KILL_GRACE_MS + COMPOSE_DRAIN_TIMEOUT_MS)} that every process of its process tree and process group had ended: one outlived SIGKILL, or the process table could not be read.`;
+      }
+      report = unsettledProjectMessage(root, endpoint, operation, failure);
+    }
+    interruption = { cause, operation, settled };
+    writeErrorSync(report);
+    // Removed only now, so a repeated stop signal cannot end the process with
+    // its default action while the stop runs.
+    removeListeners();
+    if (signal !== undefined) {
+      restoreSignalDefault(signal);
+    }
+  };
+  for (const signal of INTERRUPT_SIGNALS) {
+    const listener = () => settle(signal);
+    signalListeners.set(signal, listener);
+    process.on(signal, listener);
+  }
+  process.on('exit', onExit);
+  return {
+    attach: (stopNow) => {
+      stopCommand = stopNow;
+    },
+    release,
+  };
+}
+
 /**
  * Runs one Compose command that changes the acceptance project behind the
  * barrier file: {@link setBarrier}, then {@link runCompose}, then
  * {@link clearBarrier} only when the command completed
- * ({@link commandCompleted}). The file stays after a command stopped at its
- * deadline or whose end could not be confirmed, and after a run stopped,
- * cancelled or killed before the command ended, since nothing deletes it
- * then; every later fresh run refuses to start until an operator has checked
- * the project and deleted it. When `docker` cannot be started nothing ran, and
- * the file is deleted before the error propagates.
+ * ({@link commandCompleted}). From the write until the file is deleted or
+ * deliberately left, {@link guardProjectCommand} guards the command: a run
+ * interrupted meanwhile by a stop signal or by its process exiting stops the
+ * command's process tree and deletes the file once the tree's end is
+ * confirmed, and this command then fails. The file stays after a command
+ * stopped at its deadline or whose end could not be confirmed, an
+ * interrupted one included, and after a run killed with SIGKILL before the
+ * command ended, since nothing can delete it then; every later fresh run
+ * refuses to start until an operator has checked the project and deleted it.
+ * When `docker` cannot be started nothing ran, and the file is deleted before
+ * the error propagates. Once the run has been interrupted, no command starts.
  *
  * @param root - The repository root.
  * @param endpoint - The local Docker endpoint every Compose call of this run
@@ -2065,6 +2633,9 @@ function commandCompleted(result: ComposeResult): boolean {
  * @throws BarrierFileError when the barrier file cannot be written, and the
  *   command then does not run, or cannot be deleted. Error as
  *   {@link runCompose} throws it when `docker` cannot be started.
+ *   {@link SetupInterruptedError} when the run was interrupted, during this
+ *   command, whose stop has then already settled the barrier file, or
+ *   before it, which then does not run.
  */
 async function runProjectCommand(
   root: string,
@@ -2072,15 +2643,32 @@ async function runProjectCommand(
   args: string[],
   deadlineMs: number,
 ): Promise<ComposeResult> {
+  const refused = interruptionError();
+  if (refused !== undefined) {
+    throw refused;
+  }
   setBarrier();
+  const guard = guardProjectCommand(root, endpoint, args.join(' '));
   let result: ComposeResult;
   try {
-    result = await runCompose(root, endpoint, args, deadlineMs);
+    result = await runCompose(root, endpoint, args, deadlineMs, guard.attach);
   } catch (err) {
+    // The interruption's stop has settled the barrier file already.
+    const interrupted = interruptionError();
+    if (interrupted !== undefined) {
+      throw interrupted;
+    }
     // docker could not be started, so nothing ran.
+    guard.release();
     clearBarrier();
     throw err;
   }
+  const interrupted = interruptionError();
+  if (interrupted !== undefined) {
+    throw interrupted;
+  }
+  // The file is deleted or deliberately left below, which ends the guard.
+  guard.release();
   if (commandCompleted(result)) {
     clearBarrier();
   }
@@ -2120,16 +2708,18 @@ function settledProjectCheck(root: string, endpoint: string): string {
 function barrierRefusalMessage(root: string, endpoint: string): string {
   const file = barrierPath();
   return [
-    `The acceptance-run barrier file ${file} exists: a fresh run on this host was stopped, killed or timed out while a docker compose command on project ${ACCEPTANCE_PROJECT} was in progress, or could not confirm that one had finished, so this run stops before any Compose call.`,
+    `The acceptance-run barrier file ${file} exists: a docker compose command on project ${ACCEPTANCE_PROJECT} by an earlier fresh run on this host may not have finished, because that run was killed with SIGKILL or ended some other way setup cannot intercept while the command ran, a process of the command outlived SIGKILL, or the command was stopped at its deadline or its end could not be confirmed. So this run stops before any Compose call.`,
     `To recover, ${settledProjectCheck(root, endpoint)}. Then delete ${file} and run the tests again; a fresh run starts by removing the project with down -v.`,
   ].join('\n');
 }
 
 /**
- * Builds the message of an {@link UnsettledProjectError}: the failure to state
- * first, if any, then fixed text naming the operation, the project and the
- * barrier file the run leaves ({@link barrierPath}), then the recovery
- * guidance ({@link settledProjectCheck}, {@link manualRemovalHint}).
+ * Builds the message of an {@link UnsettledProjectError}, and the guidance an
+ * interrupted run prints when its stop could not confirm the command's end
+ * ({@link guardProjectCommand}): the failure to state first, if any, then
+ * fixed text naming the operation, the project and the barrier file the run
+ * leaves ({@link barrierPath}), then the recovery guidance
+ * ({@link settledProjectCheck}, {@link manualRemovalHint}).
  *
  * @param root - The repository root.
  * @param endpoint - The local Docker endpoint the command named.
@@ -2189,18 +2779,25 @@ class UnsettledProjectError extends Error {
  * that did not complete, because it was stopped at its deadline or its end
  * could not be confirmed, is not settled: its Compose output is printed, the
  * barrier file stays and the caller fails with an
- * {@link UnsettledProjectError}, which carries the guidance.
+ * {@link UnsettledProjectError}, which carries the guidance. A run
+ * interrupted before or during the removal has settled it already
+ * ({@link guardProjectCommand}), and its error propagates.
  *
  * @param root - The repository root.
  * @param endpoint - The local Docker endpoint the failed `up` used.
  * @returns `false` when the removal did not complete, so the run must keep the
- *   acceptance-run lock; `true` otherwise. It never rejects.
+ *   acceptance-run lock; `true` otherwise.
+ * @throws {@link SetupInterruptedError} when the run was interrupted, and
+ *   nothing else.
  */
 async function removeFailedStack(root: string, endpoint: string): Promise<boolean> {
   let result: ComposeResult;
   try {
     result = await runProjectCommand(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
   } catch (err) {
+    if (err instanceof SetupInterruptedError) {
+      throw err;
+    }
     if (err instanceof BarrierFileError) {
       // Fixed text naming the barrier path and at most a validated code.
       console.error(
@@ -2349,13 +2946,20 @@ async function acquireAcceptanceLock(): Promise<() => void> {
  * Compose command that changes the project, setup writes an empty file in
  * the user's home directory ({@link barrierPath}) and deletes it once the
  * command has completed, that is, ended on its own before its deadline with
- * its output pipes closed ({@link runProjectCommand}). A command stopped at
- * its deadline, one whose end could not be confirmed, and a run stopped,
- * cancelled or killed before the command ended leave the file. Still before
- * any Compose call, a fresh run holding the lock fails while the file exists,
- * on every platform, until an operator has checked the project and deleted
- * it. A setup failure releases the lock before its error propagates, except
- * after a Compose command that did not complete, as below.
+ * its output pipes closed ({@link runProjectCommand}). A run interrupted
+ * while the command runs, by SIGINT, SIGTERM, SIGHUP or SIGQUIT (on Windows
+ * SIGINT, SIGBREAK or SIGHUP) or by its process exiting, first stops the
+ * command's process tree, within {@link COMPOSE_KILL_GRACE_MS} plus
+ * {@link COMPOSE_DRAIN_TIMEOUT_MS}, deletes the file once the tree's end is
+ * confirmed and starts no further Compose command
+ * ({@link guardProjectCommand}). The file stays after a command stopped at
+ * its deadline, one whose end could not be confirmed, a process of it that
+ * outlived SIGKILL, and a run killed with SIGKILL while the command ran.
+ * Still before any Compose call, a fresh run holding the lock fails while the
+ * file exists, on every platform, until an operator has checked the project
+ * and deleted it. A setup failure releases the lock before its error
+ * propagates, except after a Compose command that did not complete, as
+ * below, or an interruption whose stop could not confirm the command's end.
  *
  * Every Compose command runs under a deadline: 5 minutes for each `down`
  * ({@link COMPOSE_DOWN_TIMEOUT_MS}) and 30 minutes for the `up`
@@ -2390,7 +2994,11 @@ async function acquireAcceptanceLock(): Promise<() => void> {
  *   the run ends and the barrier file remains, when a Compose command was
  *   stopped at its deadline or its end could not be confirmed. A failed,
  *   timed-out or unconfirmed Compose command's recognized status lines and
- *   likely causes are printed before the throw.
+ *   likely causes are printed before the throw. A
+ *   {@link SetupInterruptedError} when the run was interrupted during a
+ *   Compose command, once its stop has settled the barrier file; the lock
+ *   then stays held until the run ends unless that stop confirmed the
+ *   command's end. Playwright has usually exited by then.
  */
 export default async function globalSetup(): Promise<(() => Promise<void>) | void> {
   const target = resolveStackTarget();
@@ -2411,7 +3019,9 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
     // An unsettled project keeps the lock until this run ends (the OS frees
     // it then), and the barrier file it leaves keeps later fresh runs out
     // after that.
-    if (!(err instanceof UnsettledProjectError)) {
+    const unsettled =
+      err instanceof UnsettledProjectError || (err instanceof SetupInterruptedError && !err.settled);
+    if (!unsettled) {
       releaseLock();
     }
     throw err;
@@ -2430,7 +3040,9 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
  * `target.apiUrl`. Each `down` and the `up` run behind the barrier file
  * ({@link runProjectCommand}); after one that did not complete
  * ({@link commandCompleted}) it runs no further Compose command and fails
- * with an {@link UnsettledProjectError}, leaving the file in place.
+ * with an {@link UnsettledProjectError}, leaving the file in place. After an
+ * interruption during one, which stops it and settles the file
+ * ({@link guardProjectCommand}), it runs no further Compose command either.
  *
  * @param root - The repository root.
  * @param target - The fresh target, the stack this run builds.
@@ -2442,7 +3054,8 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
  *   not name the acceptance API. BarrierFileError when the barrier file
  *   cannot be checked, written or deleted. {@link UnsettledProjectError} when
  *   a Compose command was stopped at its deadline or its end could not be
- *   confirmed.
+ *   confirmed. {@link SetupInterruptedError} when the run was interrupted
+ *   during a Compose command.
  */
 async function buildAcceptanceStack(root: string, target: StackTarget): Promise<void> {
   // First, before any Compose call: the removal below must reach this

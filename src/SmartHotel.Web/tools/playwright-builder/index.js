@@ -150,10 +150,12 @@ function logSafely(context, level, message) {
 }
 
 /**
- * Signals that stop `ng test`. Each is forwarded to Playwright, so stopping ng
- * stops the run instead of leaving Playwright running on its own. SIGQUIT, a
- * terminal's Ctrl+\, is among them because on POSIX it reaches only ng's
- * process group, which Playwright is not part of.
+ * Signals that stop `ng test`. On POSIX each is forwarded to Playwright's
+ * process group (`SIGNALS_PROCESS_GROUP`), so stopping ng stops the run
+ * instead of leaving Playwright running on its own. SIGQUIT, a terminal's
+ * Ctrl+\, is among them because on POSIX it reaches only ng's process group,
+ * which Playwright is not part of. On Windows none of them is forwarded
+ * (`STOP_SIGNALS`).
  */
 const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'];
 
@@ -161,12 +163,31 @@ const FORWARDED_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'];
  * Whether Playwright runs in a process group of its own, which a stop signals
  * as a whole: on POSIX only. There the Playwright process is spawned detached,
  * so it leads a new process group (and session) that its workers and the
- * processes global setup starts, such as `docker compose`, join. Windows has
- * no process groups to signal; there a console Ctrl+C already reaches every
- * process attached to the console, and only the Playwright process is
- * signalled.
+ * processes they start join. A `docker compose` command global setup runs is
+ * not among them: setup runs each in a process group of its own and stops it
+ * itself before Playwright exits. Windows has
+ * no process groups to signal, and Node's `kill` there terminates a process
+ * forcefully whatever the signal, so a forwarded signal would end Playwright
+ * before global setup could stop a Compose command it runs. The stop signals
+ * ng can receive there are console events: Ctrl+C (SIGINT), Ctrl+Break
+ * (SIGBREAK) and closing the console window (SIGHUP). Each already reaches
+ * every process attached to the console, and Playwright, spawned without
+ * `detached`, shares ng's console, so ng forwards none of them; only the
+ * Architect teardown, which is not a console event, ends the Playwright
+ * process there.
  */
 const SIGNALS_PROCESS_GROUP = process.platform !== 'win32';
+
+/**
+ * The signals ng listens for while Playwright runs. On POSIX they are
+ * `FORWARDED_SIGNALS`, each forwarded to Playwright's process group. On
+ * Windows SIGBREAK, a console's Ctrl+Break, is added, because without a
+ * listener Node ends ng on it at once, and ending ng ends the Playwright
+ * process it started, before global setup has stopped a Compose command it
+ * runs. There each listener only records the signal, which Playwright
+ * receives from the console itself.
+ */
+const STOP_SIGNALS = SIGNALS_PROCESS_GROUP ? FORWARDED_SIGNALS : [...FORWARDED_SIGNALS, 'SIGBREAK'];
 
 /** How often, in milliseconds, a stopped run's process group is checked for members. */
 const GROUP_POLL_INTERVAL_MS = 100;
@@ -194,7 +215,9 @@ function isRunning(child) {
  * Sends a signal to a child process. `kill` throws for a signal the platform
  * cannot send, such as SIGHUP on Windows; SIGTERM, which every platform
  * supports, is then sent in its place. A failure Node detects later arrives
- * through the child's 'error' event.
+ * through the child's 'error' event. On Windows `kill` terminates the process
+ * forcefully whatever the signal, so there only the Architect teardown's
+ * SIGTERM is sent (`SIGNALS_PROCESS_GROUP`).
  *
  * @param {import('node:child_process').ChildProcess} child The child process.
  * @param {string} signal The signal name, one of `FORWARDED_SIGNALS`.
@@ -211,10 +234,12 @@ function signalChild(child, signal) {
 
 /**
  * Sends a signal to a run: on POSIX to every process in Playwright's process
- * group, which reaches the CLI, its workers and whatever global setup started;
- * on Windows to the Playwright process alone. When the group cannot be
- * signalled, for example because it is already empty, the Playwright process
- * is signalled instead.
+ * group, which reaches the CLI, its workers and the processes they start, but
+ * not a `docker compose` command global setup runs in a group of its own and
+ * stops itself; on Windows to the Playwright process alone, which that
+ * terminates, so only the Architect teardown signals a run there. When the
+ * group cannot be signalled, for example because it is already empty, the
+ * Playwright process is signalled instead.
  *
  * @param {import('node:child_process').ChildProcess} child The Playwright
  *   process, which on POSIX leads the group.
@@ -278,14 +303,21 @@ function waitForEmptyGroup(pgid, timeoutMs) {
 
 /**
  * Gives the processes still in Playwright's group once the CLI has exited
- * after a stop, such as a `docker compose` command global setup started, a
- * bounded, best-effort drain. Members left after `GROUP_EXIT_TIMEOUT_MS`
+ * after a stop, such as a test worker or a browser, a bounded, best-effort
+ * drain. A `docker compose` command global setup started is never among
+ * them: it runs in a process group of its own, which setup stops before the
+ * Playwright process exits. Members left after `GROUP_EXIT_TIMEOUT_MS`
  * receive SIGKILL, and the wait then ends after at most `GROUP_KILL_GRACE_MS`,
  * whatever remains; the result says whether the group emptied, so the caller
  * reports a group that did not instead of assuming it gone. The builder holds
- * no acceptance-run lock: global setup's barrier file, written before each
- * Compose command and left by a stopped run, is what keeps a fresh re-run out
- * until the project has been checked.
+ * no acceptance-run lock and never touches global setup's barrier file. The
+ * drain starts only once the Playwright process has exited, and global setup,
+ * which runs in that process, first stops a Compose command it had in flight
+ * and deletes the file once that command's end is confirmed. After a stop,
+ * only a setup killed with SIGKILL, or a Compose command whose end setup
+ * could not confirm, such as one with a process that survived SIGKILL,
+ * leaves the file, which then keeps a fresh re-run out until the project has
+ * been checked.
  *
  * @param {number} pgid The process group ID, which is the Playwright process's PID.
  * @param {import('@angular-devkit/architect').BuilderContext} context The Architect
@@ -322,18 +354,26 @@ async function drainProcessGroup(pgid, context) {
  * with inherited stdio and the caller's environment minus `DEBUG`,
  * `DEBUG_FILE` and `NODE_DEBUG`, whose debug loggers print bearer tokens.
  *
- * SIGINT, SIGTERM, SIGHUP and SIGQUIT received while Playwright runs are
- * forwarded to it, and the Architect teardown sends SIGTERM if the run is
- * stopped first. On POSIX, Playwright leads its own process group, and a stop
- * signals the whole group: the CLI, its workers and the processes global
- * setup started. Once the CLI has exited, the builder gives the group a
- * bounded, best-effort drain: it checks every 100 ms for up to 10 s whether
- * the group is empty, then sends SIGKILL to what remains and waits at most
- * 1 s more. A group still not empty then fails the run with a message naming
- * the process group, because a `docker compose` command may still be
- * operating on the acceptance stack. On Windows only the Playwright process
- * is signalled. A run that ends without a stop is reported as soon as the CLI
- * exits.
+ * On POSIX, SIGINT, SIGTERM, SIGHUP and SIGQUIT received while Playwright
+ * runs are forwarded to it, and the Architect teardown sends SIGTERM if the
+ * run is stopped first. Playwright leads its own process group there, and a
+ * stop signals the whole group: the CLI, its workers and the processes they
+ * start. Global setup runs each `docker compose` command in a process group
+ * of its own instead, and stops it itself before Playwright exits. Once the
+ * CLI has exited, the builder gives Playwright's group a bounded,
+ * best-effort drain: it checks every 100 ms for up to 10 s whether the group
+ * is empty, then sends SIGKILL to what remains and waits at most 1 s more. A
+ * group still not empty then fails the run with a message naming the
+ * process group. On Windows, where Node's `kill`
+ * terminates a process forcefully whatever the signal, ng forwards nothing:
+ * Ctrl+C (SIGINT), Ctrl+Break (SIGBREAK) and closing the console window
+ * (SIGHUP) reach Playwright directly, as it shares ng's console, so global
+ * setup can stop a Compose command it runs before Playwright exits. ng only
+ * records the signal and waits for Playwright's exit, which it reports; a
+ * closed console window still ends both shortly after, as Windows ends every
+ * process attached to it. Only the Architect teardown ends the Playwright
+ * process there, with SIGTERM. A run that ends without a stop is reported as
+ * soon as the CLI exits.
  *
  * @param {{ config?: string }} options The validated builder options. `config` is the
  *   Playwright configuration path, relative to the workspace root.
@@ -369,6 +409,23 @@ function runPlaywright(options, context) {
         );
       }
     };
+    /**
+     * Records a console event ng received on Windows without signalling
+     * Playwright, which receives the same event from the console and handles
+     * it itself. Forwarding it would terminate Playwright at once, before
+     * global setup could stop a Compose command it runs. The recorded signal
+     * explains a failed exit.
+     *
+     * @param {string} signal The signal name, one of `STOP_SIGNALS`.
+     */
+    const record = (signal) => {
+      if (child !== undefined && !settled && isRunning(child)) {
+        stoppedBy = stoppedBy ?? signal;
+      }
+    };
+    // The listener for each of `STOP_SIGNALS`: on POSIX it forwards the
+    // signal, on Windows it only records it.
+    const onStopSignal = SIGNALS_PROCESS_GROUP ? stop : record;
 
     // The single place the outcome is decided, so only the first outcome
     // counts: a child that fails after starting can emit 'error' and then
@@ -383,8 +440,8 @@ function runPlaywright(options, context) {
     const settle = (output) => {
       if (!settled) {
         settled = true;
-        for (const signal of FORWARDED_SIGNALS) {
-          process.off(signal, stop);
+        for (const signal of STOP_SIGNALS) {
+          process.off(signal, onStopSignal);
         }
         resolve(output);
         markSettled();
@@ -434,11 +491,14 @@ function runPlaywright(options, context) {
       // E2E_REUSE_STACK, E2E_BASE_URL and E2E_API_URL reach the configuration
       // and global setup as the caller set them. On POSIX, `detached` makes
       // Playwright the leader of a new process group, which its workers and
-      // the processes global setup starts join, so a stop reaches all of them.
-      // stdio stays inherited, so the output still streams to the terminal,
-      // and the child is not unref'd, so ng still waits for it. A SIGKILL sent
-      // to ng or to ng's process group cannot be intercepted or forwarded, so
-      // it does not reach Playwright's group.
+      // the processes they start join, so a stop reaches all of them; global
+      // setup runs each `docker compose` command in a group of its own and
+      // stops it itself. On Windows it stays attached to ng's console, so a
+      // console event reaches it directly. stdio stays inherited, so the
+      // output still streams to the terminal, and the child is not unref'd,
+      // so ng still waits for it. A SIGKILL sent to ng or to ng's process
+      // group cannot be intercepted or forwarded, so it does not reach
+      // Playwright's group.
       child = spawn(process.execPath, [cli, 'test', '--config', config], {
         cwd: root,
         stdio: 'inherit',
@@ -454,12 +514,13 @@ function runPlaywright(options, context) {
     // Stopping ng stops Playwright too. A listener also keeps Node from exiting
     // on the signal, so ng waits for Playwright's exit and reports it. On
     // POSIX, a terminal's Ctrl+C now reaches only ng's process group, and ng
-    // forwards it once to Playwright's group. On Windows, a console Ctrl+C
+    // forwards it once to Playwright's group. On Windows, a console event
     // reaches every process attached to the console, so Playwright receives
-    // it directly as well as forwarded; the duplicate is harmless, because
-    // Playwright ignores a repeated SIGINT within one second.
-    for (const signal of FORWARDED_SIGNALS) {
-      process.on(signal, stop);
+    // it directly and handles it; ng only records it, because forwarding it
+    // would terminate Playwright at once, before global setup could stop a
+    // Compose command it runs and delete its barrier file.
+    for (const signal of STOP_SIGNALS) {
+      process.on(signal, onStopSignal);
     }
     context.addTeardown(async () => {
       stop('SIGTERM');
@@ -512,8 +573,7 @@ function runPlaywright(options, context) {
           success: false,
           error:
             `${output.error ?? `Playwright exited after ng test received ${stoppedBy}`}.` +
-            ` Processes Playwright started (process group ${pgid}) were still running after SIGKILL,` +
-            ' so a docker compose command may still be operating on the acceptance stack;' +
+            ` Processes Playwright started (process group ${pgid}) were still running after SIGKILL;` +
             ' make sure they have ended before running ng test again.',
         });
       drainProcessGroup(pgid, context).then(
