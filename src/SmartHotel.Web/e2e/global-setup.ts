@@ -1,84 +1,22 @@
 /**
- * Playwright global setup for the web end-to-end suite: builds the E-STACK
- * acceptance stack before any spec runs or, in reuse mode, confirms that an
- * already running stack answers.
- *
- * `playwright.config.ts` names this file as `globalSetup`, so it runs once per
- * `ng test` and once per `npx playwright test`, before the first spec. The
- * stack contract (project, ports, Compose selection and target URLs) lives in
- * `./support/stack-target`, which `playwright.config.ts` also reads, so the
- * stack built here is the one every spec targets.
- *
- * The acceptance project is one per Docker host, so a fresh run owns it by
- * listening on `127.0.0.1:18079` from before its first Compose call until the
- * suite's global teardown. The operating system frees that port when the run
- * ends, however it ends, and a concurrent fresh run finds it taken and fails
- * before any Compose call instead of removing the stack under test.
- *
- * Every Compose command runs under a deadline, 5 minutes for a `down` and 30
- * minutes for the `up`. One that outlives it is stopped with its whole
- * process tree, the `docker` CLI, the Compose plugin the CLI runs and every
- * process they started, and nothing else: SIGTERM, then SIGKILL (on Windows,
- * `taskkill /T /F`). Setup fails and releases the lock only after a bounded
- * drain in which that tree has gone and its pipes have closed, so a stalled
- * Docker operation can neither hold the lock indefinitely nor, short of a
- * process that survives SIGKILL, keep running once the lock is released.
- *
- * Playwright transpiles this file as CommonJS and it is never type-checked
- * (no `@types/node`; `tsconfig.app.json` excludes `e2e/**`). It uses Node's
- * built-in modules and globals only.
- *
- * What it passes and prints:
- * - It passes Compose no secret of its own. The child environment drops every
- *   `SMARTHOTEL_*` first-start override and sets only the two acceptance
- *   ports; every other variable passes through unchanged, so the Docker CLI
- *   keeps working. The stack's secrets are generated inside the `db`
- *   container and are never supplied here.
- * - Before its first Compose call it asks the docker CLI which Docker daemon
- *   it selects (`docker context inspect`), refuses anything but a local unix
- *   socket or a local Windows named pipe, and passes that endpoint as
- *   `--host` to every Compose call, so `DOCKER_HOST`, `DOCKER_CONTEXT` or the
- *   current context can never point the removal at another machine's daemon.
- * - Its own messages never print a raw `E2E_*` setting or the text of a
- *   caught error. They hold only fixed text, the project name, the acceptance
- *   and lock ports, the target URLs in the canonical form
- *   `./support/stack-target` validated them into (scheme, host, port and
- *   path, never a user name, password, query or fragment), the web app's
- *   `/config.json` URL built from that canonical origin, HTTP statuses,
- *   fixed-text reasons why `/config.json` does not name the target API (never
- *   the value it serves), validated error codes such as `ECONNREFUSED` and
- *   exit codes, the Compose deadlines, the local Docker endpoint the docker
- *   CLI reported (a refused endpoint is never shown), the manual removal
- *   command with this checkout's paths and that endpoint, and the process
- *   id, start time and checkout path the run owning the lock reports, with
- *   control characters removed.
- * - Only the last 1 MiB of characters of a Compose command's output is kept,
- *   from the first line that starts within it; a line that limit cuts is
- *   dropped whole, the part of it written later included, so no line's end
- *   is kept without its start. When a Compose command fails or times out,
- *   only the lines of that output that are one of this setup's canonical
- *   Compose and BuildKit messages are printed, with control characters and
- *   escape sequences removed: Compose's events for the stack's own
- *   containers, networks, volumes and built images, with at most a duration
- *   or one of Compose's own dependency-failure details, any other details
- *   replaced by `[details withheld]`; Compose's not-started,
- *   dependency-failure, exited and unhealthy messages for the stack's own
- *   containers and services; and BuildKit's step markers for the
- *   repository's own build stages, without the instruction's arguments or the
- *   error's text. Names appear only as the project's own, and numbers only as
- *   exit codes, container indexes, step numbers and counters, unnamed-stage
- *   numbers and durations. Every other line, base-image pulls, tool output
- *   and Docker, registry and build messages included, is withheld and only
- *   counted, because it can carry credentials no pattern recognizes. At most
- *   the last 200 recognized lines of at most 500 characters are printed,
- *   after a marker when earlier output was dropped, every one prefixed
- *   `  compose | ` so it cannot pass for a message of this setup. Fixed-text
- *   likely causes follow, such as a host port already in use, found from
- *   phrases anywhere in the kept output.
+ * Playwright global setup for the web end-to-end suite, named as
+ * `globalSetup` by `playwright.config.ts`. A fresh run, the default, pins
+ * this machine's local Docker daemon, builds the acceptance stack and holds
+ * this host's acceptance-run lock while it owns it; a barrier file keeps
+ * later fresh runs out after a Compose command it could not see finish.
+ * Reuse mode (`E2E_REUSE_STACK=1`) only probes a running stack. The target
+ * is the one `./support/stack-target` resolves for the configuration too.
+ * Its own messages hold fixed text and validated values only, never a raw
+ * `E2E_*` setting or a caught error's text, and of a failed Compose
+ * command's output it prints only the status lines it recognizes.
+ * Playwright transpiles this file as CommonJS and never type-checks it, so
+ * it uses Node's built-in modules and globals only.
  */
 import { type ChildProcess, execFile, spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import {
   ACCEPTANCE_API_PORT,
@@ -107,8 +45,19 @@ interface ComposeResult {
   output: string;
   /** Whether earlier output was dropped to keep {@link output} within its cap. */
   outputDropped: boolean;
-  /** Whether the command outlived its deadline and was stopped. */
+  /** Whether the command outlived its deadline, so setup tried to stop it. */
   timedOut: boolean;
+  /**
+   * Whether the command's end was confirmed: the `docker` CLI exited and its
+   * output pipes closed and, after a timeout, on POSIX the stop step
+   * ({@link createProcessTreeStop}) found its whole process tree gone, or on
+   * Windows `taskkill /T /F` exited 0. It is `false` when the drain deadline
+   * ({@link COMPOSE_DRAIN_TIMEOUT_MS}) ended the wait first, a command that
+   * exited on its own but whose pipes stayed open until then included, and
+   * when `taskkill` failed, so only the CLI was ended. Some of the command's
+   * processes may then still be running.
+   */
+  ended: boolean;
 }
 
 /** Removes the acceptance project with its containers, networks and volumes. */
@@ -153,7 +102,8 @@ const COMPOSE_KILL_GRACE_MS = 10_000;
  * been sent SIGKILL, for its output pipes to close and, after a timeout, for
  * every process of its tree to be gone. A process it started, such as the
  * Compose plugin, can hold the pipes open after it; they are then closed from
- * this side.
+ * this side, and the command's end counts as unconfirmed
+ * ({@link ComposeResult.ended}).
  */
 const COMPOSE_DRAIN_TIMEOUT_MS = 10_000;
 
@@ -658,16 +608,6 @@ function truncateLine(line: string): string {
 }
 
 /**
- * Renders text another process supplied, such as the lock owner's checkout
- * path, as one printable line: control characters and escape sequences are
- * removed as {@link splitDisplayLines} removes them, its lines are joined with
- * a space, and the result is cut as {@link truncateLine} cuts it.
- */
-function displayText(text: string): string {
-  return truncateLine(splitDisplayLines(text).join(' '));
-}
-
-/**
  * Selects, by allowlist, what of a Compose command's output is printed. Each
  * display line ({@link splitDisplayLines}, which removes control characters
  * and escape sequences) is trimmed and its whitespace runs collapsed, and a
@@ -814,7 +754,8 @@ function describeDuration(ms: number): string {
 
 /**
  * Prints a failed Compose command: a header naming the operation, how it
- * failed (its exit code, or the deadline it outlived) and the project, and
+ * failed (its exit code, or the deadline it outlived), whether its end was
+ * unconfirmed ({@link ComposeResult.ended}) and the project, and
  * saying that only the status lines this setup recognizes are printed; then
  * those lines as {@link filterComposeOutput} selects them, every one prefixed
  * with {@link COMPOSE_OUTPUT_PREFIX}; then the likely causes
@@ -832,9 +773,16 @@ function describeDuration(ms: number): string {
  */
 function printComposeFailure(operation: string, result: ComposeResult, deadlineMs: number): void {
   const { lines, omitted, withheld } = filterComposeOutput(result.output);
-  const outcome = result.timedOut
-    ? `for project ${ACCEPTANCE_PROJECT} timed out after ${describeDuration(deadlineMs)} and was stopped`
-    : `exited with code ${result.code} for project ${ACCEPTANCE_PROJECT}`;
+  let outcome: string;
+  if (result.timedOut) {
+    outcome = `for project ${ACCEPTANCE_PROJECT} timed out after ${describeDuration(deadlineMs)} and ${
+      result.ended ? 'was stopped' : 'setup tried to stop it, but could not confirm that it ended'
+    }`;
+  } else {
+    outcome = `exited with code ${result.code} for project ${ACCEPTANCE_PROJECT}${
+      result.ended ? '' : `, but its output pipes were still open ${describeDuration(COMPOSE_DRAIN_TIMEOUT_MS)} later`
+    }`;
+  }
   const report = [
     `docker compose ${operation} ${outcome}. Only the Compose status lines this setup recognizes are printed; other Docker, registry and build output is withheld, because it can carry credentials:`,
   ];
@@ -1262,8 +1210,11 @@ function createProcessTreeStop(child: ChildProcess): (signal: StopSignal) => boo
  * the CLI alone is ended through its handle. It never throws.
  *
  * @param child - The `docker` CLI process of the command.
+ * @returns `true` when `taskkill` ran and exited 0; `false` when it could not
+ *   be run or failed, so at most the CLI was ended and the rest of its tree
+ *   may still run.
  */
-function stopWindowsProcessTree(child: ChildProcess): void {
+function stopWindowsProcessTree(child: ChildProcess): boolean {
   let ended = false;
   try {
     if (child.pid !== undefined) {
@@ -1284,6 +1235,7 @@ function stopWindowsProcessTree(child: ChildProcess): void {
       // Deliberately ignored: the bounded drain still ends the wait.
     }
   }
+  return ended;
 }
 
 /**
@@ -1492,20 +1444,22 @@ function resolveDockerEndpoint(): Promise<string> {
  * and, after a timeout on POSIX, for every process of the tree to be gone.
  * Pipes still held open then, by a process outside the tree or one that
  * survived SIGKILL, are closed from this side. The promise settles exactly
- * once: when the command has ended, its pipes have closed and, after a
+ * once, at most `deadlineMs` plus the grace and the drain after the command
+ * started: when the command has ended, its pipes have closed and, after a
  * timeout, its tree is gone; when the drain ends; or when `docker` cannot be
- * started. Every timer is cleared then. A caller holding the acceptance-run
- * lock therefore releases it only after the command's tree has been stopped
- * and drained, at most `deadlineMs` plus the grace and the drain after the
- * command started.
+ * started. Every timer is cleared then. {@link ComposeResult.ended} tells the
+ * first case from the drain ending the wait, or a failed `taskkill`, so a
+ * caller that must not overlap the command, by cleaning up, deleting the
+ * barrier file or releasing the acceptance-run lock, checks it first
+ * ({@link commandCompleted}).
  *
  * @param root - The repository root.
  * @param endpoint - The local Docker endpoint {@link resolveDockerEndpoint}
  *   returned, passed as `--host` so the command acts on that daemon only.
  * @param args - The Compose subcommand and its arguments.
  * @param deadlineMs - How long the command may run before it is stopped.
- * @returns The exit code, whether the command timed out, the kept output and
- *   whether earlier output was dropped.
+ * @returns The exit code, whether the command timed out, whether its end was
+ *   confirmed, the kept output and whether earlier output was dropped.
  * @throws Error when `docker` cannot be started at all. Its message is fixed
  *   text with at most a validated error code, such as `EACCES`, never the
  *   system's own message.
@@ -1541,7 +1495,10 @@ function runCompose(root: string, endpoint: string, args: string[], deadlineMs: 
       // step by step; Windows ends it at once.
       let stopTree: ((signal: StopSignal) => boolean) | undefined;
       let stopSignal: StopSignal = 'SIGTERM';
-      const finishWith = (code: number) => settle(() => resolve({ code, timedOut, ...collector.read() }));
+      // Set at the deadline on Windows: whether `taskkill /T /F` succeeded.
+      let windowsTreeStopped: boolean | undefined;
+      const finishWith = (code: number, ended: boolean) =>
+        settle(() => resolve({ code, timedOut, ended, ...collector.read() }));
       // Decoding on the stream keeps a multi-byte character split across two
       // chunks intact.
       child.stdout.setEncoding('utf8');
@@ -1558,7 +1515,9 @@ function runCompose(root: string, endpoint: string, args: string[], deadlineMs: 
           child.stderr.destroy();
           // A process that survived SIGKILL must not keep this run alive.
           child.unref();
-          finishWith(child.exitCode ?? 1);
+          // The pipes, or after a timeout the tree, outlived the drain, so
+          // the command's end is not confirmed.
+          finishWith(child.exitCode ?? 1, false);
         }, COMPOSE_DRAIN_TIMEOUT_MS);
       };
       // One step of stopping a timed-out command: signals what is left of its
@@ -1571,13 +1530,13 @@ function runCompose(root: string, endpoint: string, args: string[], deadlineMs: 
         clearTimeout(killTimer);
         drain();
         if (pipesClosed) {
-          finishWith(child.exitCode ?? 1);
+          finishWith(child.exitCode ?? 1, true);
         }
       };
       deadlineTimer = setTimeout(() => {
         timedOut = true;
         if (process.platform === 'win32') {
-          stopWindowsProcessTree(child);
+          windowsTreeStopped = stopWindowsProcessTree(child);
           drain();
           return;
         }
@@ -1608,11 +1567,12 @@ function runCompose(root: string, endpoint: string, args: string[], deadlineMs: 
       });
       // The promise settles once, so a 'close' that follows a spawn 'error'
       // or the end of the drain changes nothing. After a timeout on POSIX,
-      // closed pipes settle it only once the tree is gone as well.
+      // closed pipes settle it only once the tree is gone as well; after one
+      // on Windows, the end is confirmed only if `taskkill` succeeded.
       child.on('close', (code: number | null) => {
         pipesClosed = true;
         if (stopTree === undefined) {
-          finishWith(code ?? 1);
+          finishWith(code ?? 1, !timedOut || windowsTreeStopped === true);
         } else {
           stopStep();
         }
@@ -1938,178 +1898,371 @@ function manualRemovalHint(root: string, endpoint: string): string {
   ].join('\n');
 }
 
+/** The directory, in the user's home directory, that holds the barrier file ({@link barrierPath}). */
+const BARRIER_DIRECTORY = '.smarthotel';
+
 /**
- * Removes the acceptance project after a failed `up`, so the next run starts
- * clean. The removal runs under {@link COMPOSE_DOWN_TIMEOUT_MS}. Its own
- * failure is only reported, so the `up` failure stays the one the run fails
- * with. Whether the removal exits non-zero or outlives its deadline, after
- * its Compose output, or `docker` cannot be started, the report ends with the
- * same {@link manualRemovalHint}.
+ * A character the barrier path may not hold, because messages print it: a
+ * control character, a Unicode line or paragraph separator, or a
+ * bidirectional control, any of which could break or reorder the text shown.
+ */
+const UNPRINTABLE_PATH_CHARACTER = /[\p{Cc}\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+
+/**
+ * The error a barrier file operation fails with ({@link barrierPath},
+ * {@link barrierExists}, {@link setBarrier}, {@link clearBarrier}). Its
+ * message is fixed text with at most the barrier path and a validated error
+ * code.
+ */
+class BarrierFileError extends Error {
+  /** @param message - The fixed-text message. */
+  constructor(message: string) {
+    super(message);
+    this.name = 'BarrierFileError';
+  }
+}
+
+/** The barrier path once {@link barrierPath} has resolved it. */
+let resolvedBarrierPath: string | undefined;
+
+/**
+ * Returns the path of the acceptance-run barrier file,
+ * `<home>/.smarthotel/<project>.unsettled` in the home directory of the user
+ * running the tests, so every checkout that user runs on this host shares it.
+ * Setup writes the file before each Compose command that changes the
+ * acceptance project and deletes it once that command has completed
+ * ({@link runProjectCommand}); while it exists, every fresh run of that user
+ * refuses to start ({@link buildAcceptanceStack}). The path is resolved once
+ * per run, so the file written, the file deleted and the file a message names
+ * are always the same, and a call after the first never throws.
+ *
+ * @returns The absolute path.
+ * @throws BarrierFileError when the home directory cannot be determined, is
+ *   empty or relative, or holds an {@link UNPRINTABLE_PATH_CHARACTER}.
+ */
+function barrierPath(): string {
+  if (resolvedBarrierPath !== undefined) {
+    return resolvedBarrierPath;
+  }
+  const name = path.join(BARRIER_DIRECTORY, `${ACCEPTANCE_PROJECT}.unsettled`);
+  let home: string;
+  try {
+    home = os.homedir();
+  } catch (err) {
+    throw new BarrierFileError(
+      `Could not determine this user's home directory${errorCodeNote(err)}, which holds the acceptance-run barrier file ${name}, so setup stops before its next Compose call.`,
+    );
+  }
+  if (home === '' || !path.isAbsolute(home) || UNPRINTABLE_PATH_CHARACTER.test(home)) {
+    throw new BarrierFileError(
+      `This user's home directory, which holds the acceptance-run barrier file ${name}, is empty, not an absolute path or holds a control character, so setup stops before its next Compose call.`,
+    );
+  }
+  resolvedBarrierPath = path.join(home, name);
+  return resolvedBarrierPath;
+}
+
+/**
+ * Tells whether the barrier file ({@link barrierPath}) exists. Anything at
+ * the path counts, a directory or a dangling symbolic link included, because
+ * only its absence shows that no earlier run left a Compose command on the
+ * project unfinished.
+ *
+ * @returns `true` when anything exists at the path; `false` when nothing does.
+ * @throws BarrierFileError naming the path and the failure's validated code
+ *   when that cannot be told, so the run fails closed.
+ */
+function barrierExists(): boolean {
+  const file = barrierPath();
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') {
+      return false;
+    }
+    throw new BarrierFileError(
+      `Could not check whether the acceptance-run barrier file ${file} exists${errorCodeNote(err)}, so this run stops before any Compose call.`,
+    );
+  }
+}
+
+/**
+ * Writes the barrier file ({@link barrierPath}) before a Compose command that
+ * changes the acceptance project. Its directory is created when missing, for
+ * its owner only (mode `0700`); the file is created empty, with mode `0600`,
+ * and never over an existing entry, so a symbolic link placed there is never
+ * followed. The file holds nothing: its existence is the whole record.
+ *
+ * @throws BarrierFileError naming the path and the failure's validated code
+ *   when the directory or the file cannot be created, or something already
+ *   exists at the path. The command then does not run.
+ */
+function setBarrier(): void {
+  const file = barrierPath();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, '', { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    throw new BarrierFileError(
+      `Could not write the acceptance-run barrier file ${file}${errorCodeNote(err)}, which setup writes before each docker compose command that changes project ${ACCEPTANCE_PROJECT}, so that command does not run.`,
+    );
+  }
+}
+
+/**
+ * Deletes the barrier file ({@link barrierPath}) once the Compose command it
+ * guards has completed ({@link commandCompleted}) or could not be started. A
+ * file already gone counts as deleted.
+ *
+ * @throws BarrierFileError naming the path and the failure's validated code
+ *   when the file cannot be deleted, so the run fails instead of leaving a
+ *   stale barrier silently.
+ */
+function clearBarrier(): void {
+  const file = barrierPath();
+  try {
+    fs.unlinkSync(file);
+  } catch (err) {
+    if (errorCode(err) !== 'ENOENT') {
+      throw new BarrierFileError(
+        `Could not delete the acceptance-run barrier file ${file}${errorCodeNote(err)} after the docker compose command it guards had completed or could not be started. While it exists, every fresh run by this user on this host refuses to start; delete it and run the tests again.`,
+      );
+    }
+  }
+}
+
+/**
+ * Tells whether a Compose command completed: it exited on its own before its
+ * deadline and its output pipes closed ({@link ComposeResult.ended}), so
+ * Compose itself waited for the daemon calls it made. Only then may setup
+ * delete the barrier file and run another Compose command on the project.
+ *
+ * @param result - The command's outcome.
+ * @returns `true` when the command completed, whatever its exit code.
+ */
+function commandCompleted(result: ComposeResult): boolean {
+  return !result.timedOut && result.ended;
+}
+
+/**
+ * Runs one Compose command that changes the acceptance project behind the
+ * barrier file: {@link setBarrier}, then {@link runCompose}, then
+ * {@link clearBarrier} only when the command completed
+ * ({@link commandCompleted}). The file stays after a command stopped at its
+ * deadline or whose end could not be confirmed, and after a run stopped,
+ * cancelled or killed before the command ended, since nothing deletes it
+ * then; every later fresh run refuses to start until an operator has checked
+ * the project and deleted it. When `docker` cannot be started nothing ran, and
+ * the file is deleted before the error propagates.
+ *
+ * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint every Compose call of this run
+ *   names ({@link resolveDockerEndpoint}).
+ * @param args - The Compose subcommand and its arguments.
+ * @param deadlineMs - How long the command may run before it is stopped.
+ * @returns The command's outcome, as {@link runCompose} reports it.
+ * @throws BarrierFileError when the barrier file cannot be written, and the
+ *   command then does not run, or cannot be deleted. Error as
+ *   {@link runCompose} throws it when `docker` cannot be started.
+ */
+async function runProjectCommand(
+  root: string,
+  endpoint: string,
+  args: string[],
+  deadlineMs: number,
+): Promise<ComposeResult> {
+  setBarrier();
+  let result: ComposeResult;
+  try {
+    result = await runCompose(root, endpoint, args, deadlineMs);
+  } catch (err) {
+    // docker could not be started, so nothing ran.
+    clearBarrier();
+    throw err;
+  }
+  if (commandCompleted(result)) {
+    clearBarrier();
+  }
+  return result;
+}
+
+/**
+ * Tells an operator how to check that the acceptance project has settled:
+ * no Compose command for it still runs on this host and its containers have
+ * settled, as `docker --host <endpoint> compose … ps --all` shows, with that
+ * command line when this checkout's paths can be quoted for every shell
+ * ({@link portableCommandLine}).
+ *
+ * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint this run's Compose calls name.
+ * @returns The instruction, in lower case so it can continue a sentence, over
+ *   one or more lines, without a final full stop.
+ */
+function settledProjectCheck(root: string, endpoint: string): string {
+  const listing = portableCommandLine(['docker', ...composeArgs(endpoint, root, 'ps', '--all')]);
+  const shown =
+    listing === undefined
+      ? `as docker --host ${endpoint} compose ps --all, with this checkout's project, Compose file, project directory and env file, shows`
+      : `as\n  ${listing}\nshows`;
+  return `make sure no docker compose command for project ${ACCEPTANCE_PROJECT} is still running on this host and that its containers have settled, ${shown}`;
+}
+
+/**
+ * Builds the message a fresh run fails with, before any Compose call, while
+ * the barrier file exists ({@link barrierExists}): fixed text naming the file
+ * and the project, then the recovery guidance ({@link settledProjectCheck}).
+ *
+ * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint this run's Compose calls name.
+ * @returns The message, over several lines.
+ */
+function barrierRefusalMessage(root: string, endpoint: string): string {
+  const file = barrierPath();
+  return [
+    `The acceptance-run barrier file ${file} exists: a fresh run on this host was stopped, killed or timed out while a docker compose command on project ${ACCEPTANCE_PROJECT} was in progress, or could not confirm that one had finished, so this run stops before any Compose call.`,
+    `To recover, ${settledProjectCheck(root, endpoint)}. Then delete ${file} and run the tests again; a fresh run starts by removing the project with down -v.`,
+  ].join('\n');
+}
+
+/**
+ * Builds the message of an {@link UnsettledProjectError}: the failure to state
+ * first, if any, then fixed text naming the operation, the project and the
+ * barrier file the run leaves ({@link barrierPath}), then the recovery
+ * guidance ({@link settledProjectCheck}, {@link manualRemovalHint}).
+ *
+ * @param root - The repository root.
+ * @param endpoint - The local Docker endpoint the command named.
+ * @param operation - The Compose subcommand and its arguments, as run.
+ * @param failure - A failure to state first, if any.
+ * @returns The message, over several lines.
+ */
+function unsettledProjectMessage(
+  root: string,
+  endpoint: string,
+  operation: string,
+  failure: string | undefined,
+): string {
+  const file = barrierPath();
+  return [
+    ...(failure === undefined ? [] : [failure]),
+    `Setup could not confirm that docker compose ${operation} for project ${ACCEPTANCE_PROJECT} finished (it was stopped at its deadline or its end could not be confirmed), so it left the project as it is, keeps the acceptance-run lock until this run ends, and left the barrier file ${file}, which makes every fresh run by this user on this host refuse to start while it exists.`,
+    `To recover, ${settledProjectCheck(root, endpoint)}. Then delete ${file} and run the tests again, which starts by removing the project with down -v; or, to remove the project by hand before deleting the file:`,
+    manualRemovalHint(root, endpoint),
+  ].join('\n');
+}
+
+/**
+ * The error setup fails with when a Compose command that changes the
+ * acceptance project did not complete ({@link commandCompleted}): it was
+ * stopped at its deadline or its end could not be confirmed. Setup then runs
+ * no further Compose command, leaves the project and the barrier file
+ * ({@link barrierPath}) as they are and keeps the acceptance-run lock until
+ * this run ends ({@link globalSetup}). Its message is built by
+ * {@link unsettledProjectMessage}.
+ */
+class UnsettledProjectError extends Error {
+  /**
+   * @param root - The repository root, for the commands in the guidance.
+   * @param endpoint - The local Docker endpoint the command named, for the
+   *   commands in the guidance.
+   * @param operation - The Compose subcommand that did not complete, with its
+   *   arguments, as run.
+   * @param failure - The failure the run reports first, such as that of the
+   *   `up` an unfinished removal followed, if any.
+   */
+  constructor(root: string, endpoint: string, operation: string, failure?: string) {
+    super(unsettledProjectMessage(root, endpoint, operation, failure));
+    this.name = 'UnsettledProjectError';
+  }
+}
+
+/**
+ * Removes the acceptance project after an `up` that completed
+ * ({@link commandCompleted}) with a failure, so the next run starts clean.
+ * The removal runs through {@link runProjectCommand}, behind the barrier
+ * file, under {@link COMPOSE_DOWN_TIMEOUT_MS}. Its own failure is only
+ * reported, so the `up` failure stays the one the run fails with: when the
+ * removal completes with a non-zero exit code, after its Compose output, when
+ * `docker` cannot be started, and when the barrier file cannot be written or
+ * deleted, the report ends with the same {@link manualRemovalHint}. A removal
+ * that did not complete, because it was stopped at its deadline or its end
+ * could not be confirmed, is not settled: its Compose output is printed, the
+ * barrier file stays and the caller fails with an
+ * {@link UnsettledProjectError}, which carries the guidance.
  *
  * @param root - The repository root.
  * @param endpoint - The local Docker endpoint the failed `up` used.
+ * @returns `false` when the removal did not complete, so the run must keep the
+ *   acceptance-run lock; `true` otherwise. It never rejects.
  */
-async function removeFailedStack(root: string, endpoint: string): Promise<void> {
+async function removeFailedStack(root: string, endpoint: string): Promise<boolean> {
+  let result: ComposeResult;
   try {
-    const result = await runCompose(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
-    if (result.timedOut || result.code !== 0) {
-      printComposeFailure(DOWN_ARGS.join(' '), result, COMPOSE_DOWN_TIMEOUT_MS);
-      const note = result.timedOut
-        ? ` (it did not finish within ${describeDuration(COMPOSE_DOWN_TIMEOUT_MS)} and was stopped)`
-        : '';
-      console.error(
-        `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed${note}. ${manualRemovalHint(root, endpoint)}`,
-      );
-    }
+    result = await runProjectCommand(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
   } catch (err) {
+    if (err instanceof BarrierFileError) {
+      // Fixed text naming the barrier path and at most a validated code.
+      console.error(
+        `Removing the failed ${ACCEPTANCE_PROJECT} stack ran into a barrier file error. ${err.message} ${manualRemovalHint(root, endpoint)}`,
+      );
+      return true;
+    }
     // runCompose rejects with fixed text; only its validated code is repeated.
     const code = validatedErrorCode(err);
     console.error(
       `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed (docker compose could not be started${code === undefined ? '' : `, ${code}`}). ${manualRemovalHint(root, endpoint)}`,
     );
+    return true;
   }
+  if (!commandCompleted(result)) {
+    printComposeFailure(DOWN_ARGS.join(' '), result, COMPOSE_DOWN_TIMEOUT_MS);
+    return false;
+  }
+  if (result.code !== 0) {
+    printComposeFailure(DOWN_ARGS.join(' '), result, COMPOSE_DOWN_TIMEOUT_MS);
+    console.error(
+      `Removing the failed ${ACCEPTANCE_PROJECT} stack also failed. ${manualRemovalHint(root, endpoint)}`,
+    );
+  }
+  return true;
 }
 
 /** The loopback address {@link ACCEPTANCE_LOCK_PORT} is listened on. */
 const ACCEPTANCE_LOCK_HOST = '127.0.0.1';
 
 /**
- * Upper bound for reading the reply of whatever holds a taken lock port. A
- * run holding the lock answers at once, so a slow or silent reply comes from
- * another program.
- */
-const OWNER_REPLY_TIMEOUT_MS = 1_000;
-
-/** Upper bound, in bytes, for the reply read from a taken lock port. */
-const OWNER_REPLY_MAX_BYTES = 4_096;
-
-/**
- * The record a fresh run sends, as one JSON line, to every client of the lock
- * port while it owns the acceptance project, so a run refused the lock can
- * name the owner.
- */
-interface LockOwner {
-  /** Always {@link ACCEPTANCE_PROJECT}, which tells this record from another program's reply. */
-  lock: string;
-  /** Process id of the Playwright runner that owns the stack. */
-  pid: number;
-  /** Repository root the owning run builds the stack from. */
-  root: string;
-  /** ISO 8601 instant at which the owner took the lock. */
-  startedAt: string;
-}
-
-/**
- * Reads what the holder of the lock port sends a new client: at most
- * {@link OWNER_REPLY_MAX_BYTES} bytes, within {@link OWNER_REPLY_TIMEOUT_MS}.
- * A connection that is refused, fails, closes or times out ends the read with
- * whatever has arrived, so the call never hangs and never rejects.
- *
- * @returns The bytes received, decoded as UTF-8; empty when none arrived.
- */
-function readLockReply(): Promise<string> {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host: ACCEPTANCE_LOCK_HOST, port: ACCEPTANCE_LOCK_PORT });
-    const chunks: Buffer[] = [];
-    let received = 0;
-    let settled = false;
-    const settle = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(Buffer.concat(chunks).toString('utf8'));
-    };
-    const timer = setTimeout(settle, OWNER_REPLY_TIMEOUT_MS);
-    socket.on('data', (chunk: Buffer) => {
-      const kept = chunk.subarray(0, OWNER_REPLY_MAX_BYTES - received);
-      chunks.push(kept);
-      received += kept.length;
-      if (received >= OWNER_REPLY_MAX_BYTES) {
-        settle();
-      }
-    });
-    socket.on('end', settle);
-    socket.on('close', settle);
-    // A persistent listener: a socket error with no listener would be thrown.
-    socket.on('error', settle);
-  });
-}
-
-/**
- * Parses the reply read from a taken lock port.
- *
- * @param reply - The text read by {@link readLockReply}.
- * @returns The owner record when the reply's first line is one, or
- *   `undefined` when it is anything else, as another program's reply is.
- */
-function parseLockOwner(reply: string): LockOwner | undefined {
-  let value: unknown;
-  try {
-    value = JSON.parse(reply.split('\n', 1)[0]);
-  } catch {
-    return undefined;
-  }
-  if (typeof value !== 'object' || value === null) {
-    return undefined;
-  }
-  const { lock, pid, root, startedAt } = value as Record<string, unknown>;
-  if (
-    lock !== ACCEPTANCE_PROJECT ||
-    typeof pid !== 'number' ||
-    !Number.isInteger(pid) ||
-    typeof root !== 'string' ||
-    typeof startedAt !== 'string'
-  ) {
-    return undefined;
-  }
-  return { lock, pid, root, startedAt };
-}
-
-/**
  * Makes this run the single owner of the acceptance project on this host by
  * listening on `127.0.0.1` port {@link ACCEPTANCE_LOCK_PORT}. The operating
  * system lets only one socket listen there and frees the port when this
  * process ends, however it ends, a kill included, so no lock is ever left
- * behind and none is ever taken over. Every client that connects is sent this
- * run's {@link LockOwner} record as one JSON line, so a run refused the lock
- * can name its owner.
+ * behind and none is ever taken over.
+ *
+ * The lock is content-free: every client that connects is disconnected at
+ * once and sent nothing, so the port tells a local client only that it is
+ * held. A run refused the lock reads nothing from the port either, so its
+ * message names only the port and cannot tell another fresh run from another
+ * program.
  *
  * The listener is unreferenced, so it never keeps the process alive. Node
  * opens it close-on-exec, so the Compose child processes do not inherit it
  * and cannot hold the port after this run ends.
  *
- * @param root - The repository root, recorded so a refused run can name the
- *   checkout that owns the stack.
- * @returns The release function. It closes the listener without waiting for
- *   connected clients, which it disconnects, runs once however often it is
- *   called, and never throws: release runs while a run ends, where the run's
- *   own result or setup error must be the one reported.
- * @throws Error naming the owner's pid, start time and checkout when another
- *   fresh run holds the port; Error naming the port when another program
- *   holds it; Error naming the address and the failure when the port cannot
- *   be listened on for any other reason. No Compose call has run in any of
- *   these cases.
+ * @returns The release function. It closes the listener, runs once however
+ *   often it is called, and never throws: release runs while a run ends,
+ *   where the run's own result or setup error must be the one reported.
+ * @throws Error with one fixed message naming the port when it is already in
+ *   use, by another fresh run or by another program; Error naming the address
+ *   and the failure's validated code when the port cannot be listened on for
+ *   any other reason. No Compose call has run in any of these cases.
  */
-async function acquireAcceptanceLock(root: string): Promise<() => void> {
-  const owner: LockOwner = {
-    lock: ACCEPTANCE_PROJECT,
-    pid: process.pid,
-    root,
-    startedAt: new Date().toISOString(),
-  };
-  const record = `${JSON.stringify(owner)}\n`;
+async function acquireAcceptanceLock(): Promise<() => void> {
   const lockAddress = `${ACCEPTANCE_LOCK_HOST}:${ACCEPTANCE_LOCK_PORT}`;
-  const clients = new Set<net.Socket>();
   const server = net.createServer((socket) => {
-    clients.add(socket);
-    socket.on('close', () => clients.delete(socket));
-    // A persistent listener: a client that resets the connection must not
-    // fail the run that owns the stack.
+    // A persistent listener: a client that resets the connection before it is
+    // closed must not fail the run that owns the stack.
     socket.on('error', () => socket.destroy());
-    socket.end(record);
+    socket.destroy();
   });
   // Errors after 'listening', such as a failed accept, leave the port held.
   // The message names only the address and the failure's validated code.
@@ -2133,14 +2286,8 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
         `Could not listen on ${lockAddress}, which a fresh acceptance run holds while it owns the ${ACCEPTANCE_PROJECT} stack${errorCodeNote(err)}.`,
       );
     }
-    const holder = parseLockOwner(await readLockReply());
-    if (holder !== undefined) {
-      throw new Error(
-        `Another fresh acceptance run owns the ${ACCEPTANCE_PROJECT} stack (pid ${holder.pid}, started ${displayText(holder.startedAt)}, from ${displayText(holder.root)}). Wait for it to finish and run the tests again.`,
-      );
-    }
     throw new Error(
-      `Port ${ACCEPTANCE_LOCK_PORT} on ${ACCEPTANCE_LOCK_HOST}, which a fresh acceptance run holds while it owns the ${ACCEPTANCE_PROJECT} stack, is in use by another process. Free it and run the tests again.`,
+      `Port ${ACCEPTANCE_LOCK_PORT} on ${ACCEPTANCE_LOCK_HOST}, which a fresh acceptance run holds while it owns the ${ACCEPTANCE_PROJECT} stack, is in use: another fresh acceptance run owns the stack, or another program holds the port. Wait for that run to finish, or free the port, and run the tests again.`,
     );
   }
   server.unref();
@@ -2153,10 +2300,6 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
     held = false;
     try {
       server.close();
-      for (const socket of clients) {
-        socket.destroy();
-      }
-      clients.clear();
     } catch (err) {
       console.error(
         `Could not close the acceptance-run lock on ${lockAddress}${errorCodeNote(err)}; it is freed when this run ends.`,
@@ -2192,25 +2335,40 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * with the local endpoint the run printed, in a shell without the Compose
  * selection and `SMARTHOTEL_*` variables.
  *
- * One fresh run at a time owns the acceptance project on a host. Before its
- * first Compose call a fresh run listens on `127.0.0.1` port
- * {@link ACCEPTANCE_LOCK_PORT} (18079) and holds it until the suite's global
- * teardown; the operating system frees the port when the run ends, however it
- * ends. A second fresh run started meanwhile fails before any Compose call,
- * with "Another fresh acceptance run owns the smarthotel-acceptance stack
- * (pid …, started …, from …)", so it never removes the stack the first run is
- * testing; when another program holds the port, it fails with a message
- * naming that port. A setup failure releases the lock before its error
- * propagates.
+ * One fresh run per host owns the acceptance project. Before its first
+ * Compose call a fresh run listens on `127.0.0.1` port
+ * {@link ACCEPTANCE_LOCK_PORT} (18079), which serves no content, and holds it
+ * until the suite's global teardown; the operating system frees the port when
+ * the run ends, however it ends. A second fresh run started meanwhile, or any
+ * fresh run while another program holds the port, fails before any Compose
+ * call with one message naming the port and nothing about its holder
+ * ({@link acquireAcceptanceLock}), so it never removes the stack another run
+ * is testing.
+ *
+ * The lock ends with the run, so a barrier file outlives it: before each
+ * Compose command that changes the project, setup writes an empty file in
+ * the user's home directory ({@link barrierPath}) and deletes it once the
+ * command has completed, that is, ended on its own before its deadline with
+ * its output pipes closed ({@link runProjectCommand}). A command stopped at
+ * its deadline, one whose end could not be confirmed, and a run stopped,
+ * cancelled or killed before the command ended leave the file. Still before
+ * any Compose call, a fresh run holding the lock fails while the file exists,
+ * on every platform, until an operator has checked the project and deleted
+ * it. A setup failure releases the lock before its error propagates, except
+ * after a Compose command that did not complete, as below.
  *
  * Every Compose command runs under a deadline: 5 minutes for each `down`
  * ({@link COMPOSE_DOWN_TIMEOUT_MS}) and 30 minutes for the `up`
  * ({@link COMPOSE_UP_TIMEOUT_MS}), which covers a first build on a clean
- * machine. A command that outlives it is stopped with its whole process
- * tree, SIGTERM and then SIGKILL, and drained before setup fails
- * ({@link runCompose}), so the lock is released only after that tree has
- * stopped. A timed-out `up` is followed by the same `down -v` as a failed
- * one.
+ * machine. At a deadline setup attempts to stop the command's process tree
+ * (on POSIX SIGTERM, then SIGSTOP and SIGKILL; on Windows `taskkill /T /F`,
+ * falling back to the CLI alone) and bounds the drain that follows
+ * ({@link runCompose}); processes can outlive that drain. A command that did
+ * not complete ({@link commandCompleted}) is followed by no further Compose
+ * command, not even the `down -v` after a failed `up`: setup leaves the
+ * project and the barrier file as they are, keeps the lock until this run
+ * ends and fails with recovery guidance ({@link UnsettledProjectError}). An
+ * `up` that completed with a failure is followed by `down -v`.
  *
  * Reuse mode (`E2E_REUSE_STACK=1`) is for local iteration. It takes no lock,
  * makes no Compose call and only probes the stack at `E2E_BASE_URL` and
@@ -2222,14 +2380,17 @@ async function acquireAcceptanceLock(root: string): Promise<() => void> {
  * @returns In fresh mode, the global teardown Playwright runs after the
  *   suite: it releases the lock and leaves the stack running. In reuse mode,
  *   nothing.
- * @throws Error when another fresh run owns the acceptance stack, another
- *   program holds the lock port or it cannot be listened on, the docker CLI
- *   selects a Docker daemon that is not local or cannot say which it
- *   selects, Docker or Compose is unavailable, fails or outlives its
- *   deadline, an acceptance port is taken, the target does not answer, or in
- *   fresh mode the web app's `/config.json` does not name the acceptance API;
- *   the message says which. A failed or timed-out Compose command's
- *   recognized status lines and likely causes are printed before the throw.
+ * @throws Error when the lock port is in use or cannot be listened on, the
+ *   docker CLI selects a Docker daemon that is not local or cannot say which
+ *   it selects, the barrier file exists or cannot be checked, written or
+ *   deleted, Docker or Compose is unavailable or fails, an acceptance port is
+ *   taken, the target does not answer, or in fresh mode the web app's
+ *   `/config.json` does not name the acceptance API; the message says which.
+ *   An {@link UnsettledProjectError}, after which the lock stays held until
+ *   the run ends and the barrier file remains, when a Compose command was
+ *   stopped at its deadline or its end could not be confirmed. A failed,
+ *   timed-out or unconfirmed Compose command's recognized status lines and
+ *   likely causes are printed before the throw.
  */
 export default async function globalSetup(): Promise<(() => Promise<void>) | void> {
   const target = resolveStackTarget();
@@ -2243,11 +2404,16 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
   }
 
   const root = findRepositoryRoot();
-  const releaseLock = await acquireAcceptanceLock(root);
+  const releaseLock = await acquireAcceptanceLock();
   try {
     await buildAcceptanceStack(root, target);
   } catch (err) {
-    releaseLock();
+    // An unsettled project keeps the lock until this run ends (the OS frees
+    // it then), and the barrier file it leaves keeps later fresh runs out
+    // after that.
+    if (!(err instanceof UnsettledProjectError)) {
+      releaseLock();
+    }
     throw err;
   }
   return async () => {
@@ -2257,34 +2423,45 @@ export default async function globalSetup(): Promise<(() => Promise<void>) | voi
 
 /**
  * The fresh path of {@link globalSetup}, run while this run holds the lock:
- * resolves the local Docker daemon every Compose call names, removes the
+ * resolves the local Docker daemon every Compose call names, refuses to start
+ * while the barrier file exists ({@link barrierExists}), removes the
  * acceptance project, checks the acceptance ports, starts the stack, probes
  * `target` and requires the web app's `/config.json` to name
- * `target.apiUrl`.
+ * `target.apiUrl`. Each `down` and the `up` run behind the barrier file
+ * ({@link runProjectCommand}); after one that did not complete
+ * ({@link commandCompleted}) it runs no further Compose command and fails
+ * with an {@link UnsettledProjectError}, leaving the file in place.
  *
  * @param root - The repository root.
  * @param target - The fresh target, the stack this run builds.
  * @throws Error when the docker CLI selects a Docker daemon that is not local
- *   or cannot say which it selects ({@link resolveDockerEndpoint}), a Compose
- *   command fails or outlives its deadline, an acceptance port is taken, the
- *   target does not answer or the web app's `/config.json` does not name the
- *   acceptance API.
+ *   or cannot say which it selects ({@link resolveDockerEndpoint}), the
+ *   barrier file exists, both before any Compose call, a Compose command
+ *   completes with a failure or cannot be started, an acceptance port is
+ *   taken, the target does not answer or the web app's `/config.json` does
+ *   not name the acceptance API. BarrierFileError when the barrier file
+ *   cannot be checked, written or deleted. {@link UnsettledProjectError} when
+ *   a Compose command was stopped at its deadline or its end could not be
+ *   confirmed.
  */
 async function buildAcceptanceStack(root: string, target: StackTarget): Promise<void> {
   // First, before any Compose call: the removal below must reach this
   // machine's Docker daemon and no other.
   const endpoint = await resolveDockerEndpoint();
   console.log(`Docker daemon: ${endpoint} (local).`);
+  // Still before any Compose call, so a refused run has started nothing and
+  // releases the lock as usual.
+  if (barrierExists()) {
+    throw new Error(barrierRefusalMessage(root, endpoint));
+  }
   console.log(
     `Building the ${ACCEPTANCE_PROJECT} stack (web :${ACCEPTANCE_WEB_PORT}, API :${ACCEPTANCE_API_PORT})…`,
   );
 
-  const down = await runCompose(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
-  if (down.timedOut) {
+  const down = await runProjectCommand(root, endpoint, DOWN_ARGS, COMPOSE_DOWN_TIMEOUT_MS);
+  if (!commandCompleted(down)) {
     printComposeFailure(DOWN_ARGS.join(' '), down, COMPOSE_DOWN_TIMEOUT_MS);
-    throw new Error(
-      `docker compose down did not finish within ${describeDuration(COMPOSE_DOWN_TIMEOUT_MS)} for project ${ACCEPTANCE_PROJECT} and was stopped; is the Docker daemon responding?`,
-    );
+    throw new UnsettledProjectError(root, endpoint, DOWN_ARGS.join(' '));
   }
   if (down.code !== 0) {
     printComposeFailure(DOWN_ARGS.join(' '), down, COMPOSE_DOWN_TIMEOUT_MS);
@@ -2311,15 +2488,30 @@ async function buildAcceptanceStack(root: string, target: StackTarget): Promise<
   }
 
   console.log('Building images and starting db, api and web; a first build can take several minutes.');
-  const up = await runCompose(root, endpoint, UP_ARGS, COMPOSE_UP_TIMEOUT_MS);
-  if (up.timedOut || up.code !== 0) {
+  const up = await runProjectCommand(root, endpoint, UP_ARGS, COMPOSE_UP_TIMEOUT_MS);
+  if (!commandCompleted(up)) {
     printComposeFailure(UP_ARGS.join(' '), up, COMPOSE_UP_TIMEOUT_MS);
-    await removeFailedStack(root, endpoint);
-    throw new Error(
+    // The `down -v` a failed `up` is followed by is deferred, because nothing
+    // can show the daemon has finished an `up` that was stopped or whose end
+    // is unconfirmed. The barrier file keeps every fresh run out until an
+    // operator has checked the project, and the next fresh run then starts
+    // with that same removal.
+    throw new UnsettledProjectError(
+      root,
+      endpoint,
+      UP_ARGS.join(' '),
       up.timedOut
-        ? `docker compose up --wait did not finish within ${describeDuration(COMPOSE_UP_TIMEOUT_MS)} for project ${ACCEPTANCE_PROJECT} and was stopped; see the Compose output above.`
-        : `docker compose up --wait failed for project ${ACCEPTANCE_PROJECT}; see the Compose output above.`,
+        ? `docker compose up --wait did not finish within ${describeDuration(COMPOSE_UP_TIMEOUT_MS)} for project ${ACCEPTANCE_PROJECT}; see the Compose output above.`
+        : `docker compose up --wait exited with code ${up.code} for project ${ACCEPTANCE_PROJECT}, but its end could not be confirmed; see the Compose output above.`,
     );
+  }
+  if (up.code !== 0) {
+    printComposeFailure(UP_ARGS.join(' '), up, COMPOSE_UP_TIMEOUT_MS);
+    const failure = `docker compose up --wait failed for project ${ACCEPTANCE_PROJECT}; see the Compose output above.`;
+    if (!(await removeFailedStack(root, endpoint))) {
+      throw new UnsettledProjectError(root, endpoint, DOWN_ARGS.join(' '), failure);
+    }
+    throw new Error(failure);
   }
 
   await probeTarget(target);

@@ -15,6 +15,7 @@ using System.Text.RegularExpressions;
 
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Hosting;
@@ -71,6 +72,14 @@ namespace SmartHotel.Api.IntegrationTests.Http;
 /// environment only: an HTTPS listener serves the readiness probe with the certificate the environment's password
 /// opens, while a password from the command line or a JSON file, or a listener that is plaintext only, stops startup
 /// with exit code 1.
+/// </para>
+/// <para>
+/// Kestrel's protocols settings are tested the same way, in Development: an endpoint configured for HTTP/1.1 serves and
+/// answers the server's rejections with the problem, while a protocols setting for anything else, an endpoint's, the
+/// endpoint defaults' or an SNI entry's, stops startup with exit code 1 and, when a configuration reload brings it,
+/// leaves the endpoint unbound while the process keeps running. An HTTP/3-only endpoint's multiplexed pipeline is built
+/// in process, because the host running the tests need not support QUIC, and so are the pipelines of an endpoint bound
+/// after such a reload, because no listener shows a binding that was refused.
 /// </para>
 /// </remarks>
 public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHotelApiFactory>
@@ -130,6 +139,24 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private const string CommandLinePasswordSource = "command-line";
     private const string JsonFilePasswordSource = "json-file";
 
+    // The protocols tests' Development web origin, the variables that configure a plaintext endpoint and an HTTPS
+    // endpoint with an SNI entry for localhost of their own, and the endpoint defaults' protocols, the API's
+    // UnsupportedEndpointProtocols and UnsupportedProtocolsSetting event ids, and how long a configuration reload may
+    // take to rebind.
+    private const string DevelopmentWebOrigin = "http://localhost:4200";
+    private const string ProbeEndpointName = "Probe";
+    private const string ProbeEndpointUrlVariable = "Kestrel__Endpoints__" + ProbeEndpointName + "__Url";
+    private const string ProbeEndpointProtocolsVariable = "Kestrel__Endpoints__" + ProbeEndpointName + "__Protocols";
+    private const string TlsEndpointName = "Tls";
+    private const string SniHostName = "localhost";
+    private const string TlsEndpointUrlVariable = "Kestrel__Endpoints__" + TlsEndpointName + "__Url";
+    private const string TlsSniProtocolsVariable =
+        "Kestrel__Endpoints__" + TlsEndpointName + "__Sni__" + SniHostName + "__Protocols";
+    private const string EndpointDefaultsProtocolsVariable = "Kestrel__EndpointDefaults__Protocols";
+    private const int UnsupportedEndpointProtocolsEventId = 5203;
+    private const int UnsupportedProtocolsSettingEventId = 5204;
+    private static readonly TimeSpan ReloadTimeout = TimeSpan.FromSeconds(30);
+
     private const string SearchGuestsMarkerScenario = "search-guests-marker";
     private const string LoginEmailNumberScenario = "login-email-number";
     private const string LoginUpperCaseEmailNumberScenario = "login-upper-case-email-number";
@@ -176,6 +203,13 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
     private static readonly string ExceptionHandlerCategory = typeof(ApiExceptionHandler).FullName!;
     private static readonly string AuthServiceCategory = typeof(AuthService).FullName!;
     private static readonly string DatabaseInitializerCategory = typeof(DatabaseInitializer).FullName!;
+    private static readonly string ProblemWriterCategory = typeof(ApiProblemDetailsWriter).FullName!;
+    private static readonly string UnsupportedEndpointProtocolsRecord = string.Create(
+        CultureInfo.InvariantCulture,
+        $"{ProblemWriterCategory}[{UnsupportedEndpointProtocolsEventId}]");
+    private static readonly string UnsupportedProtocolsSettingRecord = string.Create(
+        CultureInfo.InvariantCulture,
+        $"{ProblemWriterCategory}[{UnsupportedProtocolsSettingEventId}]");
 
     private static readonly LogLevel[] RecordLevels =
     [
@@ -1745,6 +1779,269 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         AssertOutputCarriesNoSecret(output, certificatePassword: null);
     }
 
+    // Over HTTP/2 or HTTP/3 the server answers the requests it rejects without a problem body, and a value with none of
+    // the protocol flags leaves an endpoint serving nothing, so every protocols setting in Kestrel's configuration is
+    // held to Http1 as Kestrel parses it: ignoring case, as a list of names or as a number. An endpoint's own setting
+    // with any other value, or the endpoint defaults' although the API's HTTP/1.1 default overrides it, stops startup
+    // before Kestrel binds anything: the API writes one UnsupportedProtocolsSetting event naming the setting and the
+    // protocols it selects, reports HostRunFailed, exits with code 1 and never listens. Its output carries no secret.
+    [Theory]
+    [InlineData(ProbeEndpointProtocolsVariable, nameof(HttpProtocols.Http2), nameof(HttpProtocols.Http2))]
+    [InlineData(
+        ProbeEndpointProtocolsVariable,
+        nameof(HttpProtocols.Http1AndHttp2),
+        nameof(HttpProtocols.Http1AndHttp2))]
+    [InlineData(
+        ProbeEndpointProtocolsVariable,
+        nameof(HttpProtocols.Http1AndHttp2AndHttp3),
+        nameof(HttpProtocols.Http1AndHttp2AndHttp3))]
+    [InlineData(ProbeEndpointProtocolsVariable, nameof(HttpProtocols.None), nameof(HttpProtocols.None))]
+    [InlineData(ProbeEndpointProtocolsVariable, "8", "8")]
+    [InlineData(ProbeEndpointProtocolsVariable, "http1, HTTP2", nameof(HttpProtocols.Http1AndHttp2))]
+    [InlineData(EndpointDefaultsProtocolsVariable, nameof(HttpProtocols.Http2), nameof(HttpProtocols.Http2))]
+    public async Task ProtocolsSettingBeyondHttp1_StopsStartupWithoutListening(
+        string setting,
+        string value,
+        string selected)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        Dictionary<string, string> environment = DevelopmentProcessEnvironment();
+        environment[ProbeEndpointUrlVariable] = HttpLoopbackUrl;
+        environment[setting] = value;
+        await using ApiProcess api = ApiProcess.Start(environment, [], AppContext.BaseDirectory);
+
+        int exitCode = await api.WaitForExitAsync(cancellationToken);
+
+        Assert.Equal(1, exitCode);
+        AssertStartupRefusedForProtocolsSetting(api, setting, selected);
+        AssertOutputCarriesNoSecret(api.Output, certificatePassword: null);
+    }
+
+    // An SNI entry's protocols replace the endpoint's for the TLS connections that name its host, out of sight of the
+    // endpoint's own protocols, so the entry's setting is held to Http1 too. An HTTPS endpoint whose SNI entry for
+    // localhost selects Http2 stops startup as an endpoint's own setting does, with one UnsupportedProtocolsSetting
+    // event naming the entry's setting. Its output carries neither the certificate password nor any other secret.
+    [Fact]
+    public async Task SniEntryConfiguredBeyondHttp1_StopsStartupWithoutListening()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        using ThrowawayCertificate certificate = ThrowawayCertificate.Create();
+        Dictionary<string, string> environment = DevelopmentProcessEnvironment();
+        environment[CertificatePathVariable] = certificate.FilePath;
+        environment[CertificatePasswordVariable] = certificate.Password;
+        environment[TlsEndpointUrlVariable] = HttpsLoopbackUrl;
+        environment[TlsSniProtocolsVariable] = nameof(HttpProtocols.Http2);
+        await using ApiProcess api = ApiProcess.Start(environment, [], AppContext.BaseDirectory);
+
+        int exitCode = await api.WaitForExitAsync(cancellationToken);
+
+        Assert.Equal(1, exitCode);
+        AssertStartupRefusedForProtocolsSetting(api, TlsSniProtocolsVariable, nameof(HttpProtocols.Http2));
+        AssertOutputCarriesNoSecret(api.Output, certificate.Password);
+    }
+
+    // An endpoint whose own Protocols setting is Http1, in any letter case, serves as an endpoint on the defaults does:
+    // it listens, answers the readiness probe, and gives a request the server rejects the API's problem, so the
+    // connection middleware runs on an endpoint that configuration names. So does an endpoint whose setting does not
+    // parse as protocols, which Kestrel ignores, leaving the endpoint on the API's HTTP/1.1 default. The API writes
+    // neither an UnsupportedEndpointProtocols nor an UnsupportedProtocolsSetting event.
+    [Theory]
+    [InlineData(nameof(HttpProtocols.Http1))]
+    [InlineData("http1")]
+    [InlineData("Http2Please")]
+    public async Task EndpointConfiguredForHttp1_ServesAndReturnsProblemForServerRejection(string protocols)
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        Dictionary<string, string> environment = DevelopmentProcessEnvironment();
+        environment[ProbeEndpointUrlVariable] = HttpLoopbackUrl;
+        environment[ProbeEndpointProtocolsVariable] = protocols;
+        await using ApiProcess api = ApiProcess.Start(environment, [], AppContext.BaseDirectory);
+
+        Uri? address = await api.WaitForHttpListenerAsync(cancellationToken);
+        Assert.True(address is not null, $"The API exited without listening; it wrote {api.DescribeRecords()}.");
+        await AssertReadinessThroughLoopbackAsync(address, cancellationToken);
+
+        using RawHttpConnection connection = await RawHttpConnection.OpenAsync(address, cancellationToken);
+        await connection.SendAsync(OversizedHeaderRequest("GET"));
+        RawResponse rejection = await connection.ReadResponseAsync(headRequest: false);
+
+        using HttpResponseMessage response = rejection.ToResponseMessage();
+        await ProblemAssert.AssertProblemAsync(
+            response,
+            HttpStatusCode.RequestHeaderFieldsTooLarge,
+            cancellationToken: cancellationToken);
+        string output = api.Output;
+        Assert.False(
+            output.Contains(UnsupportedEndpointProtocolsRecord, StringComparison.Ordinal)
+                || output.Contains(UnsupportedProtocolsSettingRecord, StringComparison.Ordinal),
+            "The API refused an endpoint configured for HTTP/1.1.");
+        AssertOutputCarriesNoSecret(output, certificatePassword: null);
+    }
+
+    // Kestrel rebinds an endpoint whose settings change when its configuration reloads, and the refusal holds there:
+    // once the endpoint's Protocols in appsettings.Development.json changes from Http1 to Http2, the API reports the
+    // setting with the UnsupportedProtocolsSetting event, Kestrel stops the endpoint and the API refuses its new
+    // binding without another event, so the old address accepts no connection while the process keeps running.
+    // Kestrel's own report of the failed bind is withheld from every log provider, so the event is what tells the
+    // operator. The file is replaced by a rename, so the reload never reads it half written.
+    [Fact]
+    public async Task EndpointReloadedBeyondHttp1_IsRefusedWhileTheApiKeepsRunning()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        string contentRoot = CreateReloadContentRoot();
+        try
+        {
+            string settingsPath = Path.Combine(contentRoot, "appsettings.Development.json");
+            await WriteProbeEndpointSettingsAsync(settingsPath, HttpProtocols.Http1, cancellationToken);
+            await using ApiProcess api = ApiProcess.Start(DevelopmentProcessEnvironment(), [], contentRoot);
+
+            Uri? address = await api.WaitForHttpListenerAsync(cancellationToken);
+            Assert.True(address is not null, $"The API exited without listening; it wrote {api.DescribeRecords()}.");
+            await AssertReadinessThroughLoopbackAsync(address, cancellationToken);
+
+            await WriteProbeEndpointSettingsAsync(settingsPath, HttpProtocols.Http2, cancellationToken);
+
+            await AssertReloadRefusedForProtocolsSettingAsync(
+                api,
+                address,
+                ProbeEndpointProtocolsVariable,
+                cancellationToken);
+            AssertOutputCarriesNoSecret(api.Output, certificatePassword: null);
+        }
+        finally
+        {
+            Directory.Delete(contentRoot, recursive: true);
+        }
+    }
+
+    // Kestrel rebinds an endpoint whose SNI entries change when its configuration reloads, and the entry's setting is
+    // held to Http1 there too: an HTTPS endpoint whose SNI entry for localhost selects Http1 serves the readiness probe
+    // over HTTP/1.1 to a client that names localhost in its TLS handshake, and once appsettings.Development.json
+    // changes that entry alone to Http2, the API reports the entry's setting with the UnsupportedProtocolsSetting event
+    // and the old address accepts no connection, TLS or other, while the process keeps running. Its output carries
+    // neither the certificate password nor any other secret.
+    [Fact]
+    public async Task SniEntryReloadedBeyondHttp1_IsRefusedWhileTheApiKeepsRunning()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        using ThrowawayCertificate certificate = ThrowawayCertificate.Create();
+        string contentRoot = CreateReloadContentRoot();
+        try
+        {
+            string settingsPath = Path.Combine(contentRoot, "appsettings.Development.json");
+            await WriteTlsEndpointSettingsAsync(settingsPath, HttpProtocols.Http1, cancellationToken);
+            Dictionary<string, string> environment = DevelopmentProcessEnvironment();
+            environment[CertificatePathVariable] = certificate.FilePath;
+            environment[CertificatePasswordVariable] = certificate.Password;
+            await using ApiProcess api = ApiProcess.Start(environment, [], contentRoot);
+
+            Uri? address = await api.WaitForHttpsListenerAsync(cancellationToken);
+            Assert.True(
+                address is not null,
+                $"The API exited without listening on HTTPS; it wrote {api.DescribeRecords()}.");
+            await AssertReadinessOverTlsAsync(address, certificate, cancellationToken);
+
+            await WriteTlsEndpointSettingsAsync(settingsPath, HttpProtocols.Http2, cancellationToken);
+
+            await AssertReloadRefusedForProtocolsSettingAsync(api, address, TlsSniProtocolsVariable, cancellationToken);
+            AssertOutputCarriesNoSecret(api.Output, certificate.Password);
+        }
+        finally
+        {
+            Directory.Delete(contentRoot, recursive: true);
+        }
+    }
+
+    // While Kestrel's configuration holds a protocols setting other than Http1, Kestrel binds no endpoint that a reload
+    // starts or rebinds, one whose SNI entries alone changed included. The guard reports a setting that a reload brings
+    // once, and the connection pipelines of an endpoint built after that reload, as Kestrel builds them when it binds
+    // the endpoint, refuse to be built without another event. The class's host runs on the in-process server, which
+    // creates no Kestrel options and builds no pipeline of its own, so both are done here, and the setting arrives
+    // through a configuration source of the test's own, whose one change is one reload. The API process tests above
+    // show the same reload on a real listener, where a refused binding cannot be told apart from one on a new port.
+    [Fact]
+    public async Task EndpointBoundAfterReloadToUnsupportedSniProtocols_IsRefusedWithoutAnotherEvent()
+    {
+        CancellationToken cancellationToken = TestContext.Current.CancellationToken;
+        string urlKey = ConfigurationPath.Combine("Kestrel", "Endpoints", TlsEndpointName, "Url");
+        string sniProtocolsKey =
+            ConfigurationPath.Combine("Kestrel", "Endpoints", TlsEndpointName, "Sni", SniHostName, "Protocols");
+        SmartHotelApiFactory.LogCapture capture = new();
+        ChangeableSettings settings = new(new Dictionary<string, string?>
+        {
+            [urlKey] = HttpsLoopbackUrl,
+            [sniProtocolsKey] = nameof(HttpProtocols.Http1),
+        });
+        await using WebApplicationFactory<Program> variant = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, configuration) => configuration.Add(settings));
+            builder.ConfigureServices(services => services.AddSingleton<ILoggerProvider>(capture));
+        });
+        await Task.Run(() => _ = variant.Server, cancellationToken);
+
+        KestrelServerOptions kestrel = variant.Services.GetRequiredService<IOptions<KestrelServerOptions>>().Value;
+        ListenOptions? endpoint = null;
+        kestrel.Listen(IPAddress.Loopback, 0, listenOptions => endpoint = listenOptions);
+        Assert.NotNull(endpoint);
+        _ = endpoint.Build();
+        _ = ((IMultiplexedConnectionBuilder)endpoint).Build();
+        Assert.DoesNotContain(capture.Records, static record => record.Category == ProblemWriterCategory);
+
+        settings.Change(sniProtocolsKey, nameof(HttpProtocols.Http2));
+
+        SmartHotelApiFactory.CapturedLog report = Assert.Single(
+            capture.Records,
+            static record => record.Category == ProblemWriterCategory);
+        Assert.Equal(UnsupportedProtocolsSettingEventId, report.EventId);
+        Assert.Equal(LogLevel.Critical, report.Level);
+        Assert.False(report.HasException);
+        Assert.StartsWith(
+            $"The Kestrel setting {TlsSniProtocolsVariable} selects the protocols Http2,",
+            report.Message,
+            StringComparison.Ordinal);
+
+        Assert.Throws<InvalidOperationException>(() => endpoint.Build());
+        Assert.Throws<InvalidOperationException>(() => ((IMultiplexedConnectionBuilder)endpoint).Build());
+        Assert.Single(capture.Records, static record => record.Category == ProblemWriterCategory);
+    }
+
+    // An endpoint that serves HTTP/3 alone builds no connection pipeline, only the multiplexed one, which Kestrel
+    // builds when it binds the endpoint on a host that supports QUIC. That pipeline refuses the endpoint, whose
+    // protocols are set in code rather than configuration, with the Critical UnsupportedEndpointProtocols event, which
+    // names the endpoint's address and protocols and carries no exception. The pipeline is built here directly from the
+    // API's registrations, because the host running the tests need not support QUIC.
+    [Fact]
+    public void Http3OnlyEndpoint_IsRefusedByItsMultiplexedPipeline()
+    {
+        SmartHotelApiFactory.LogCapture capture = new();
+        ServiceCollection services = new();
+        services.AddLogging(logging => logging.AddProvider(capture));
+        services.AddApiProblemDetails();
+        using ServiceProvider provider = services.BuildServiceProvider();
+        KestrelServerOptions kestrel = provider.GetRequiredService<IOptions<KestrelServerOptions>>().Value;
+        kestrel.ApplicationServices = provider;
+        ListenOptions? endpoint = null;
+        kestrel.Listen(IPAddress.Loopback, 0, listenOptions =>
+        {
+            listenOptions.Protocols = HttpProtocols.Http3;
+            endpoint = listenOptions;
+        });
+        Assert.NotNull(endpoint);
+
+        Assert.Throws<InvalidOperationException>(() => ((IMultiplexedConnectionBuilder)endpoint).Build());
+
+        SmartHotelApiFactory.CapturedLog refusal = Assert.Single(
+            capture.Records,
+            static record => record.EventId == UnsupportedEndpointProtocolsEventId);
+        Assert.Equal(ProblemWriterCategory, refusal.Category);
+        Assert.Equal(LogLevel.Critical, refusal.Level);
+        Assert.False(refusal.HasException);
+        Assert.StartsWith(
+            "The Kestrel endpoint 127.0.0.1:0 is configured for the protocols Http3,",
+            refusal.Message,
+            StringComparison.Ordinal);
+    }
+
     // An API process inherits no variable that would configure the API or its host, whichever delimiter, prefix or
     // letter case its name carries, and keeps every variable the dotnet host and the runtime need. The environment is
     // a synthetic one with a fixed value, never that of the process running the tests.
@@ -1809,6 +2106,249 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             ["Jwt__SigningKey"] = _factory.SigningKey,
             ["Cors__AllowedOrigin"] = HttpsWebOrigin,
         };
+    }
+
+    // The environment of an API process in Development, with the class's database and signing key and the local web
+    // origin, and no listener of its own: a test adds the endpoint it needs through the environment or a JSON file.
+    private Dictionary<string, string> DevelopmentProcessEnvironment()
+    {
+        return new Dictionary<string, string>
+        {
+            ["ASPNETCORE_ENVIRONMENT"] = "Development",
+            ["ConnectionStrings__SmartHotel"] = _factory.DatabaseConnectionString,
+            ["Jwt__SigningKey"] = _factory.SigningKey,
+            ["Cors__AllowedOrigin"] = DevelopmentWebOrigin,
+        };
+    }
+
+    // An API process stopped by a protocols setting has written exactly one UnsupportedProtocolsSetting event, naming
+    // the setting and the protocols it selects, and HostRunFailed. It refused no endpoint while binding it, which would
+    // mean Kestrel had begun to bind, and reported no listening address. Failure messages name event ids, never the
+    // output.
+    private static void AssertStartupRefusedForProtocolsSetting(ApiProcess api, string setting, string selected)
+    {
+        string output = api.Output;
+        Assert.True(
+            Regex.Count(output, Regex.Escape(UnsupportedProtocolsSettingRecord)) == 1,
+            $"Expected one UnsupportedProtocolsSetting event 5204, but the API wrote {api.DescribeRecords()}.");
+        Assert.True(
+            output.Contains(
+                $"The Kestrel setting {setting} selects the protocols {selected},",
+                StringComparison.Ordinal),
+            "The UnsupportedProtocolsSetting event does not name the setting and the protocols it selects.");
+        Assert.True(
+            output.Contains(HostRunFailedRecord, StringComparison.Ordinal),
+            $"Expected the HostRunFailed event 5202, but the API wrote {api.DescribeRecords()}.");
+        Assert.False(
+            output.Contains(UnsupportedEndpointProtocolsRecord, StringComparison.Ordinal),
+            "The API refused an endpoint while binding it, so Kestrel began to bind despite the setting.");
+        Assert.False(
+            output.Contains(ListeningRecord, StringComparison.Ordinal),
+            "The API reported a listening address although a protocols setting stopped its startup.");
+    }
+
+    // Once a reload has brought the setting given with the value Http2, the API reports it with the
+    // UnsupportedProtocolsSetting event within the reload timeout, keeps running, and the old address stops accepting
+    // connections. The event is written as the reload is noticed, which can be before Kestrel stops the endpoint, so
+    // the address is tried until it refuses; and its message, the record's second line, is what is waited for, so the
+    // whole record has been read. The refused binding is not logged again as an UnsupportedEndpointProtocols event.
+    private static async Task AssertReloadRefusedForProtocolsSettingAsync(
+        ApiProcess api,
+        Uri address,
+        string setting,
+        CancellationToken cancellationToken)
+    {
+        bool reported = await api.WaitForOutputAsync(
+            $"The Kestrel setting {setting} selects the protocols Http2,",
+            ReloadTimeout,
+            cancellationToken);
+        Assert.True(
+            reported && api.Output.Contains(UnsupportedProtocolsSettingRecord, StringComparison.Ordinal),
+            $"Expected the UnsupportedProtocolsSetting event 5204 after the reload, but the API wrote "
+            + $"{api.DescribeRecords()}.");
+
+        bool refused = await WaitForRefusedConnectionAsync(address, cancellationToken);
+        Assert.True(refused, "The old address still accepted connections after the reload.");
+        Assert.False(api.HasExited, "The API exited after refusing the reloaded endpoint.");
+        Assert.False(
+            api.Output.Contains(UnsupportedEndpointProtocolsRecord, StringComparison.Ordinal),
+            "The API logged the refused binding again as an UnsupportedEndpointProtocols event.");
+    }
+
+    // Whether the address refuses a TCP connection within the reload timeout, trying again every 100 ms while it
+    // accepts one. Each accepted connection is closed at once.
+    private static async Task<bool> WaitForRefusedConnectionAsync(Uri address, CancellationToken cancellationToken)
+    {
+        TimeSpan retryInterval = TimeSpan.FromMilliseconds(100);
+        long started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            using (TcpClient client = new())
+            {
+                try
+                {
+                    await client.ConnectAsync(address.Host, address.Port, cancellationToken);
+                }
+                catch (SocketException)
+                {
+                    return true;
+                }
+            }
+
+            if (Stopwatch.GetElapsedTime(started) >= ReloadTimeout)
+            {
+                return false;
+            }
+
+            await Task.Delay(retryInterval, cancellationToken);
+        }
+    }
+
+    // A content root for a reload test, in a new directory under the temporary path, holding a copy of the build's
+    // appsettings.json. The test writes appsettings.Development.json beside it and deletes the directory.
+    private static string CreateReloadContentRoot()
+    {
+        string contentRoot = Path.Combine(Path.GetTempPath(), "smarthotel-reload-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(contentRoot);
+        try
+        {
+            File.Copy(
+                Path.Combine(AppContext.BaseDirectory, "appsettings.json"),
+                Path.Combine(contentRoot, "appsettings.json"));
+            return contentRoot;
+        }
+        catch
+        {
+            Directory.Delete(contentRoot, recursive: true);
+            throw;
+        }
+    }
+
+    // Writes, as a whole, the JSON file that configures the probe endpoint on a loopback port the operating system
+    // chooses, with the protocols given.
+    private static Task WriteProbeEndpointSettingsAsync(
+        string path,
+        HttpProtocols protocols,
+        CancellationToken cancellationToken)
+    {
+        JsonObject settings = new()
+        {
+            ["Kestrel"] = new JsonObject
+            {
+                ["Endpoints"] = new JsonObject
+                {
+                    [ProbeEndpointName] = new JsonObject
+                    {
+                        ["Url"] = HttpLoopbackUrl,
+                        ["Protocols"] = protocols.ToString(),
+                    },
+                },
+            },
+        };
+
+        return ReplaceSettingsFileAsync(path, settings, cancellationToken);
+    }
+
+    // Writes, as a whole, the JSON file that configures the HTTPS endpoint on a loopback port the operating system
+    // chooses, with an SNI entry for localhost that sets the protocols given and nothing else, so the entry serves the
+    // default certificate the environment names.
+    private static Task WriteTlsEndpointSettingsAsync(
+        string path,
+        HttpProtocols sniProtocols,
+        CancellationToken cancellationToken)
+    {
+        JsonObject settings = new()
+        {
+            ["Kestrel"] = new JsonObject
+            {
+                ["Endpoints"] = new JsonObject
+                {
+                    [TlsEndpointName] = new JsonObject
+                    {
+                        ["Url"] = HttpsLoopbackUrl,
+                        ["Sni"] = new JsonObject
+                        {
+                            [SniHostName] = new JsonObject { ["Protocols"] = sniProtocols.ToString() },
+                        },
+                    },
+                },
+            },
+        };
+
+        return ReplaceSettingsFileAsync(path, settings, cancellationToken);
+    }
+
+    // A sibling file is written first and then renamed over the target, so a reader that the change wakes never sees
+    // the file half written.
+    private static async Task ReplaceSettingsFileAsync(
+        string path,
+        JsonObject settings,
+        CancellationToken cancellationToken)
+    {
+        string staging = path + ".staging";
+        await File.WriteAllTextAsync(staging, settings.ToJsonString(), cancellationToken);
+        File.Move(staging, path, overwrite: true);
+    }
+
+    // The readiness probe answers over HTTP/1.1 through the API process's HTTPS listener to a client that names
+    // localhost in its TLS handshake, as the SNI entry the tests configure requires. The client connects to the
+    // listener's loopback address directly, never through a proxy the environment of the host running the tests names,
+    // trusts the throwaway certificate alone, and is disposed before this returns, so it holds no connection open
+    // afterwards.
+    private static async Task AssertReadinessOverTlsAsync(
+        Uri address,
+        ThrowawayCertificate certificate,
+        CancellationToken cancellationToken)
+    {
+        using HttpClient https = new(new SocketsHttpHandler
+        {
+            AllowAutoRedirect = false,
+            UseProxy = false,
+            ConnectCallback = async (_, token) =>
+            {
+                Socket socket = new(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await socket.ConnectAsync(address.Host, address.Port, token);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            },
+            SslOptions = new SslClientAuthenticationOptions
+            {
+                RemoteCertificateValidationCallback = (_, remote, _, errors) =>
+                    remote is not null
+                    && certificate.IsSameAs(remote)
+                    && (errors & ~SslPolicyErrors.RemoteCertificateChainErrors) == SslPolicyErrors.None,
+            },
+        })
+        {
+            BaseAddress = new UriBuilder(address) { Host = SniHostName }.Uri,
+        };
+
+        using HttpResponseMessage response = await https.GetAsync(ReadinessPath, cancellationToken);
+
+        Assert.Equal(HttpVersion.Version11, response.Version);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
+    }
+
+    // The readiness probe answers through the API process's plaintext listener. The client goes to the loopback
+    // address directly, never through a proxy the environment of the host running the tests names, and is disposed
+    // before this returns, so it holds no connection open afterwards.
+    private static async Task AssertReadinessThroughLoopbackAsync(Uri address, CancellationToken cancellationToken)
+    {
+        using HttpClient http = new(new SocketsHttpHandler { UseProxy = false }) { BaseAddress = address };
+        using HttpResponseMessage response = await http.GetAsync(ReadinessPath, cancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal("Healthy", await response.Content.ReadAsStringAsync(cancellationToken));
     }
 
     // A content root, in a new directory under the parent given, whose configuration files hold the certificate
@@ -2278,6 +2818,41 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         }
     }
 
+    // A configuration source holding the settings given, which a test changes while the host runs. Each change is one
+    // reload of the source's provider, which the host's configuration relays as one change of its own. Every build of
+    // the source returns the same provider, so the change reaches each configuration built from it.
+    private sealed class ChangeableSettings(IReadOnlyDictionary<string, string?> settings) : IConfigurationSource
+    {
+        private readonly ChangeableSettingsProvider _provider = new(settings);
+
+        public void Change(string key, string? value)
+        {
+            _provider.Change(key, value);
+        }
+
+        public IConfigurationProvider Build(IConfigurationBuilder builder)
+        {
+            return _provider;
+        }
+
+        private sealed class ChangeableSettingsProvider : ConfigurationProvider
+        {
+            public ChangeableSettingsProvider(IReadOnlyDictionary<string, string?> settings)
+            {
+                foreach ((string key, string? value) in settings)
+                {
+                    Data[key] = value;
+                }
+            }
+
+            public void Change(string key, string? value)
+            {
+                Set(key, value);
+                OnReload();
+            }
+        }
+    }
+
     // A hosted service whose start fails with the given message, as the server's start does when it cannot bind.
     private sealed class FailingStartup(string message) : IHostedService
     {
@@ -2674,6 +3249,8 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
         private readonly StringBuilder _output = new();
         private readonly TaskCompletionSource<Uri> _httpsAddress =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<Uri> _httpAddress =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private ApiProcess(Process process)
         {
@@ -2693,6 +3270,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
                 }
             }
         }
+
+        // Whether the API has exited, on its own or because it was killed.
+        public bool HasExited => _process.HasExited;
 
         // Starts the API with the arguments given and the working directory, which is its content root.
         public static ApiProcess Start(
@@ -2744,20 +3324,55 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             return api;
         }
 
-        // The first HTTPS address the API reports listening on, or null once it has exited without reporting one. The
-        // wait for the exit also waits for the end of the output, so an address reported just before an exit is seen.
-        public async Task<Uri?> WaitForHttpsListenerAsync(CancellationToken cancellationToken)
+        // The first HTTPS address the API reports listening on, or null once it has exited without reporting one.
+        public Task<Uri?> WaitForHttpsListenerAsync(CancellationToken cancellationToken)
+        {
+            return WaitForListenerAsync(_httpsAddress, "HTTPS", cancellationToken);
+        }
+
+        // The first plaintext HTTP address the API reports listening on, or null once it has exited without reporting
+        // one.
+        public Task<Uri?> WaitForHttpListenerAsync(CancellationToken cancellationToken)
+        {
+            return WaitForListenerAsync(_httpAddress, "HTTP", cancellationToken);
+        }
+
+        // Whether the output contains the text given within the time given, read as the output arrives. The process
+        // is not required to keep running, so a text written just before an exit is still found.
+        public async Task<bool> WaitForOutputAsync(string text, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            TimeSpan pollInterval = TimeSpan.FromMilliseconds(100);
+            long started = Stopwatch.GetTimestamp();
+            while (!Output.Contains(text, StringComparison.Ordinal))
+            {
+                if (Stopwatch.GetElapsedTime(started) >= timeout)
+                {
+                    return false;
+                }
+
+                await Task.Delay(pollInterval, cancellationToken);
+            }
+
+            return true;
+        }
+
+        // The wait for the exit also waits for the end of the output, so an address reported just before an exit is
+        // seen.
+        private async Task<Uri?> WaitForListenerAsync(
+            TaskCompletionSource<Uri> reported,
+            string protocol,
+            CancellationToken cancellationToken)
         {
             using CancellationTokenSource deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             deadline.CancelAfter(StartTimeout);
             Task exited = _process.WaitForExitAsync(deadline.Token);
-            await Task.WhenAny(_httpsAddress.Task, exited);
+            await Task.WhenAny(reported.Task, exited);
 
-            if (_httpsAddress.Task.IsCompletedSuccessfully)
+            if (reported.Task.IsCompletedSuccessfully)
             {
                 // Ends the exit wait, which nothing awaits any longer.
                 await deadline.CancelAsync();
-                return await _httpsAddress.Task;
+                return await reported.Task;
             }
 
             if (exited.IsCompletedSuccessfully)
@@ -2767,7 +3382,7 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
 
             // The runner's cancellation stays a cancellation; only the deadline becomes a failure.
             cancellationToken.ThrowIfCancellationRequested();
-            throw new TimeoutException("The API process neither listened on HTTPS nor exited within a minute.");
+            throw new TimeoutException($"The API process neither listened on {protocol} nor exited within a minute.");
         }
 
         // The API's exit code, once it has exited on its own and its output has ended.
@@ -2905,9 +3520,9 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
             RegexOptions.Multiline | RegexOptions.CultureInvariant)]
         private static partial Regex ConsoleRecord();
 
-        // The hosting lifetime's report of an HTTPS address the server listens on.
-        [GeneratedRegex(@"Now listening on: (?<address>https://\S+)", RegexOptions.CultureInvariant)]
-        private static partial Regex HttpsListeningReport();
+        // The hosting lifetime's report of an HTTPS or plaintext HTTP address the server listens on.
+        [GeneratedRegex(@"Now listening on: (?<address>https?://\S+)", RegexOptions.CultureInvariant)]
+        private static partial Regex ListeningReport();
 
         private void OnLineReceived(object sender, DataReceivedEventArgs line)
         {
@@ -2922,11 +3537,13 @@ public sealed partial class ProblemDetailsContractTests : IClassFixture<SmartHot
                 _output.Append(line.Data).Append('\n');
             }
 
-            Match report = HttpsListeningReport().Match(line.Data);
+            Match report = ListeningReport().Match(line.Data);
             if (report.Success
                 && Uri.TryCreate(report.Groups["address"].Value, UriKind.Absolute, out Uri? address))
             {
-                _httpsAddress.TrySetResult(address);
+                TaskCompletionSource<Uri> reported =
+                    address.Scheme == Uri.UriSchemeHttps ? _httpsAddress : _httpAddress;
+                reported.TrySetResult(address);
             }
         }
     }

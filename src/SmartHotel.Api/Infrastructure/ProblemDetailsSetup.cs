@@ -4,6 +4,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 
+using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Abstractions;
@@ -66,8 +67,10 @@ public static class ProblemDetailsSetup
     /// Adds ProblemDetails support with <see cref="ApplyDefaults"/> as its customization step, registers
     /// <see cref="ApiProblemDetailsWriter"/> ahead of every framework writer, wires the sanitized diagnostics
     /// for unhandled exceptions that the exception handler cannot answer, keeps the Development exception
-    /// page from rendering exception data, and gives the requests Kestrel rejects before the pipeline runs the
-    /// same problem body.
+    /// page from rendering exception data, keeps every Kestrel endpoint to HTTP/1.1, refusing every Kestrel protocols
+    /// setting for anything else, and gives the recognized HTTP/1.x rejections Kestrel writes before the pipeline runs
+    /// the same problem envelope, without the body for a <c>HEAD</c> request, while every other response the server
+    /// writes passes through unchanged.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -92,9 +95,13 @@ public static class ProblemDetailsSetup
     /// Every Kestrel endpoint defaults to HTTP/1.1 and runs <see cref="ApiProblemDetailsWriter.ServerRejections"/>
     /// as its first connection middleware, ahead of any TLS layer. The middleware learns of each rejection from the
     /// server's own diagnostic event, so nothing is added to the request pipeline, whose first middleware stays the
-    /// exception handler. An endpoint's own <c>Protocols</c> setting in configuration still overrides the default.
-    /// A host on another server, such as the in-process test server, never resolves the Kestrel options and builds
-    /// no connection middleware.
+    /// exception handler. <see cref="ApiProblemDetailsWriter.ServerRejections.ProtocolsSettingsGuard"/> holds every
+    /// <c>Protocols</c> setting in Kestrel's configuration, for the endpoint defaults, an endpoint or one of its SNI
+    /// entries, to <c>Http1</c>: it reports each other value with a Critical event that names the setting, when Kestrel
+    /// creates its options and on each reload of its configuration, and while such a value is in place the host does
+    /// not start and Kestrel binds no endpoint that a reload starts or rebinds. A host on another server, such as the
+    /// in-process test server, never resolves the Kestrel options, so the guard reads nothing there and no connection
+    /// middleware is built.
     /// </para>
     /// </remarks>
     /// <param name="services">The API host's service collection.</param>
@@ -147,18 +154,37 @@ public static class ProblemDetailsSetup
             ApiExceptionHandler.DeveloperPageProblemFilter>());
 
         // Kestrel rejects some requests while it parses them, before any middleware runs, and answers with a bodyless
-        // status of its own; the connection middleware gives that response the problem body. Over HTTP/2 the rejection
-        // is a bare HEADERS frame that the middleware cannot extend with a body, so endpoints default to HTTP/1.1,
-        // which TLS serves just as well. Kestrel applies the endpoint defaults when it binds each endpoint, before an
-        // HTTPS endpoint adds its TLS layer. When Kestrel builds the endpoint's connection pipeline, before it accepts
-        // a connection, the middleware resolves the problem writer from the endpoint's application services and
-        // subscribes to the server's rejection event on the host's diagnostic listener. ConfigureEndpointDefaults
-        // replaces any earlier defaults action; nothing else in the API sets one.
+        // status of its own; the connection middleware completes a recognized HTTP/1.x rejection with the problem. Over
+        // HTTP/2 and HTTP/3 a rejection is a bare header frame that the middleware cannot extend with a body, so
+        // endpoints default to HTTP/1.1, which TLS serves just as well. Kestrel applies these defaults to each endpoint
+        // before the endpoint's own Protocols setting and before an HTTPS endpoint adds its TLS layer; an SNI entry's
+        // Protocols setting replaces the endpoint's for the TLS connections that name its host; and a value with no
+        // protocol flag builds no pipeline at all. One guard therefore serves as a validator of the Kestrel options,
+        // which reads every Protocols setting in Kestrel's configuration when Kestrel creates its options while the
+        // host is built and again on each reload, and as a hosted service, which refuses the host's start while one is
+        // anything but Http1. Kestrel builds an endpoint's connection pipelines only when it binds the endpoint, at
+        // startup or on a configuration reload, and the middleware refuses to be built while the configuration holds
+        // such a setting or when the endpoint's own protocols are anything else; the multiplexed pipeline, the only one
+        // Kestrel builds for an endpoint that serves HTTP/3 alone, refuses it too. ConfigureEndpointDefaults replaces
+        // any earlier defaults action; nothing else in the API sets one.
+        services.TryAddSingleton<ApiProblemDetailsWriter.ServerRejections.ProtocolsSettingsGuard>();
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<
+            IValidateOptions<KestrelServerOptions>,
+            ApiProblemDetailsWriter.ServerRejections.ProtocolsSettingsGuard>(
+            static provider =>
+                provider.GetRequiredService<ApiProblemDetailsWriter.ServerRejections.ProtocolsSettingsGuard>()));
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<
+            IHostedService,
+            ApiProblemDetailsWriter.ServerRejections.ProtocolsSettingsGuard>(
+            static provider =>
+                provider.GetRequiredService<ApiProblemDetailsWriter.ServerRejections.ProtocolsSettingsGuard>()));
         services.AddOptions<KestrelServerOptions>().Configure(static kestrel =>
             kestrel.ConfigureEndpointDefaults(static listenOptions =>
             {
                 listenOptions.Protocols = HttpProtocols.Http1;
                 listenOptions.Use(next => ApiProblemDetailsWriter.ServerRejections.Create(next, listenOptions));
+                ((IMultiplexedConnectionBuilder)listenOptions).Use(
+                    next => ApiProblemDetailsWriter.ServerRejections.CreateMultiplexed(next, listenOptions));
             }));
 
         return services;
@@ -211,13 +237,8 @@ public static class ProblemDetailsSetup
 
         problem.Extensions[TraceIdKey] = ResolveTraceId(httpContext);
 
-        // Every 400 carries exactly one errors object, a field-message dictionary: string keys mapped to arrays of
-        // message strings, with no null array and no null message. Both branches store a normalized copy, so the
-        // valid entries of a source survive beside its invalid ones. A plain 400 takes the copy of its errors
-        // extension, which is empty when the extension is missing or not a dictionary. On a validation problem,
-        // MVC's ValidationProblemDetails included, the typed Errors member is that object: it takes the copy of
-        // its own messages or, when the settable member is null, of the errors extension. The extension is then
-        // removed, because beside the typed member it would serialize as a second errors member.
+        // On a validation problem the typed Errors member is the errors object, so the errors extension is removed:
+        // beside the typed member it would serialize as a second errors member.
         if (status == StatusCodes.Status400BadRequest)
         {
             problem.Extensions.TryGetValue(ErrorsKey, out object? extension);

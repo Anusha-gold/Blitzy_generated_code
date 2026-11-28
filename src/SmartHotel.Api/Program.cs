@@ -38,7 +38,7 @@ WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 // environment variables, then a view of the merged section that answers every key except a certificate password, so
 // every other key keeps its usual precedence. A password therefore comes from Kestrel__Certificates__Default__Password
 // or its endpoint forms alone, and no application code looks it up. The delegate runs when Kestrel's options are
-// created after Build(), replaces the default configuration loader, and leaves loading the certificate to Kestrel.
+// created during Build(), replaces the default configuration loader, and leaves loading the certificate to Kestrel.
 // No response carries a Server header, not even the server's own rejections: the header would name the implementation
 // to every client and tell none of them anything it needs.
 builder.WebHost.ConfigureKestrel(static (context, kestrel) =>
@@ -620,7 +620,13 @@ file sealed class KestrelConfigurationView : IConfigurationProvider
         return true;
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Refuses every write. The view is read-only: it answers only from the merged <c>Kestrel</c> section, and a
+    /// certificate password comes only from the <c>Kestrel__</c> environment variables.
+    /// </summary>
+    /// <param name="key">The key, relative to the <c>Kestrel</c> section; not used.</param>
+    /// <param name="value">The value to write; not stored.</param>
+    /// <exception cref="NotSupportedException">Always: the view accepts no writes.</exception>
     public void Set(string key, string? value)
     {
         throw new NotSupportedException("The Kestrel configuration view is read-only.");

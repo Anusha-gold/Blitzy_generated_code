@@ -174,7 +174,10 @@ const GROUP_POLL_INTERVAL_MS = 100;
 /** How long, in milliseconds, a stopped run's remaining processes get to exit before SIGKILL. */
 const GROUP_EXIT_TIMEOUT_MS = 10_000;
 
-/** How long, in milliseconds, the group gets to empty after SIGKILL before ng exits anyway. */
+/**
+ * How long, in milliseconds, the group gets to empty after SIGKILL before the
+ * run fails with the group reported still running.
+ */
 const GROUP_KILL_GRACE_MS = 1_000;
 
 /**
@@ -274,20 +277,26 @@ function waitForEmptyGroup(pgid, timeoutMs) {
 }
 
 /**
- * Waits, after a stop, for the processes still in Playwright's group once the
- * CLI has exited, such as a `docker compose` command global setup started, so
- * that ng exits only after they have stopped and a re-run cannot race them.
- * Members left after `GROUP_EXIT_TIMEOUT_MS` receive SIGKILL, and the wait
- * then ends after at most `GROUP_KILL_GRACE_MS`, whatever remains.
+ * Gives the processes still in Playwright's group once the CLI has exited
+ * after a stop, such as a `docker compose` command global setup started, a
+ * bounded, best-effort drain. Members left after `GROUP_EXIT_TIMEOUT_MS`
+ * receive SIGKILL, and the wait then ends after at most `GROUP_KILL_GRACE_MS`,
+ * whatever remains; the result says whether the group emptied, so the caller
+ * reports a group that did not instead of assuming it gone. The builder holds
+ * no acceptance-run lock: global setup's barrier file, written before each
+ * Compose command and left by a stopped run, is what keeps a fresh re-run out
+ * until the project has been checked.
  *
  * @param {number} pgid The process group ID, which is the Playwright process's PID.
  * @param {import('@angular-devkit/architect').BuilderContext} context The Architect
  *   context, which supplies `logger`.
- * @returns {Promise<void>} Resolves when the wait ends. It never rejects.
+ * @returns {Promise<boolean>} Resolves `true` once the group is empty, within
+ *   `GROUP_EXIT_TIMEOUT_MS` or after SIGKILL within `GROUP_KILL_GRACE_MS`, and
+ *   `false` when members remain. It never rejects.
  */
 async function drainProcessGroup(pgid, context) {
   if (await waitForEmptyGroup(pgid, GROUP_EXIT_TIMEOUT_MS)) {
-    return;
+    return true;
   }
   logSafely(
     context,
@@ -301,7 +310,7 @@ async function drainProcessGroup(pgid, context) {
     // Deliberately ignored: the group emptied meanwhile, or a member cannot be
     // signalled; either way the wait below is bounded.
   }
-  await waitForEmptyGroup(pgid, GROUP_KILL_GRACE_MS);
+  return waitForEmptyGroup(pgid, GROUP_KILL_GRACE_MS);
 }
 
 /**
@@ -317,19 +326,23 @@ async function drainProcessGroup(pgid, context) {
  * forwarded to it, and the Architect teardown sends SIGTERM if the run is
  * stopped first. On POSIX, Playwright leads its own process group, and a stop
  * signals the whole group: the CLI, its workers and the processes global
- * setup started. Once the CLI has exited, the builder waits until the group
- * is empty, checking every 100 ms for up to 10 s, then sends SIGKILL to what
- * remains and waits at most 1 s more, so ng exits only after those processes
- * have stopped. On Windows only the Playwright process is signalled. A run
- * that ends without a stop is reported as soon as the CLI exits.
+ * setup started. Once the CLI has exited, the builder gives the group a
+ * bounded, best-effort drain: it checks every 100 ms for up to 10 s whether
+ * the group is empty, then sends SIGKILL to what remains and waits at most
+ * 1 s more. A group still not empty then fails the run with a message naming
+ * the process group, because a `docker compose` command may still be
+ * operating on the acceptance stack. On Windows only the Playwright process
+ * is signalled. A run that ends without a stop is reported as soon as the CLI
+ * exits.
  *
  * @param {{ config?: string }} options The validated builder options. `config` is the
  *   Playwright configuration path, relative to the workspace root.
  * @param {import('@angular-devkit/architect').BuilderContext} context The Architect
  *   context, which supplies `workspaceRoot`, `logger` and `addTeardown`.
  * @returns {Promise<{ success: boolean, error?: string }>} Resolves `success: true` only
- *   when Playwright exits with code 0. A failure carries a fixed message in
- *   `error`, which the Angular CLI prints. It never rejects.
+ *   when Playwright exits with code 0 and, after a stop, its process group
+ *   emptied. A failure carries a fixed message in `error`, which the Angular
+ *   CLI prints. It never rejects.
  */
 function runPlaywright(options, context) {
   return new Promise((resolve) => {
@@ -489,13 +502,23 @@ function runPlaywright(options, context) {
         settle(output);
         return;
       }
-      // After a stop, processes the CLI started can outlive it, such as a
-      // `docker compose` command global setup awaited. ng exits only once
-      // they are gone, so a re-run's `down -v` cannot race them.
+      // After a stop, give surviving group members a bounded drain before
+      // reporting the outcome; a group that does not empty is reported, not
+      // assumed gone.
       draining = true;
-      drainProcessGroup(child.pid, context).then(
-        () => settle(output),
-        () => settle(output),
+      const pgid = child.pid;
+      const reportSurvivors = () =>
+        settle({
+          success: false,
+          error:
+            `${output.error ?? `Playwright exited after ng test received ${stoppedBy}`}.` +
+            ` Processes Playwright started (process group ${pgid}) were still running after SIGKILL,` +
+            ' so a docker compose command may still be operating on the acceptance stack;' +
+            ' make sure they have ended before running ng test again.',
+        });
+      drainProcessGroup(pgid, context).then(
+        (emptied) => (emptied ? settle(output) : reportSurvivors()),
+        reportSurvivors,
       );
     });
   });

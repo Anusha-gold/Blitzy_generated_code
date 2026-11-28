@@ -15,7 +15,10 @@
  * return URLs the login page refuses or keeps, URL criteria, late answers,
  * the request deadline, a request that fails with no HTTP response, a 5xx
  * problem body shown only as generic text, and unusable response bodies and
- * success statuses.
+ * success statuses. Booking outcomes stay with the session that sent them:
+ * "Log out" or the session's expiry while "Book" is in flight, a late 401
+ * notice that names no booking, a late notice's link once the clock has
+ * passed the expiry, and the expiry checks that run when the timer is late.
  *
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory. Every guest is registered
@@ -1898,10 +1901,20 @@ for (const c of LATE_CREATED_CASES) {
       await expectNoInlineError(page);
       expect(await inlineErrors.appearances()).toEqual([]);
     });
+
+    await test.step('with the session live, the link opens My bookings with the confirmation', async () => {
+      await page.getByTestId('late-booking-bookings').click();
+      await expect(page).toHaveURL(/\/bookings$/);
+      const confirmation = page.getByTestId('booking-confirmation');
+      await expect(confirmation).toBeVisible();
+      await expect(confirmation).toContainText(`${pending.hotel.name}, ${pending.roomType.name}, room `);
+      await expect(confirmation).toContainText(`${displayDate(bookedIn)} to ${displayDate(bookedOut)}`);
+      await expect(confirmation).toContainText('No payment is taken online in this version.');
+    });
   });
 }
 
-test('a late 401 on a reused detail page shows in its notice, never as an error of the stay on screen', async ({ page }) => {
+test('a late 401 on a reused detail page shows in a notice that names no booking, never as an error of the stay on screen', async ({ page }) => {
   // The stays overlap, so only the status, not the dates, rules out a
   // revalidation.
   const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(111, 114, 112, 115);
@@ -1922,14 +1935,17 @@ test('a late 401 on a reused detail page shows in its notice, never as an error 
     expect((await rejected).status()).toBe(401);
   });
 
-  await test.step('the notice says the booking could not be confirmed, with the 401 and its own link', async () => {
+  await test.step('the notice names no booking, only that it could not be confirmed, with the 401 and its own link', async () => {
     const late = page.getByTestId('late-booking');
     await expect(late).toBeVisible();
-    await expect(page.getByTestId('late-booking-message')).toHaveText(
-      `Your booking of ${pending.roomType.name} at ${pending.hotel.name} ` +
-        `from ${displayDate(bookedIn)} to ${displayDate(bookedOut)} ` +
-        'could not be confirmed.',
-    );
+    // The 401 signed the guest out, so the public page keeps none of the
+    // booking: no room type, hotel or dates.
+    await expect(page.getByTestId('late-booking-message')).toHaveText('Your booking could not be confirmed.');
+    await expect(late).not.toContainText(pending.roomType.name);
+    await expect(late).not.toContainText(pending.hotel.name);
+    await expect(late).not.toContainText(displayDate(bookedIn));
+    await expect(late).not.toContainText(displayDate(bookedOut));
+    await expect(late.locator('time')).toHaveCount(0);
     const error = late.getByTestId('inline-error');
     await expect(error).toBeVisible();
     const loginAgain = error.getByTestId('late-booking-login-again');
@@ -1958,6 +1974,318 @@ test('a late 401 on a reused detail page shows in its notice, never as an error 
     expect(await inlineErrors.appearances()).toEqual([new URL(pending.url).pathname]);
   });
 });
+
+/** The neutral notice of a booking answered after the session that sent it had ended. */
+const SESSION_ENDED_MESSAGE =
+  'Your session ended before this booking was answered. Log in and open My bookings to see whether it was made ' +
+  'before you book again.';
+
+/**
+ * Records, from now on, the path of every URL the page's main frame commits,
+ * the router's history API navigations included, and returns the list it
+ * fills.
+ */
+function recordVisitedPaths(page: Page): string[] {
+  const visited: string[] = [];
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) {
+      visited.push(new URL(frame.url()).pathname);
+    }
+  });
+  return visited;
+}
+
+/**
+ * Registers a fresh guest and logs in, as {@link registerAndLogIn} does, and
+ * also returns the session's expiry, read from the login response.
+ *
+ * @returns The guest's credentials and the `expiresAt` instant in
+ *   milliseconds since the epoch.
+ */
+async function registerAndLogInWithExpiry(page: Page): Promise<{ guest: GuestCredentials; expiresAt: number }> {
+  const login = page.waitForResponse((r) => isLoginApi(new URL(r.url())) && r.request().method() === 'POST');
+  const guest = await registerAndLogIn(page);
+  const body: unknown = await (await login).json();
+  const expiresAt = Date.parse(isRecord(body) && typeof body['expiresAt'] === 'string' ? body['expiresAt'] : '');
+  expect(Number.isNaN(expiresAt), 'the login returns an expiry instant').toBe(false);
+  return { guest, expiresAt };
+}
+
+/**
+ * Moves the page's faked clock forward until it reads `offsetMs` from the
+ * session's `expiresAt`: a negative offset stops short of the expiry, a
+ * positive one passes it. Timers due on the way fire, as `clock.fastForward`
+ * fires them. Expects `page.clock.install()` before the app loaded.
+ */
+async function fastForwardToExpiry(page: Page, expiresAt: number, offsetMs: number): Promise<void> {
+  const now = await page.evaluate(() => Date.now());
+  const ms = expiresAt + offsetMs - now;
+  expect(ms, 'the clock only moves forward').toBeGreaterThan(0);
+  await page.clock.fastForward(ms);
+}
+
+test('Log out while Book is in flight reaches the search page, and the later 201 shows nowhere', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(116, 118);
+  const indicator = page.getByTestId('loading-indicator');
+  const inlineErrors = await watchInlineErrors(page);
+
+  const session = await test.step('register and log in', async () => {
+    // Recorded before "Book" is clicked, so the booking the released POST
+    // commits is cancelled after the test.
+    const guest = await apiSignIn(request, await registerAndLogIn(page));
+    cancelGuestBookingsAfterTest(page, guest);
+    return guest;
+  });
+
+  const post = await test.step('open a Seattle hotel, click Book and hold its POST', async () => {
+    await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+    await openHotel(page, page.locator(VIEW_ROOMS).first());
+    const gate = await holdRequest(page, isBookingsCollection, 'POST');
+    await page.locator(`${BOOK_BUTTONS}:enabled`).first().click();
+    await gate.expectArrival('Book sends the POST');
+    await expect(indicator).toBeVisible();
+    await expectEveryBookDisabled(page);
+    return gate;
+  });
+
+  const visited = recordVisitedPaths(page);
+  const sent = recordApiRequests(page);
+
+  await test.step('Log out leaves for the search page at once, signed out', async () => {
+    await page.getByTestId('nav-logout').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Find a hotel');
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+  });
+
+  await test.step('release the POST: the API creates the booking', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await post.release();
+    expect((await created).status()).toBe(201);
+  });
+
+  await test.step('the 201 shows nowhere, navigates nowhere and stands on the server', async () => {
+    // The indicator falls only once the answer has been delivered, so the
+    // app has handled it by now.
+    await expect(indicator).toHaveCount(0);
+    await expect(page).toHaveURL(/\/search$/);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('booking-session-ended')).toHaveCount(0);
+    expect(visited, 'the paths the tab visited since Book').toEqual(['/search']);
+    // Leaving neither repeated the POST nor sent anything else.
+    expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+    expect(await inlineErrors.appearances()).toEqual([]);
+    expect(await confirmedBookingIds(request, session), "the guest's Confirmed bookings").toHaveLength(1);
+  });
+});
+
+test('a 201 answered after the session expired shows only the neutral notice and revalidates the stay', async ({ page, request }) => {
+  // Installed before the app loads, so the app's Date and timers run on a
+  // clock the test can move forward; until then it keeps pace with real time.
+  await page.clock.install();
+  const [checkIn, checkOut] = utcDates(144, 146);
+  const stay: Stay = { checkIn, checkOut, guests: 1 };
+  const indicator = page.getByTestId('loading-indicator');
+  const inlineErrors = await watchInlineErrors(page);
+
+  const expiresAt = await test.step('register and log in', async () => {
+    const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+    // Recorded before "Book" is clicked; the API session is the server's own,
+    // so the faked browser clock never expires it.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+    return expiry;
+  });
+
+  const { hotel, roomTypeId, url, shownCount } = await test.step('open a Seattle hotel', async () => {
+    await searchHotels(page, { city: 'Seattle', ...stay });
+    const opened = await openHotel(page, page.locator(VIEW_ROOMS).first());
+    const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+    expect(testId).toMatch(/^book-\d+$/);
+    const id = Number(testId.slice('book-'.length));
+    return { hotel: opened, roomTypeId: id, url: page.url(), shownCount: await readAvailableCount(page, id) };
+  });
+
+  const post = await test.step('ten seconds before the session expires, click Book and hold its POST', async () => {
+    await fastForwardToExpiry(page, expiresAt, -10_000);
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    const gate = await holdRequest(page, isBookingsCollection, 'POST');
+    await page.getByTestId(`book-${roomTypeId}`).click();
+    await gate.expectArrival('Book sends the POST');
+    return gate;
+  });
+
+  await test.step('the session expires while the POST is held', async () => {
+    // Five seconds past the expiry is still inside the POST's 30-second
+    // deadline, so the request is still pending.
+    await fastForwardToExpiry(page, expiresAt, 5_000);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    await expect(indicator).toBeVisible();
+  });
+
+  const visited = recordVisitedPaths(page);
+  const sent = recordApiRequests(page);
+
+  await test.step('release the POST: the API creates the booking', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await post.release();
+    expect((await created).status()).toBe(201);
+  });
+
+  await test.step('only the neutral notice shows, on the same stay, with its counts revalidated', async () => {
+    await expect(page.getByTestId('booking-session-ended')).toHaveText(SESSION_ENDED_MESSAGE);
+    // The notice renders as the 201 is settled, which starts the
+    // revalidation; with the indicator gone that has answered too.
+    await expect(indicator).toHaveCount(0);
+    await expect(page).toHaveURL(url);
+    expect(visited, 'the paths the tab visited since the expiry').toEqual([]);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toHaveText(hotel.name);
+    await expectNoInlineError(page);
+    expect(await inlineErrors.appearances()).toEqual([]);
+    await expect(page.getByTestId(`available-count-${roomTypeId}`)).toHaveText(String(shownCount - 1));
+    expect(await apiAvailableCount(request, hotel.id, stay, roomTypeId)).toBe(shownCount - 1);
+    expect(sent.map(describeStayRequest)).toEqual([
+      `GET /api/hotels/${hotel.id} checkIn=${checkIn} checkOut=${checkOut} guests=${stay.guests}`,
+    ]);
+    // Focus returns to the pressed "Book", as after a failed booking.
+    await expect(page.getByTestId(`book-${roomTypeId}`)).toBeFocused();
+  });
+});
+
+test('a late-booking notice leaves with its link to My bookings when its session expires', async ({ page, request }) => {
+  // Installed before the app loads, as in the test above.
+  await page.clock.install();
+  // The booked stay starts on the shown stay's check-out day, so the 201
+  // starts no revalidation.
+  const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(160, 162, 162, 164);
+  const shown: Stay = { checkIn: shownIn, checkOut: shownOut, guests: 1 };
+  const booked: Stay = { checkIn: bookedIn, checkOut: bookedOut, guests: 2 };
+  const indicator = page.getByTestId('loading-indicator');
+
+  const expiresAt = await test.step('register and log in', async () => {
+    const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+    return expiry;
+  });
+  const pending = await bookThenReturnToShownStay(page, shown, booked);
+
+  await test.step('release the POST: the notice confirms the booking, with its link', async () => {
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await pending.post.release();
+    expect((await created).status()).toBe(201);
+    await expect(page.getByTestId('late-booking-message')).toContainText('is confirmed.');
+    await expect(indicator).toHaveCount(0);
+    const link = page.getByTestId('late-booking-bookings');
+    await link.focus();
+    await expect(link).toBeFocused();
+  });
+
+  await test.step('at the expiry the notice and its link leave, and focus moves to the hotel heading', async () => {
+    await fastForwardToExpiry(page, expiresAt, 5_000);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('late-booking-bookings')).toHaveCount(0);
+    await expect(page.getByTestId('booking-session-ended')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toBeFocused();
+    await expect(page).toHaveURL(pending.url);
+    await expect(page.getByTestId('hotel-name')).toHaveText(pending.hotel.name);
+  });
+});
+
+/**
+ * Moves the page's faked wall clock to `offsetMs` past the session's
+ * `expiresAt` without firing a timer: `clock.setSystemTime` changes only what
+ * `Date` reads, and timers keep their own schedule, so the session's expiry
+ * timer stays pending, as a throttled tab's or a sleeping device's would.
+ * Expects `page.clock.install()` before the app loaded.
+ */
+async function passExpiryWithoutTimers(page: Page, expiresAt: number, offsetMs: number): Promise<void> {
+  await page.clock.setSystemTime(expiresAt + offsetMs);
+  expect(await page.evaluate(() => Date.now()), 'the page clock reads past the expiry').toBeGreaterThan(expiresAt);
+}
+
+/**
+ * How the guest activates a late-booking notice's "View it in My bookings"
+ * once its session has expired with the expiry timer not yet fired. Either
+ * way the click reaches the link's own handler first, as the app checks the
+ * expiry after a click only on the next task.
+ */
+interface ExpiredLinkCase {
+  /** The activation, for the test title. */
+  title: string;
+  /** Days from today of the shown check-in and check-out, then of the booked ones. */
+  offsets: readonly [number, number, number, number];
+  /** Activates the link. */
+  activate(link: Locator): Promise<void>;
+}
+
+/** The activations, one test each. The booked stays start on the shown check-out day, so no 201 revalidates. */
+const EXPIRED_LINK_CASES: readonly ExpiredLinkCase[] = [
+  // A real mouse press and release on the link, then its click.
+  { title: 'a pointer click', offsets: [166, 168, 168, 170], activate: (link) => link.click() },
+  // A click event alone, with no press before it, as assistive technology can send.
+  { title: 'a click no press precedes', offsets: [172, 174, 174, 176], activate: (link) => link.dispatchEvent('click') },
+];
+
+for (const c of EXPIRED_LINK_CASES) {
+  test(`${c.title} on a late-booking link after an undelivered expiry hands over no booking`, async ({ page, request }) => {
+    // Installed before the app loads, as in the expiry tests above.
+    await page.clock.install();
+    const [shownIn, shownOut, bookedIn, bookedOut] = utcDates(...c.offsets);
+    const shown: Stay = { checkIn: shownIn, checkOut: shownOut, guests: 1 };
+    const booked: Stay = { checkIn: bookedIn, checkOut: bookedOut, guests: 2 };
+    const indicator = page.getByTestId('loading-indicator');
+    const link = page.getByTestId('late-booking-bookings');
+
+    const expiresAt = await test.step('register and log in', async () => {
+      const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+      return expiry;
+    });
+    const pending = await bookThenReturnToShownStay(page, shown, booked);
+
+    await test.step('release the POST: the notice confirms the booking, with its link', async () => {
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await pending.post.release();
+      expect((await created).status()).toBe(201);
+      await expect(page.getByTestId('late-booking-message')).toContainText('is confirmed.');
+      await expect(indicator).toHaveCount(0);
+      await expect(link).toHaveAttribute('href', '/bookings');
+    });
+
+    await test.step('the clock passes the expiry while its timer stays pending: the notice still shows', async () => {
+      await passExpiryWithoutTimers(page, expiresAt, 5_000);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+      await expect(link).toBeVisible();
+    });
+
+    const visited = recordVisitedPaths(page);
+    const sent = recordApiRequests(page);
+
+    await test.step(`${c.title} signs the guest out and opens no confirmation`, async () => {
+      await c.activate(link);
+      // The link asks My bookings with no state, which the guard sends to log
+      // in; the booking reaches no page.
+      await expect(page).toHaveURL(/\/login\?returnUrl=%2Fbookings$/);
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      await expect(page.getByTestId('late-booking')).toHaveCount(0);
+      expect(visited, 'the paths the tab visited since the expiry').toEqual(['/login']);
+      await expect(page.getByTestId('booking-confirmation')).toHaveCount(0);
+      expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+    });
+  });
+}
 
 test('duplicate registration shows an inline 409', async ({ page }) => {
   const { email } = await test.step('register a guest', () => registerNewGuest(page));
@@ -3085,6 +3413,108 @@ test('token expiry signs the guest out of the nav bar without a request', async 
 
   expect(apiRequests).toEqual([]);
 });
+
+/** An event after which the app compares the clock with the session's expiry, as its timer would. */
+interface ExpiryCheckCase {
+  /** The event, for the test title. */
+  title: string;
+  /** Makes the event happen on the page. */
+  fire(page: Page): Promise<void>;
+}
+
+/** The events, one test each. */
+const EXPIRY_CHECK_CASES: readonly ExpiryCheckCase[] = [
+  // The heading is no control, so no handler answers the click; the app
+  // compares the clock on the task after it.
+  { title: 'a click on the page', fire: (page) => page.getByRole('heading', { level: 1 }).click() },
+  {
+    title: 'the tab becoming visible',
+    fire: (page) => page.evaluate(() => void document.dispatchEvent(new Event('visibilitychange'))),
+  },
+  { title: 'window focus', fire: (page) => page.evaluate(() => void window.dispatchEvent(new FocusEvent('focus'))) },
+  {
+    title: 'the page shown again',
+    fire: (page) =>
+      page.evaluate(() => void window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))),
+  },
+];
+
+for (const c of EXPIRY_CHECK_CASES) {
+  test(`${c.title} after an undelivered expiry signs the guest out without a request`, async ({ page }) => {
+    // Installed before the app loads, as in the test above.
+    await page.clock.install();
+    const { expiresAt } = await test.step('register and log in', () => registerAndLogInWithExpiry(page));
+    const sent = recordApiRequests(page);
+
+    await test.step('the clock passes the expiry while its timer stays pending: still signed in', async () => {
+      await passExpiryWithoutTimers(page, expiresAt, 5_000);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+    });
+
+    await test.step(`${c.title} shows the guest signed out on the same page`, async () => {
+      await c.fire(page);
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      await expect(page).toHaveURL(/\/search$/);
+    });
+
+    expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+  });
+}
+
+/** How the guest activates nav "Log out". */
+interface LogoutActivationCase {
+  /** The activation, for the test title. */
+  title: string;
+  /** Activates the button. */
+  activate(button: Locator): Promise<void>;
+}
+
+/**
+ * The activations, one test each. Enter clicks a button at the key's press
+ * and Space at its release, so a check of the expiry before the click would
+ * remove "Log out" before it is activated.
+ */
+const LOGOUT_ACTIVATION_CASES: readonly LogoutActivationCase[] = [
+  { title: 'a pointer click', activate: (button) => button.click() },
+  { title: 'Enter', activate: (button) => button.press('Enter') },
+  { title: 'Space', activate: (button) => button.press('Space') },
+];
+
+for (const c of LOGOUT_ACTIVATION_CASES) {
+  test(`"Log out" by ${c.title} after an undelivered expiry still reaches the search page signed out`, async ({ page }) => {
+    // Installed before the app loads, as in the tests above.
+    await page.clock.install();
+    const [checkIn, checkOut] = utcDates(178, 180);
+    const logout = page.getByTestId('nav-logout');
+    const { expiresAt } = await test.step('register and log in', () => registerAndLogInWithExpiry(page));
+
+    await test.step('open a Seattle hotel', async () => {
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      await openHotel(page, page.locator(VIEW_ROOMS).first());
+    });
+
+    await test.step('the clock passes the expiry while its timer stays pending: "Log out" still shows', async () => {
+      await passExpiryWithoutTimers(page, expiresAt, 5_000);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+      await expect(logout).toBeVisible();
+    });
+
+    const visited = recordVisitedPaths(page);
+    const sent = recordApiRequests(page);
+
+    await test.step(`"Log out" by ${c.title} leaves for the search page, signed out`, async () => {
+      await c.activate(logout);
+      await expect(page).toHaveURL(/\/search$/);
+      await expect(page.getByRole('heading', { level: 1 })).toHaveText('Find a hotel');
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await expect(page.getByTestId('nav-email')).toHaveCount(0);
+      expect(visited, 'the paths the tab visited since the expiry').toEqual(['/search']);
+      // Logging out calls no endpoint, and bare /search runs no search.
+      expect(sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`)).toEqual([]);
+    });
+  });
+}
 
 /** The inventory {@link apiLeaveFreeRooms} arranged. */
 interface HeldRoomType {

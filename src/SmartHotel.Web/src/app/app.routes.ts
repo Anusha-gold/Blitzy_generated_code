@@ -14,11 +14,12 @@ import { SearchPageComponent } from './features/search/search-page.component';
  *   from the query.
  * - `hotels/:id`: hotel detail and booking; reads `checkIn`, `checkOut` and
  *   `guests` from the query. It has no access guard. Its `canDeactivate`
- *   calls `HotelDetailPageComponent.canLeave`, which holds every navigation
- *   to another route, whatever the session state, while the page's booking
- *   request is in flight, until the page has settled the answer, and then
- *   refuses it; a 201 for the stay on screen goes to My bookings instead
- *   while the guest has a live session, and is shown on the page otherwise.
+ *   calls `HotelDetailPageComponent.canLeave`: while the page's booking
+ *   request is in flight and the session that sent it is live, a navigation
+ *   to another route waits until the page has settled the answer and is then
+ *   refused, and a 201 for the stay on screen goes to My bookings instead;
+ *   once that session has ended, as at "Log out", the navigation proceeds at
+ *   once and the page drops the answer, without cancelling the request.
  *   The hold keeps a booking's outcome in view; it is not access protection.
  * - `login`: reads `returnUrl`, `registered` and `reason` from the query.
  * - `register`: guest registration.

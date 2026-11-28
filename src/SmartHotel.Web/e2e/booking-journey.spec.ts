@@ -44,7 +44,10 @@
  * the API, booking A checking in tomorrow (UTC) and booking B the day after,
  * opens My bookings in a browser set to Pacific/Kiritimati (UTC+14), and sets
  * the page clock to noon UTC on B's check-in day, when the local date is
- * already the next day. B must still offer "Cancel" and A must not, so a page
+ * already the next day. That noon lies past the token's 60 minutes, so the
+ * test hands the app the login's answer with its expiry moved a day past it,
+ * keeping the guest signed in on the page's clock; the API still checks the
+ * token on its own. B must still offer "Cancel" and A must not, so a page
  * that reads the local date, treats today's check-in as passed, or offers
  * "Cancel" on yesterday's check-in fails it. Its own `afterEach` hook attempts
  * the same best-effort cleanup of both bookings.
@@ -66,6 +69,7 @@ import {
   expectControlValue,
   expectNoInlineError,
   expectSignedInAs,
+  isApiEndpoint,
   logIn,
   readAvailableCount,
   registerGuest,
@@ -942,6 +946,27 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
     // clock the test can set. Until it is set it keeps pace with real time.
     await page.clock.install();
 
+    // The page clock is set below to noon UTC on d2, long past the 60 minutes
+    // the API's token lasts, and the app signs the guest out at the first
+    // window focus, or just after the first click, once its clock has passed
+    // the session's expiresAt; the step below dispatches such a focus. The
+    // login's answer therefore reaches the app with the expiry moved to a day
+    // after that noon; the token is the API's own, which the server still
+    // accepts on its real clock for the few seconds this test runs.
+    const pageExpiry = `${d3}T12:00:00Z`;
+    await page.route(
+      (url) => isApiEndpoint(url, '/auth/login'),
+      async (route) => {
+        if (route.request().method() !== 'POST') {
+          await route.fallback();
+          return;
+        }
+        const response = await route.fetch();
+        const body: unknown = await response.json();
+        await route.fulfill({ response, json: isRecord(body) ? { ...body, expiresAt: pageExpiry } : body });
+      },
+    );
+
     await test.step('log in and open My bookings: both bookings offer Cancel', async () => {
       await page.goto('/login');
       await logIn(page, email, password);
@@ -960,7 +985,9 @@ test.describe('cancel eligibility at the UTC date boundary', () => {
     await test.step("set the page clock to noon UTC on booking B's check-in day", async () => {
       // setSystemTime moves the wall clock only and fires no timer, so the
       // session's expiry timer and the page's UTC-midnight timer stay pending.
-      // A window focus is one of the page's own triggers to re-read the date.
+      // A window focus is one of the page's own triggers to re-read the date;
+      // the session's expiry, moved past this noon above, keeps the guest
+      // signed in through it.
       await page.clock.setSystemTime(reference);
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       const pageDates = await page.evaluate(() => {

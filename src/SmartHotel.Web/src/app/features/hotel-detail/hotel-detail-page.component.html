@@ -1,27 +1,36 @@
 <!-- The answer to a booking made for another hotel or stay than the one on
-     screen, or a 201 for the stay on screen once "Log out" or the session's
-     expiry has left no live session, when the guard of My bookings would send
-     the guest to the login page and lose the confirmation. The page holds
-     every navigation away while its booking is in flight, so this shows to
-     the guest who sent it. It sits outside the hotel content, so it shows in
-     every state of the current view, and it never navigates or puts an error
-     above the current room table; when it is a 201 or a 409 for rooms that
-     table counts (same hotel, overlapping dates), the page revalidates them.
-     The link hands over the created booking in memory, so My bookings shows
-     the same confirmation as after a booking on the current view; without a
-     live session the guard asks for a login first and the link's
-     confirmation is not carried there. -->
-<div *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
+     screen. It renders only while the session state it was settled for is
+     current: the session that sent the booking, or the signed-out state of
+     that booking's own 401. "Log out" or the session's expiry removes it in
+     the render that shows the change, so it never shows after its session,
+     and an answer whose session ended before it was settled never shows
+     here at all. For the sending session it names the room type, hotel and
+     dates; a 401 has signed the guest out, so its notice keeps no attempt
+     and names no booking, showing only the 401 and "Log in again". It sits
+     outside the hotel content, so it shows in every state of the current
+     view, and it never navigates or puts an error above the current room
+     table; when it is a 201 or a 409 for rooms that table counts (same
+     hotel, overlapping dates), the page revalidates them. The link hands
+     over the created booking in memory, so My bookings shows the same
+     confirmation as after a booking on the current view; its click handler
+     checks again that the session is current and unexpired, and otherwise
+     drops the notice and opens My bookings with no state, so the guard asks
+     for a login. A click with a modifier key or another button is left to
+     the browser, whose new tab gets neither the booking nor the session. -->
+<div #lateNotice *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
   <p role="status" data-testid="late-booking-message">
-    Your booking of {{ late.attempt.roomType.name }} at {{ late.attempt.hotel.name }}
-    from <time [attr.datetime]="late.attempt.hotel.checkIn">{{ late.attempt.hotel.checkIn | date }}</time>
-    to <time [attr.datetime]="late.attempt.hotel.checkOut">{{ late.attempt.hotel.checkOut | date }}</time>
-    {{ late.error === null ? 'is confirmed. No payment is taken online in this version.' : 'could not be confirmed.' }}
+    <ng-container *ngIf="late.attempt as attempt; else unnamedBooking">
+      Your booking of {{ attempt.roomType.name }} at {{ attempt.hotel.name }}
+      from <time [attr.datetime]="attempt.hotel.checkIn">{{ attempt.hotel.checkIn | date }}</time>
+      to <time [attr.datetime]="attempt.hotel.checkOut">{{ attempt.hotel.checkOut | date }}</time>
+      {{ late.error === null ? 'is confirmed. No payment is taken online in this version.' : 'could not be confirmed.' }}
+    </ng-container>
+    <ng-template #unnamedBooking>Your booking could not be confirmed.</ng-template>
   </p>
   <a
-    *ngIf="late.confirmation as confirmation"
-    routerLink="/bookings"
-    [state]="confirmation"
+    *ngIf="late.confirmation"
+    href="/bookings"
+    (click)="openLateBooking($event, late)"
     data-testid="late-booking-bookings"
   >View it in My bookings</a>
   <app-error-message [error]="late.error">
@@ -32,6 +41,18 @@
       data-testid="late-booking-login-again"
     >Log in again</a>
   </app-error-message>
+</div>
+
+<!-- A booking answered after the session that sent it had ended, at "Log out"
+     or its expiry. Only the guest who logs in again may see that booking, so
+     this names no hotel, room type, dates or status, and it never says the
+     booking was cancelled, which leaving cannot do. The next load or booking
+     clears it. -->
+<div *ngIf="sessionEnded()" class="session-ended">
+  <p role="status" data-testid="booking-session-ended">
+    Your session ended before this booking was answered. Log in and open My bookings to see whether it was made
+    before you book again.
+  </p>
 </div>
 
 <!-- While a load runs, loadError is null and the previous hotel, if any, is
@@ -63,7 +84,7 @@
      browser's own style sheet applies. -->
 <div *ngIf="hotel() as hotel" [hidden]="loadPending()">
   <header class="hotel-header">
-    <h1 tabindex="-1" data-testid="hotel-name">{{ hotel.name }}</h1>
+    <h1 #hotelHeading tabindex="-1" data-testid="hotel-name">{{ hotel.name }}</h1>
     <p class="hotel-meta">{{ hotel.city }}</p>
     <p class="hotel-meta">{{ hotel.address }}</p>
     <p class="hotel-description">{{ hotel.description }}</p>

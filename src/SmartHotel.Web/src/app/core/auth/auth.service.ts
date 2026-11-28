@@ -1,4 +1,5 @@
 import { DestroyRef, Injectable, NgZone, inject, signal } from '@angular/core';
+import { DOCUMENT } from '@angular/common';
 import { Router } from '@angular/router';
 import { map, tap } from 'rxjs';
 import type { Observable } from 'rxjs';
@@ -32,9 +33,29 @@ export interface Session {
  * Expiry: storing a session starts a timer for its `expiresAt`, and the timer
  * clears the session once that instant has passed, so the nav bar shows the
  * guest signed out on any page without a request being sent. Logging out,
- * clearing the session and a new login each cancel the pending timer. It runs
- * outside the Angular zone, so the wait never keeps the app from becoming
- * stable; only the clearing re-enters the zone to update the views.
+ * clearing the session and a new login each cancel the pending timer. A timer
+ * can fire late, as in a throttled background tab or after the device sleeps,
+ * so the clock is also compared whenever the app sees the guest or the tab
+ * again. When the document becomes visible, the window gains focus or the page
+ * is shown again from the back/forward cache, the comparison runs at once.
+ * After each click in the document, which a document listener sees in the
+ * capture phase, it runs on the next task. Every activation of a control, by
+ * mouse, Enter, Space or assistive technology, produces a click, and the
+ * deferral lets the activated control's own handler run first, under its own
+ * rule for an expired session: "Log out" clears it and navigates to
+ * `/search`; a late-booking notice's "View it in My bookings" clears it and
+ * opens My bookings with no booking, which `authGuard` sends to log in;
+ * "Book" sends the guest to log in; and `authGuard`, on any navigation to a
+ * protected page, clears it and redirects to the login page. A session still
+ * held after that handler, as after a click on any other part of the page, is
+ * then cleared, so the nav bar and the hotel detail page drop it. A session
+ * whose `expiresAt` has passed by the time of a check, or is unparseable, is
+ * cleared as the timer would have cleared it.
+ * Each check costs one `Date.parse` comparison. The timers and the listeners
+ * run outside the Angular zone, so neither a wait nor a check that finds the
+ * session live triggers change detection or keeps the app from becoming
+ * stable; only the clearing re-enters the zone to update the views. The root
+ * injector's teardown cancels the timers and removes the listeners.
  *
  * A server 401 that the expiry check cannot predict, such as a token the API
  * rejects before `expiresAt`, is handled in two places:
@@ -59,8 +80,12 @@ export class AuthService {
 
   /**
    * The current session, or `null` when signed out. It becomes `null` once its
-   * `expiresAt` has passed, when the expiry timer fires. A timer can fire late,
-   * for example in a throttled background tab or after the device sleeps, so
+   * `expiresAt` has passed: when the expiry timer fires, or, when the timer is
+   * late, as in a throttled background tab or after the device sleeps, at the
+   * first visibility change to visible, window focus or page show after that
+   * instant, or on the task after the first click, once the clicked control
+   * has handled that click. Between the expiry and the first of these, the
+   * signal still holds the expired session, so
    * {@link AuthService.isAuthenticated} still compares the clock.
    */
   readonly session = this._session.asReadonly();
@@ -74,18 +99,67 @@ export class AuthService {
   readonly pendingLoginEmail = signal<string | null>(null);
 
   constructor() {
+    const document = inject(DOCUMENT);
+    const view = document.defaultView;
+    const check = (): void => this.expireIfPast();
+    const checkWhenVisible = (): void => {
+      if (document.visibilityState === 'visible') {
+        check();
+      }
+    };
+    // The check a click defers to the next task, or `null` when none is
+    // pending. Clicks before it runs share it, as one check after their
+    // handlers sees what each would.
+    let clickCheck: ReturnType<typeof setTimeout> | null = null;
+    const checkAfterClick = (): void => {
+      if (clickCheck !== null) {
+        return;
+      }
+      clickCheck = this.zone.runOutsideAngular(() =>
+        setTimeout(() => {
+          clickCheck = null;
+          check();
+        }, 0),
+      );
+    };
+
+    // Outside the Angular zone, like the expiry timer: an event, or a deferred
+    // check, that finds the session live runs no change detection. The click
+    // listener uses the capture phase, so it sees every click, including one
+    // an element stops from propagating, and its check waits for the next
+    // task, after the clicked control's own handler has run.
+    this.zone.runOutsideAngular(() => {
+      document.addEventListener('visibilitychange', checkWhenVisible);
+      document.addEventListener('click', checkAfterClick, true);
+      view?.addEventListener('focus', check);
+      view?.addEventListener('pageshow', check);
+    });
+
     // The root injector's teardown, such as the app being destroyed, leaves no
-    // timer behind to fire into it.
-    inject(DestroyRef).onDestroy(() => this.cancelExpiry());
+    // timer or listener behind to fire into it.
+    inject(DestroyRef).onDestroy(() => {
+      this.cancelExpiry();
+      if (clickCheck !== null) {
+        clearTimeout(clickCheck);
+        clickCheck = null;
+      }
+      document.removeEventListener('visibilitychange', checkWhenVisible);
+      document.removeEventListener('click', checkAfterClick, true);
+      view?.removeEventListener('focus', check);
+      view?.removeEventListener('pageshow', check);
+    });
   }
 
   /**
    * Whether a session exists and its `expiresAt` is still in the future.
    *
    * It is a method rather than a `computed` because the clock is not reactive:
-   * until the expiry timer fires, which can be late, the session signal still
-   * holds the expired session, so a computed value would stay `true`. An
-   * unparseable `expiresAt` counts as expired.
+   * until the expiry timer fires, which can be late, or the next visibility,
+   * focus or page-show check, or the check after a click, detects the expiry,
+   * the session signal still holds the expired session, so a computed value
+   * would stay `true`. A clicked control's handler runs before its click's
+   * check, so it reads this method to treat such a session as signed out.
+   * An unparseable `expiresAt` counts as expired.
    */
   isAuthenticated(): boolean {
     const current = this._session();
@@ -118,9 +192,13 @@ export class AuthService {
   }
 
   /**
-   * Signs the guest out: discards the session and any unconsumed
+   * Signs the guest out: immediately discards the session and any unconsumed
    * {@link AuthService.pendingLoginEmail}, so a later login page never
-   * pre-fills a previous guest's email, and navigates to `/search`.
+   * pre-fills a previous guest's email, and then requests navigation to
+   * `/search`. With a booking in flight on the hotel detail page, that
+   * navigation is not refused, because the session that sent the booking has
+   * ended: the page lets it leave and drops that booking's answer, without
+   * cancelling or retrying the request.
    *
    * There is no logout endpoint and no HTTP call, so the discarded token stays
    * valid on the server until it expires, at most 60 minutes later.
@@ -183,6 +261,26 @@ export class AuthService {
       return;
     }
     this.zone.run(() => this._session.set(null));
+  }
+
+  /**
+   * Runs outside the Angular zone when the app sees the guest or the tab
+   * again: at once on a visibility change to visible, a window focus or a
+   * page show, and on the task after a click, once the clicked control's
+   * handler has run. It does nothing while there is no session or its
+   * `expiresAt` is still ahead, as after a handler that already cleared an
+   * expired session. Otherwise the expiry timer is late, so the session is
+   * cleared now, as the timer would clear it: the timer is cancelled and the
+   * session set to `null` inside the Angular zone, so the views reading
+   * {@link AuthService.session} re-render. An unparseable `expiresAt` counts
+   * as expired, as in {@link AuthService.isAuthenticated}.
+   */
+  private expireIfPast(): void {
+    const current = this._session();
+    if (current === null || Date.parse(current.expiresAt) > Date.now()) {
+      return;
+    }
+    this.zone.run(() => this.store(null));
   }
 
   /** Cancels the pending expiry timer, if there is one. */
