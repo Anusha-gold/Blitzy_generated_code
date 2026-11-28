@@ -7,8 +7,11 @@
 #   API_BASE_URL     becomes "apiBaseUrl" in /config.json
 #   WEB_ENVIRONMENT  becomes "environment" in /config.json
 # Before rendering, the image clears an input that holds a single quote, a
-# dollar sign or a backslash, or is longer than 1000 characters, because nginx
-# cannot read such a value in this file.
+# dollar sign or a backslash, which nginx cannot read in this file, or that is
+# longer than 1000 bytes, well under the about 4 KB nginx reads as one
+# parameter. It then writes the origin of API_BASE_URL in the browser's form,
+# or clears API_BASE_URL when its host holds a non-ASCII character, whose
+# browser form it cannot compute, as the API origin map below describes.
 # Static files only: this server never proxies the API.
 
 # "environment" is Development only for exactly that value. Every other value,
@@ -31,28 +34,40 @@ map '${API_BASE_URL}' $smarthotel_api_base_url {
 
 # The API's origin, for connect-src in the Content-Security-Policy below,
 # rebuilt as scheme://host[:port] from "apiBaseUrl" as the browser's URL
-# parser reads that value, so it names the origin the SPA sends requests to:
+# parser reads that value, so it names the origin the SPA sends requests to.
+# Before rendering, the image rewrites the origin of API_BASE_URL as that
+# parser serializes it, which these entries cannot compute: it decodes the
+# percent-encoded ASCII characters of a host, writes an IPv4 address given in
+# any of the parser's number forms, such as 0xC0.0.2.10 or 3221225994, in
+# dotted decimal, lower-cases the scheme and host, and drops an empty user
+# name and password, leading zeros of the port and a default port.
+# "apiBaseUrl" is then that rewritten value, so /config.json and connect-src
+# carry the same origin.
+# The image clears a base URL whose host holds a non-ASCII character, as a
+# raw byte or percent-encoded, because the parser maps such a host to an
+# ASCII form, punycode for a domain name, that the image cannot compute; the
+# map above then serves it as empty.
 # - Spaces before the scheme, the slashes after it, however many there are,
 #   an empty user name and password ("@" or ":@") and an empty port
 #   ("host:/api") are left out.
 # - The scheme and host may be in any case: source expressions match both
 #   case-insensitively.
 # - An IPv4 address is kept in its four-decimal form, without the trailing
-#   dot the browser drops from it. Any other host whose last label is a
-#   number, such as 0xC0.0.2.10 or 3221225994, is an IPv4 address in a form
-#   the browser rewrites, so it gives no origin.
+#   dot the browser drops from it. The image has rewritten every other host
+#   whose last label is a number unless the browser cannot parse it, so such
+#   a host gives no origin.
 # - A domain name is kept as dot-separated labels of letters, digits and
 #   hyphens, with the trailing dot the browser keeps when it has one.
 # - A path, query, fragment or the end of the value must follow.
 # A source expression names a host only as such labels, so every other base
 # URL gives no origin: one with a user name or password, which the SPA
-# rejects as well; an IPv6 literal or a host with an underscore, which the
-# source-expression grammar has no form for and Chromium refuses; and a
-# percent-encoded or non-ASCII host or one with an empty label, whose
-# browser form nginx cannot compute or a source cannot name. Neither does a
-# base URL the map above serves as empty. connect-src is then 'self' alone,
-# and the browser refuses the SPA's requests to every other origin, the
-# API's included. No entry yields a wildcard.
+# rejects as well; an IPv6 literal or a host with an underscore or another
+# ASCII character outside those labels, which the source-expression grammar
+# has no form for and Chromium refuses; and a host with an empty label,
+# which a source cannot name. Neither does a base URL the map above serves
+# as empty. connect-src is then 'self' alone, and the browser refuses the
+# SPA's requests to every other origin, the API's included. No entry yields a
+# wildcard.
 map $smarthotel_api_base_url $smarthotel_api_origin {
   default                                                                                                                                                             '';
   '~*^ *(https?):/*(?::?@)?((?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))\.?(?:(:[0-9]+)|:)?(?:[/?#]|\z)'  $1://$2$3;

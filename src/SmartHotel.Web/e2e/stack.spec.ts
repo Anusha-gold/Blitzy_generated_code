@@ -52,21 +52,53 @@
  * stylesheet's load handler switches it to `media="all"`, and the page reports
  * no policy violation and writes nothing to the console.
  *
- * The last test checks the policy a Production deployment is served with,
- * which the stack under test, a Development one, cannot show. One
- * parameterized test starts the runtime image the web Dockerfile names, with
- * that file's template filter, the checkout's nginx template and
- * `WEB_ENVIRONMENT=Production`, once per API base URL. connect-src must admit
- * the API origin of a host with a trailing dot; of an upper-case scheme and
- * host with the default port and a trailing slash; of an IPv4 address with a
- * port and of one with a trailing dot; of a value with a leading space, no
- * slashes, an empty user name and an empty port; and of a plain host. It must
- * be `'self'` alone for an IPv6 literal and for a base URL with a user name.
- * A page served under the rendered policy then requests the API origin the
- * browser derives from the base URL, which must succeed exactly when it is
- * admitted, and an unrelated origin, which Chromium must refuse every time.
- * The container publishes no port and the page's requests are answered in
- * the browser, so this test reaches neither the stack nor the network.
+ * The tests after those render the web server as the web image would for
+ * inputs the stack under test does not use. Each render starts the runtime
+ * image the web Dockerfile names, with that file's template filter and input
+ * guard and the checkout's nginx template, so the guard checks and rewrites
+ * the inputs before the template is rendered, and reads the
+ * Content-Security-Policy, the served `/config.json` and the guard's
+ * warnings. The container publishes no port and has no network.
+ *
+ * One parameterized test checks the policy a Production deployment is served
+ * with, which the stack, a Development one, cannot show, once per API base
+ * URL. connect-src must admit exactly the API origin the browser derives from
+ * a host with a trailing dot; from an upper-case scheme and host with the
+ * default port and a trailing slash; from an IPv4 address with a port and
+ * from one with a trailing dot; from a value with a leading space, no
+ * slashes, an empty user name and an empty port; from a plain host; from a
+ * percent-encoded host letter, with or without a non-ASCII path segment the
+ * browser removes; from an IPv4 address written as one number and from one
+ * in hexadecimal, decimal and octal parts; and from a zero-padded default
+ * port. `/config.json` must serve the base URL with that same origin, spelled
+ * the same way, and the rest exactly as given. connect-src must be `'self'`
+ * alone for an IPv6 literal and for a base URL with a user name, and
+ * `/config.json` must serve either as given. For a host with a percent-encoded
+ * fullwidth letter and for a non-ASCII domain name, which the browser maps to
+ * an ASCII form, the guard must issue exactly one warning, which names the
+ * input and the reason and never the host, `/config.json` must serve an empty
+ * `apiBaseUrl` and connect-src must be `'self'` alone. Every other case must
+ * draw no warning. A page served under the rendered policy then requests the
+ * API origin the browser derives from the base URL, which must succeed
+ * exactly when it is admitted, and an unrelated origin, which Chromium must
+ * refuse every time. The page's requests are answered in the browser, so this
+ * test reaches neither the stack nor the network.
+ *
+ * The next test renders the target API's base URL with the first character
+ * of its host percent-encoded, in Development: the guard issues no warning,
+ * `/config.json` serves the target's own base URL and connect-src admits its
+ * origin. The stack's web app is then loaded with the rendered policy in
+ * place of its own on every document and the rendered `/config.json`, and a
+ * search for Seattle, 1 guest, through the page must show the 2 seeded
+ * hotels, from one successful request to the target API, with no policy
+ * violation and no app console output.
+ *
+ * The last, parameterized test checks the guard's 1000-byte limit for each
+ * input: a value of exactly 1000 bytes, in ASCII characters or in 500
+ * two-byte ones, is kept with no warning, and one of 1001 bytes is served as
+ * empty with exactly one warning, which names the input and the limit and
+ * never the value. No test name or failure message carries one of those
+ * values.
  *
  * API requests use absolute URLs from `apiUrl()`, because the configured
  * `baseURL` is the web origin. The security-header tests send nothing to the
@@ -88,7 +120,7 @@ import {
   type Route,
 } from '@playwright/test';
 
-import { apiUrl, utcDates } from './support/helpers';
+import { apiUrl, fillBound, isApiEndpoint, utcDates } from './support/helpers';
 
 /** One element of the `GET /api/hotels` array. */
 interface HotelSummary {
@@ -220,8 +252,8 @@ const ALLOWED_SCRIPT_SOURCE = /^(?:'self'|'unsafe-hashes'|'sha256-[A-Za-z0-9+/]+
 const WEB_WORKSPACE = join(__dirname, '..');
 
 /**
- * Where the web image's runtime stage reads the nginx template, and where the
- * production render mounts the checkout's template.
+ * Where the web image's runtime stage reads the nginx template, and where a
+ * render mounts the checkout's template.
  */
 const TEMPLATE_TARGET = '/etc/nginx/templates/default.conf.template';
 
@@ -229,8 +261,8 @@ const TEMPLATE_TARGET = '/etc/nginx/templates/default.conf.template';
 const execFileAsync = promisify(execFile);
 
 /**
- * Upper bound for one production render: the `docker run` of the runtime
- * image, its template rendering, the nginx start and the header request,
+ * Upper bound for one render: the `docker run` of the runtime image, its
+ * input guard and template rendering, the nginx start and the two requests,
  * with room for a first pull of the pinned image.
  */
 const RENDER_TIMEOUT_MS = 120_000;
@@ -242,7 +274,7 @@ const RENDER_TIMEOUT_MS = 120_000;
  */
 const RENDER_ENTRYPOINT_TIMEOUT_S = 30;
 
-/** Upper bound, in seconds, for the header request inside the render container. */
+/** Upper bound, in seconds, for each request inside the render container. */
 const RENDER_REQUEST_TIMEOUT_S = 10;
 
 /**
@@ -253,6 +285,19 @@ const HEADERS_BEGIN = '--- smarthotel-web response headers begin ---';
 
 /** The line the render container prints after the response headers. */
 const HEADERS_END = '--- smarthotel-web response headers end ---';
+
+/** The line the render container prints before the `/config.json` body. */
+const CONFIG_BEGIN = '--- smarthotel-web config.json begin ---';
+
+/** The line the render container prints after the `/config.json` body. */
+const CONFIG_END = '--- smarthotel-web config.json end ---';
+
+/**
+ * The environment variable that carries the image's input guard into the
+ * render container. The container writes the guard where the image keeps it
+ * and removes the variable before the image's entrypoint runs.
+ */
+const INPUT_GUARD_VARIABLE = 'SMARTHOTEL_RENDER_INPUT_GUARD';
 
 /** The most lines of a failed render's error output that its error message quotes: its last ones. */
 const RENDER_OUTPUT_MAX_LINES = 20;
@@ -477,47 +522,183 @@ interface CspViolationLog {
 }
 
 /** One production API base URL whose rendered policy the production-policy test checks. */
-interface ProductionOriginCase {
+type ProductionOriginCase = {
   /** What the base URL exercises, as the test name states it. */
   name: string;
   /** The `API_BASE_URL` the web server is started with. */
   apiBaseUrl: string;
-  /**
-   * Whether connect-src must admit the API origin the browser derives from
-   * {@link apiBaseUrl}. When it must not, connect-src is `'self'` alone.
-   */
-  admitted: boolean;
-}
+} & (
+  | {
+      /**
+       * connect-src admits the API origin the browser derives from the base
+       * URL, and the input guard issues no warning.
+       */
+      outcome: 'admitted';
+      /**
+       * The `apiBaseUrl` `/config.json` serves: the base URL with its origin
+       * as the browser serializes it and the rest exactly as given.
+       */
+      served: string;
+    }
+  | {
+      /**
+       * `'served as given'`: the input guard issues no warning, `/config.json`
+       * serves the base URL exactly as given, and connect-src is `'self'`
+       * alone. `'served as empty'`: the input guard issues exactly one
+       * warning, `/config.json` serves an empty `apiBaseUrl`, which the SPA
+       * rejects, and connect-src is `'self'` alone.
+       */
+      outcome: 'served as given' | 'served as empty';
+    }
+);
+
+/**
+ * The warning the input guard issues, after its file name, for a base URL
+ * whose host holds a non-ASCII character: it names the input and the reason,
+ * never the value.
+ */
+const NON_ASCII_HOST_WARNING = /: API_BASE_URL has a host with a non-ASCII character\b.*; it is served as empty$/;
 
 /**
  * Production base URLs in the forms a deployment can write. The admitted ones
  * are each a base URL the SPA accepts in Production, written in a form the
  * browser's URL parser rewrites before it sends a request: the policy must
- * name the origin the SPA actually calls. The others must leave connect-src
- * at `'self'`, never widen it.
+ * name the origin the SPA actually calls. Those served as given must leave
+ * connect-src at `'self'`, never widen it. Those served as empty have a host
+ * the browser maps to an ASCII form the image cannot compute, so the image
+ * clears them rather than serve a base URL whose origin the policy would not
+ * name.
  */
 const PRODUCTION_ORIGIN_CASES: readonly ProductionOriginCase[] = [
-  { name: 'a host with a trailing dot', apiBaseUrl: 'https://api.example.test./api', admitted: true },
+  {
+    name: 'a host with a trailing dot',
+    apiBaseUrl: 'https://api.example.test./api',
+    outcome: 'admitted',
+    served: 'https://api.example.test./api',
+  },
   {
     name: 'an upper-case scheme and host, the default port and a trailing slash',
     apiBaseUrl: 'HTTPS://API.Example.TEST:443/api/',
-    admitted: true,
+    outcome: 'admitted',
+    served: 'https://api.example.test/api/',
   },
-  { name: 'an IPv4 address with a port', apiBaseUrl: 'https://192.0.2.10:8443/api', admitted: true },
-  { name: 'an IPv4 address with a trailing dot', apiBaseUrl: 'https://192.0.2.10./api', admitted: true },
+  {
+    name: 'an IPv4 address with a port',
+    apiBaseUrl: 'https://192.0.2.10:8443/api',
+    outcome: 'admitted',
+    served: 'https://192.0.2.10:8443/api',
+  },
+  {
+    name: 'an IPv4 address with a trailing dot',
+    apiBaseUrl: 'https://192.0.2.10./api',
+    outcome: 'admitted',
+    served: 'https://192.0.2.10/api',
+  },
   {
     name: 'a leading space, no slashes, an empty user name and an empty port',
     apiBaseUrl: ' https:@api.example.test:/api',
-    admitted: true,
+    outcome: 'admitted',
+    served: 'https://api.example.test/api',
   },
-  { name: 'a plain host', apiBaseUrl: 'https://api.example.test/api', admitted: true },
+  {
+    name: 'a plain host',
+    apiBaseUrl: 'https://api.example.test/api',
+    outcome: 'admitted',
+    served: 'https://api.example.test/api',
+  },
+  {
+    name: 'a percent-encoded host letter',
+    apiBaseUrl: 'https://%61pi.example.test/api',
+    outcome: 'admitted',
+    served: 'https://api.example.test/api',
+  },
+  {
+    name: 'a percent-encoded host letter and a non-ASCII path segment the browser removes',
+    apiBaseUrl: 'https://%61pi.example.test/caf\u00e9/../api',
+    outcome: 'admitted',
+    served: 'https://api.example.test/caf\u00e9/../api',
+  },
+  {
+    name: 'an IPv4 address written as one number',
+    apiBaseUrl: 'https://3221225994/api',
+    outcome: 'admitted',
+    served: 'https://192.0.2.10/api',
+  },
+  {
+    name: 'an IPv4 address in hexadecimal, decimal and octal parts with a port',
+    apiBaseUrl: 'https://0xC0.0.02.0x0a:8443/api',
+    outcome: 'admitted',
+    served: 'https://192.0.2.10:8443/api',
+  },
+  {
+    name: 'a zero-padded default port',
+    apiBaseUrl: 'https://api.example.test:000443/api',
+    outcome: 'admitted',
+    served: 'https://api.example.test/api',
+  },
   {
     name: 'an IPv6 literal, which no source expression can name',
     apiBaseUrl: 'https://[2001:db8::1]/api',
-    admitted: false,
+    outcome: 'served as given',
   },
-  { name: 'a user name, which the SPA rejects', apiBaseUrl: 'https://user@api.example.test/api', admitted: false },
+  {
+    name: 'a user name, which the SPA rejects',
+    apiBaseUrl: 'https://user@api.example.test/api',
+    outcome: 'served as given',
+  },
+  {
+    name: 'a percent-encoded fullwidth host letter, which the browser maps to ASCII',
+    apiBaseUrl: 'https://%EF%BD%81pi.example.test/api',
+    outcome: 'served as empty',
+  },
+  {
+    name: 'a non-ASCII domain name, which the browser writes in punycode',
+    apiBaseUrl: 'https://b\u00fccher.example/api',
+    outcome: 'served as empty',
+  },
 ];
+
+/** The input guard's limit for each of its two inputs, in bytes. */
+const GUARD_LIMIT_BYTES = 1_000;
+
+/** The API base URL the input-guard test starts the web server with while it checks `WEB_ENVIRONMENT`. */
+const GUARD_API_BASE_URL = 'https://api.example.test/api';
+
+/** One input length the input-guard test checks at the guard's limit. */
+interface GuardLengthCase {
+  /** The value's length and make-up, as the test name states it; never the value itself. */
+  name: string;
+  /** The input the value is given as. */
+  variable: 'API_BASE_URL' | 'WEB_ENVIRONMENT';
+  /** The value. */
+  value: string;
+  /** Whether the guard keeps the value. When it does not, it serves the input as empty with one warning. */
+  kept: boolean;
+}
+
+/**
+ * Each input at the guard's limit and one byte over it, in ASCII characters
+ * and in two-byte UTF-8 ones (`é`). A limit counted in characters would keep
+ * the 1001-byte value of 501 characters.
+ */
+const GUARD_LENGTH_CASES: readonly GuardLengthCase[] = (['API_BASE_URL', 'WEB_ENVIRONMENT'] as const).flatMap(
+  (variable) => [
+    { name: `${GUARD_LIMIT_BYTES} ASCII bytes`, variable, value: 'a'.repeat(GUARD_LIMIT_BYTES), kept: true },
+    { name: `${GUARD_LIMIT_BYTES + 1} ASCII bytes`, variable, value: 'a'.repeat(GUARD_LIMIT_BYTES + 1), kept: false },
+    {
+      name: `${GUARD_LIMIT_BYTES} bytes in ${GUARD_LIMIT_BYTES / 2} two-byte characters`,
+      variable,
+      value: '\u00e9'.repeat(GUARD_LIMIT_BYTES / 2),
+      kept: true,
+    },
+    {
+      name: `${GUARD_LIMIT_BYTES + 1} bytes in ${GUARD_LIMIT_BYTES / 2} two-byte characters and one ASCII one`,
+      variable,
+      value: `${'\u00e9'.repeat(GUARD_LIMIT_BYTES / 2)}a`,
+      kept: false,
+    },
+  ],
+);
 
 /** The runtime stage of the web image, as its Dockerfile sets it. */
 interface WebRuntime {
@@ -525,22 +706,41 @@ interface WebRuntime {
   image: string;
   /** The image's `NGINX_ENVSUBST_FILTER`, which limits template substitution to its two inputs. */
   envsubstFilter: string;
+  /** Where the image keeps its input guard, a file under `/docker-entrypoint.d/` the entrypoint sources. */
+  inputGuardPath: string;
+  /** The input guard's text, as the image holds it. */
+  inputGuard: string;
 }
 
 /**
- * Reads the runtime image and the template filter from the web image's
- * Dockerfile, so the production render runs what the image runs.
+ * Reads the runtime image, the template filter and the input guard from the
+ * web image's Dockerfile, so a render runs what the image runs. The guard is
+ * the `.envsh` file the Dockerfile writes into `/docker-entrypoint.d/` from a
+ * quoted heredoc; like the Dockerfile, which strips a carriage return from the
+ * end of each of its lines, this drops those, so a Windows checkout renders
+ * the same guard.
  *
- * @throws Error when the Dockerfile names no stage or no filter.
+ * @throws Error when the Dockerfile names no stage, no filter or no guard.
  */
 function webRuntime(): WebRuntime {
   const dockerfile = readFileSync(join(WEB_WORKSPACE, 'Dockerfile'), 'utf8');
   const stages = [...dockerfile.matchAll(/^FROM\s+(?:--\S+\s+)*(\S+)/gim)].map((stage) => stage[1]);
   const filter = /^ENV\s+NGINX_ENVSUBST_FILTER=(?:'([^']*)'|([^\s'"]+))\s*$/m.exec(dockerfile);
-  if (stages.length === 0 || filter === null) {
-    throw new Error('The web Dockerfile names no FROM stage or no single-quoted or unquoted NGINX_ENVSUBST_FILTER.');
+  const guard =
+    /^COPY[ \t]+(?:--\S+[ \t]+)*<<'([A-Za-z_]\w*)'[ \t]+(\/docker-entrypoint\.d\/[\w.-]+\.envsh)[ \t]*\r?\n([\s\S]*?)^\1\r?$/m.exec(
+      dockerfile,
+    );
+  if (stages.length === 0 || filter === null || guard === null) {
+    throw new Error(
+      'The web Dockerfile names no FROM stage, no single-quoted or unquoted NGINX_ENVSUBST_FILTER, or no quoted heredoc COPY of an .envsh file into /docker-entrypoint.d/.',
+    );
   }
-  return { image: stages[stages.length - 1], envsubstFilter: filter[1] ?? filter[2] };
+  return {
+    image: stages[stages.length - 1],
+    envsubstFilter: filter[1] ?? filter[2],
+    inputGuardPath: guard[2],
+    inputGuard: guard[3].replace(/\r$/gm, ''),
+  };
 }
 
 /** The members of the error `execFile` rejects with that a failed render reports. */
@@ -554,14 +754,15 @@ interface ExecFailure {
 }
 
 /**
- * Describes a failed production render in one message: the base URL and
- * image, why `docker run` failed, and the last lines of its error output with
- * control characters removed, each prefixed `  docker | ` so it cannot pass
- * for this message. A Node.js error code is named only when it has the shape
- * of one. The container's environment holds only the case's fixed values and
- * the image's own, so that output can name nothing else.
+ * Describes a failed render in one message: what was rendered, as `subject`
+ * names it, the image, why `docker run` failed, and the last lines of its
+ * error output with control characters removed, each prefixed `  docker | `
+ * so it cannot pass for this message. A Node.js error code is named only when
+ * it has the shape of one. The container's environment holds only the case's
+ * fixed values, the image's input guard and the image's own values, and the
+ * guard never prints an input, so that output can name nothing else.
  */
-function renderFailure(apiBaseUrl: string, image: string, error: unknown): string {
+function renderFailure(subject: string, image: string, error: unknown): string {
   const failure = (typeof error === 'object' && error !== null ? error : {}) as ExecFailure;
   let reason = 'docker could not be run';
   if (typeof failure.code === 'number') {
@@ -585,40 +786,90 @@ function renderFailure(apiBaseUrl: string, image: string, error: unknown): strin
     .filter((line) => line.trim() !== '')
     .slice(-RENDER_OUTPUT_MAX_LINES);
   return [
-    `Rendering the nginx template in ${image} for API_BASE_URL ${JSON.stringify(apiBaseUrl)} failed (${reason}).`,
+    `Rendering the nginx template in ${image} for ${subject} failed (${reason}).`,
     ...lines.map((line) => `  docker | ${line}`),
   ].join('\n');
 }
 
+/** The two inputs a render starts the web server with. */
+interface RenderInputs {
+  /** The value of `API_BASE_URL`. */
+  apiBaseUrl: string;
+  /** The value of `WEB_ENVIRONMENT`. */
+  webEnvironment: string;
+}
+
+/** The members of `/config.json` the SPA reads. */
+interface ServedConfig {
+  apiBaseUrl: string;
+  environment: string;
+}
+
+/** What one render's web server served and its input guard reported. */
+interface WebRender {
+  /** The one Content-Security-Policy nginx sends for `/`. */
+  policy: string;
+  /** The raw `/config.json` body nginx serves. */
+  configBody: string;
+  /** That body, parsed. */
+  config: ServedConfig;
+  /** Each line the input guard wrote to its error output, in order. */
+  guardMessages: string[];
+}
+
 /**
- * Starts the web image's runtime image as a Production deployment would, with
- * `apiBaseUrl` as `API_BASE_URL` and the checkout's nginx template mounted
- * read-only where the image keeps its own, and returns the one
- * Content-Security-Policy nginx sends for `/`.
- *
- * The container publishes no port and has no network but its loopback: its
- * entrypoint renders the template and starts nginx, and curl inside it then
- * requests the headers. The image's input guard is not run: it only clears a
- * value holding a single quote, a dollar sign or a backslash, which no case
- * holds.
- *
- * @throws Error when the container fails, outlives {@link RENDER_TIMEOUT_MS}
- *   or prints no header block.
+ * Returns the text `output` holds between a line `begin` and a line `end`, or
+ * `undefined` when it holds no such block.
  */
-async function renderProductionPolicy(apiBaseUrl: string): Promise<string> {
+function outputBlock(output: string, begin: string, end: string): string | undefined {
+  const start = output.indexOf(`${begin}\n`);
+  const stop = start === -1 ? -1 : output.indexOf(`\n${end}\n`, start + begin.length);
+  return stop === -1 ? undefined : output.slice(start + begin.length + 1, stop);
+}
+
+/**
+ * Starts the web image's runtime image with `inputs`, as a deployment of the
+ * web image would, and returns the Content-Security-Policy nginx sends for `/`,
+ * the `/config.json` it serves and what the image's input guard reported.
+ *
+ * The container runs what the image runs: the template filter and the input
+ * guard come from the web Dockerfile ({@link webRuntime}), the guard is
+ * written where the image keeps it, executable, and the checkout's nginx
+ * template is mounted read-only where the image keeps its own. The image's
+ * entrypoint then sources its own files and the guard and renders the
+ * template, so the guard sees the inputs before the template does, and curl
+ * inside the container requests the headers of `/` and the body of
+ * `/config.json`. The container publishes no port and has no network but its
+ * loopback, and nothing is written on the host.
+ *
+ * @param subject - What the render is for, as error messages name it; it
+ *   carries an input only when that input may be printed.
+ * @throws Error when the container fails, outlives {@link RENDER_TIMEOUT_MS},
+ *   does not source the guard, or prints no header block or no `/config.json`
+ *   object of strings.
+ */
+async function renderWebServer(inputs: RenderInputs, subject: string): Promise<WebRender> {
   const runtime = webRuntime();
   // --mount reads its value as one CSV record, so the path is a quoted field
   // and a comma or quote in it stays part of the path.
   const templateSource = `"source=${join(WEB_WORKSPACE, 'nginx', 'default.conf.template').replace(/"/g, '""')}"`;
   const script = [
+    `printf '%s' "$${INPUT_GUARD_VARIABLE}" > '${runtime.inputGuardPath}'`,
+    `chmod 0755 '${runtime.inputGuardPath}'`,
+    `unset ${INPUT_GUARD_VARIABLE}`,
     `timeout ${RENDER_ENTRYPOINT_TIMEOUT_S} /docker-entrypoint.sh nginx >&2`,
     `echo '${HEADERS_BEGIN}'`,
     `curl -sS --max-time ${RENDER_REQUEST_TIMEOUT_S} -I http://127.0.0.1/`,
     `echo '${HEADERS_END}'`,
+    `echo '${CONFIG_BEGIN}'`,
+    `curl -sS --max-time ${RENDER_REQUEST_TIMEOUT_S} http://127.0.0.1/config.json`,
+    'echo',
+    `echo '${CONFIG_END}'`,
   ].join(' && ');
   let stdout: string;
+  let stderr: string;
   try {
-    ({ stdout } = await execFileAsync(
+    ({ stdout, stderr } = await execFileAsync(
       'docker',
       [
         'run',
@@ -626,11 +877,13 @@ async function renderProductionPolicy(apiBaseUrl: string): Promise<string> {
         '--network',
         'none',
         '--env',
-        `API_BASE_URL=${apiBaseUrl}`,
+        `API_BASE_URL=${inputs.apiBaseUrl}`,
         '--env',
-        'WEB_ENVIRONMENT=Production',
+        `WEB_ENVIRONMENT=${inputs.webEnvironment}`,
         '--env',
         `NGINX_ENVSUBST_FILTER=${runtime.envsubstFilter}`,
+        '--env',
+        `${INPUT_GUARD_VARIABLE}=${runtime.inputGuard}`,
         '--mount',
         `type=bind,${templateSource},target=${TEMPLATE_TARGET},readonly`,
         runtime.image,
@@ -641,23 +894,40 @@ async function renderProductionPolicy(apiBaseUrl: string): Promise<string> {
       { encoding: 'utf8', timeout: RENDER_TIMEOUT_MS, killSignal: 'SIGKILL' },
     ));
   } catch (error) {
-    throw new Error(renderFailure(apiBaseUrl, runtime.image, error));
+    throw new Error(renderFailure(subject, runtime.image, error));
   }
 
-  const begin = stdout.indexOf(`${HEADERS_BEGIN}\n`);
-  const end = stdout.indexOf(HEADERS_END, begin);
-  if (begin === -1 || end === -1) {
-    throw new Error(
-      `The production render for API_BASE_URL ${JSON.stringify(apiBaseUrl)} printed no response headers.`,
-    );
+  if (!stderr.split(/\r?\n/).some((line) => line.endsWith(`: Sourcing ${runtime.inputGuardPath}`))) {
+    throw new Error(`The render for ${subject} did not source the input guard ${runtime.inputGuardPath}.`);
   }
-  const policies = stdout
-    .slice(begin + HEADERS_BEGIN.length + 1, end)
+  const guardPrefix = `${runtime.inputGuardPath.slice(runtime.inputGuardPath.lastIndexOf('/') + 1)}: `;
+  const guardMessages = stderr.split(/\r?\n/).filter((line) => line.startsWith(guardPrefix));
+
+  const headers = outputBlock(stdout, HEADERS_BEGIN, HEADERS_END);
+  const configBody = outputBlock(stdout, CONFIG_BEGIN, CONFIG_END);
+  if (headers === undefined || configBody === undefined) {
+    throw new Error(`The render for ${subject} printed no response headers or no /config.json body.`);
+  }
+  const policies = headers
     .split(/\r?\n/)
     .filter((line) => /^content-security-policy:/i.test(line))
     .map((line) => line.slice(line.indexOf(':') + 1).trim());
-  expect(policies, `Content-Security-Policy headers for API_BASE_URL ${JSON.stringify(apiBaseUrl)}`).toHaveLength(1);
-  return policies[0];
+  expect(policies, `Content-Security-Policy headers for ${subject}`).toHaveLength(1);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(configBody);
+  } catch {
+    parsed = undefined;
+  }
+  const served: Record<string, unknown> =
+    typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  const apiBaseUrl = served['apiBaseUrl'];
+  const environment = served['environment'];
+  if (typeof apiBaseUrl !== 'string' || typeof environment !== 'string') {
+    throw new Error(`The render for ${subject} served a /config.json that is not an object with string apiBaseUrl and environment.`);
+  }
+  return { policy: policies[0], configBody, config: { apiBaseUrl, environment }, guardMessages };
 }
 
 /** What the production-policy browser check observed in its page. */
@@ -972,19 +1242,40 @@ test('security headers in the browser: under the Content-Security-Policy the she
   expect(appConsole, 'console output').toEqual([]);
 });
 
+/** What the production-policy test name states for each outcome. */
+const PRODUCTION_ORIGIN_OUTCOME_TITLES: Readonly<Record<ProductionOriginCase['outcome'], string>> = {
+  admitted: 'connect-src admits the API origin, which Chromium matches',
+  'served as given': "it is served as given and connect-src is 'self' alone",
+  'served as empty': "the input guard serves it as empty with one warning and connect-src is 'self' alone",
+};
+
 for (const target of PRODUCTION_ORIGIN_CASES) {
-  test(`production Content-Security-Policy for API_BASE_URL ${JSON.stringify(target.apiBaseUrl)}, ${target.name}: connect-src ${target.admitted ? 'admits the API origin, which Chromium matches' : "is 'self' alone"}, and a request to an unrelated origin is refused`, async ({
+  test(`production Content-Security-Policy for API_BASE_URL ${JSON.stringify(target.apiBaseUrl)}, ${target.name}: ${PRODUCTION_ORIGIN_OUTCOME_TITLES[target.outcome]}, and a request to an unrelated origin is refused`, async ({
     page,
   }) => {
     test.setTimeout(RENDER_TIMEOUT_MS + 30_000);
+    const admitted = target.outcome === 'admitted';
 
-    const renderedPolicy = await renderProductionPolicy(target.apiBaseUrl);
+    const render = await renderWebServer(
+      { apiBaseUrl: target.apiBaseUrl, webEnvironment: 'Production' },
+      `API_BASE_URL ${JSON.stringify(target.apiBaseUrl)}`,
+    );
+    if (target.outcome === 'served as empty') {
+      expect(render.guardMessages, 'input guard warnings').toHaveLength(1);
+      const [warning] = render.guardMessages;
+      expect(warning, 'the input guard warning').toMatch(NON_ASCII_HOST_WARNING);
+      expect(warning.includes(target.apiBaseUrl.split('/')[2]), 'the warning quotes the host').toBe(false);
+      expect(render.config.apiBaseUrl, "/config.json's apiBaseUrl").toBe('');
+    } else {
+      expect(render.guardMessages, 'input guard warnings').toEqual([]);
+    }
+    const renderedPolicy = render.policy;
     const policy = cspDirectives(renderedPolicy);
     for (const [name, sources] of FIXED_CSP_DIRECTIVES) {
       expect(policy.get(name), `CSP ${name}`).toEqual(sources);
     }
     const connectSources = policy.get('connect-src') ?? [];
-    expect(connectSources, 'CSP connect-src').toHaveLength(target.admitted ? 2 : 1);
+    expect(connectSources, 'CSP connect-src').toHaveLength(admitted ? 2 : 1);
     expect(connectSources[0], "CSP connect-src's first source").toBe("'self'");
 
     // The page is served under the rendered policy, and every request the
@@ -1061,22 +1352,173 @@ for (const target of PRODUCTION_ORIGIN_CASES) {
 
       expect(probe.unrelatedReported, `the page reported the refused request to ${UNRELATED_ORIGIN}`).toBe(true);
       expect(probe.unrelated, `the request to ${UNRELATED_ORIGIN}`).toBe('refused');
-      expect(probe.api, `the request to the API origin ${probe.apiOrigin}`).toBe(
-        target.admitted ? 'HTTP 200' : 'refused',
-      );
-      const refusedOrigins = target.admitted ? [UNRELATED_ORIGIN] : [probe.apiOrigin, UNRELATED_ORIGIN];
+      expect(probe.api, `the request to the API origin ${probe.apiOrigin}`).toBe(admitted ? 'HTTP 200' : 'refused');
+      const refusedOrigins = admitted ? [UNRELATED_ORIGIN] : [probe.apiOrigin, UNRELATED_ORIGIN];
       expect(probe.violations, 'policy violations the page reported').toEqual(
         refusedOrigins.map((origin) => `connect-src ${origin}`),
       );
-      expect(reached, 'origins the page reached').toEqual(target.admitted ? [probe.apiOrigin] : []);
-      if (target.admitted) {
-        // The API source names exactly the origin the browser calls, in
-        // whatever form the base URL wrote it.
-        expect(connectSources[1], "CSP connect-src's API source").toMatch(/^https:\/\/[^*]+$/i);
-        expect(new URL(connectSources[1]).origin, "CSP connect-src's API source as an origin").toBe(probe.apiOrigin);
+      expect(reached, 'origins the page reached').toEqual(admitted ? [probe.apiOrigin] : []);
+      if (target.outcome === 'admitted') {
+        // The API source is exactly the origin the browser calls, in whatever
+        // form the base URL wrote it, and /config.json serves the base URL
+        // with that same origin spelled the same way and the rest as given,
+        // so the SPA calls the origin the policy names.
+        expect(connectSources[1], "CSP connect-src's API source").toBe(probe.apiOrigin);
+        expect(render.config.apiBaseUrl, "/config.json's apiBaseUrl").toBe(target.served);
+        expect(new URL(render.config.apiBaseUrl).origin, "the origin of /config.json's apiBaseUrl").toBe(
+          connectSources[1],
+        );
+        expect(
+          render.config.apiBaseUrl.slice(0, connectSources[1].length + 1),
+          "the start of /config.json's apiBaseUrl",
+        ).toBe(`${connectSources[1]}/`);
+      } else if (target.outcome === 'served as given') {
+        // A host no source expression can name, or a user name, is served
+        // exactly as it was given.
+        expect(render.config.apiBaseUrl, "/config.json's apiBaseUrl").toBe(target.apiBaseUrl);
       }
     } finally {
       await page.unrouteAll({ behavior: 'wait' });
     }
+  });
+}
+
+test('a percent-encoded spelling of the API host in Development: the image serves the canonical origin in /config.json and connect-src, and a search in the browser reaches the API', async ({
+  page,
+  context,
+  baseURL,
+}) => {
+  test.setTimeout(RENDER_TIMEOUT_MS + 60_000);
+  if (baseURL === undefined) {
+    throw new Error('The run configures no baseURL for the web app.');
+  }
+  const webOrigin = new URL(baseURL).origin;
+
+  // The target API with the first character of its host percent-encoded, as
+  // http://%6cocalhost:8080/api spells http://localhost:8080/api: the SPA
+  // accepts it in Development, and the browser decodes it to the same origin.
+  const api = new URL(apiUrl());
+  const first = api.hostname.charAt(0);
+  expect(/^[a-z0-9]$/.test(first), `the API host ${api.hostname} starts with a letter or digit`).toBe(true);
+  const spelling = `${api.protocol}//%${first.charCodeAt(0).toString(16)}${api.hostname.slice(1)}${api.port === '' ? '' : `:${api.port}`}${api.pathname}`;
+  expect(new URL(spelling).origin, `the origin of ${spelling}`).toBe(api.origin);
+
+  const render = await renderWebServer(
+    { apiBaseUrl: spelling, webEnvironment: 'Development' },
+    `API_BASE_URL ${JSON.stringify(spelling)}`,
+  );
+  expect(render.guardMessages, 'input guard warnings').toEqual([]);
+  expect(render.config, '/config.json').toEqual({ apiBaseUrl: `${api.origin}${api.pathname}`, environment: 'Development' });
+  expect(cspDirectives(render.policy).get('connect-src'), 'CSP connect-src').toEqual(["'self'", api.origin]);
+
+  // The running web server answers every request but two kinds, which the
+  // render decides: each document is sent with the rendered policy in place
+  // of its own, and /config.json with the rendered body. Chromium places a
+  // document the test answers in the public address space, whatever its
+  // origin, and refuses its requests to a loopback API unless the page may
+  // reach the local network; the permission restores what the stack's own
+  // loopback document may do, and the policy still decides every request.
+  await context.grantPermissions(['local-network-access'], { origin: webOrigin });
+  await page.route(
+    (url) => url.origin === webOrigin,
+    async (route) => {
+      if (isConfigRequest(new URL(route.request().url()))) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'cache-control': 'no-store' },
+          body: render.configBody,
+        });
+      } else if (route.request().resourceType() === 'document') {
+        const response = await route.fetch();
+        await route.fulfill({
+          response,
+          headers: { ...response.headers(), 'content-security-policy': render.policy },
+        });
+      } else {
+        await route.continue();
+      }
+    },
+  );
+  await page.addInitScript(() => {
+    const violations: string[] = [];
+    (window as unknown as CspViolationLog).smarthotelCspViolations = violations;
+    document.addEventListener('securitypolicyviolation', (event) => {
+      violations.push(`${event.effectiveDirective}: ${event.blockedURI || 'inline code'}`);
+    });
+  });
+  const appConsole = recordAppConsole(page);
+  const searches: string[] = [];
+  page.on('response', (response) => {
+    if (isApiEndpoint(response.url(), '/hotels') && response.request().method() === 'GET') {
+      searches.push(`HTTP ${response.status()}`);
+    }
+  });
+
+  try {
+    const shell = await page.goto('/search');
+    expect(shell?.headers()['content-security-policy'], "the shell's Content-Security-Policy").toBe(render.policy);
+    await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel', exact: true })).toBeVisible();
+
+    // Far enough ahead that both Seattle hotels have rooms free.
+    const [checkIn, checkOut] = utcDates(180, 182);
+    await fillBound(page, 'search-city', 'Seattle');
+    await fillBound(page, 'search-check-in', checkIn);
+    await fillBound(page, 'search-check-out', checkOut);
+    await fillBound(page, 'search-guests', '1');
+    await page.getByTestId('search-submit').click();
+    await expect(
+      page
+        .locator('[data-testid^="hotel-result-"], [data-testid="search-empty"], [data-testid="inline-error"]')
+        .first(),
+    ).toBeVisible();
+
+    const violations = await page.evaluate(
+      () => (window as unknown as CspViolationLog).smarthotelCspViolations ?? null,
+    );
+    expect(violations, 'policy violations the page reported').toEqual([]);
+    await expect(page.getByTestId('inline-error')).toHaveCount(0);
+    await expect(page.locator('[data-testid^="hotel-result-"]')).toHaveCount(2);
+    expect(searches, `GET /api/hotels responses from ${api.origin}`).toEqual(['HTTP 200']);
+    expect(appConsole, 'app console output').toEqual([]);
+  } finally {
+    await page.unrouteAll({ behavior: 'wait' });
+  }
+});
+
+for (const target of GUARD_LENGTH_CASES) {
+  test(`the input guard ${target.kept ? 'keeps' : 'serves as empty, with one warning naming the variable and the byte limit,'} ${target.variable} of ${target.name}`, async () => {
+    test.setTimeout(RENDER_TIMEOUT_MS + 30_000);
+
+    const checksApiBaseUrl = target.variable === 'API_BASE_URL';
+    const render = await renderWebServer(
+      checksApiBaseUrl
+        ? { apiBaseUrl: target.value, webEnvironment: 'Production' }
+        : { apiBaseUrl: GUARD_API_BASE_URL, webEnvironment: target.value },
+      `the input-guard case ${target.variable} of ${target.name}`,
+    );
+
+    // Each check that involves the value compares inside the test and
+    // reports only its outcome, so no failure prints the value.
+    expect(render.guardMessages.length, 'input guard warnings').toBe(target.kept ? 0 : 1);
+    if (!target.kept) {
+      const [warning] = render.guardMessages;
+      expect(
+        new RegExp(`: ${target.variable} is longer than ${GUARD_LIMIT_BYTES} bytes\\b`).test(warning),
+        `the warning names ${target.variable} and the ${GUARD_LIMIT_BYTES}-byte limit`,
+      ).toBe(true);
+      expect(warning.includes(target.value.slice(0, 16)), 'the warning quotes the value').toBe(false);
+    }
+    if (checksApiBaseUrl) {
+      expect(
+        render.config.apiBaseUrl === (target.kept ? target.value : ''),
+        target.kept ? "/config.json's apiBaseUrl is the value" : "/config.json's apiBaseUrl is empty",
+      ).toBe(true);
+    } else {
+      expect(render.config.apiBaseUrl, "/config.json's apiBaseUrl").toBe(GUARD_API_BASE_URL);
+    }
+    // Only Development relaxes the SPA's rules, so every other value, kept or
+    // cleared, is served as Production.
+    expect(render.config.environment, "/config.json's environment").toBe('Production');
   });
 }
