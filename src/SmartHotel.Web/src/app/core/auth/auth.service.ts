@@ -92,9 +92,11 @@ export class AuthService {
 
   /**
    * Hands the email of a successful registration to the login page without
-   * putting it in the URL. The register page sets it after the 201; the login
-   * page reads it once when `registered=1`, pre-fills the email and sets it back
-   * to `null`. {@link AuthService.logout} also sets it to `null`.
+   * putting it in the URL. The register page sets it after the 201, and sets it
+   * back to `null` while it still holds that email when its navigation to the
+   * login page fails; the login page reads it once when `registered=1`,
+   * pre-fills the email and sets it back to `null`.
+   * {@link AuthService.logout} also sets it to `null`.
    */
   readonly pendingLoginEmail = signal<string | null>(null);
 

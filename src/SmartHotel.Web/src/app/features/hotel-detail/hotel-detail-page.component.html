@@ -63,8 +63,9 @@
      reason the fresh counts are missing. Only one of this block and the hotel
      content below renders at a time, so both can carry the booking error's
      "Log in again" link under one test hook. The heading takes focus from
-     script only, after a booking answer whose revalidation failed has removed
-     the room table and the pressed "Book" with it. -->
+     script only: on entry from within the app when the load failed, and
+     after a booking answer whose revalidation failed has removed the room
+     table and the pressed "Book" with it. -->
 <ng-container *ngIf="loadError() as e">
   <h1 #loadErrorHeading tabindex="-1" data-testid="load-error-heading">Hotel</h1>
   <app-error-message [error]="e"></app-error-message>

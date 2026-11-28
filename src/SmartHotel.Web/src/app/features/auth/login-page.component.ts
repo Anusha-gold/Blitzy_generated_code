@@ -12,6 +12,7 @@ import {
   computed,
   inject,
   signal,
+  type WritableSignal,
 } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { DOCUMENT, NgIf } from '@angular/common';
@@ -38,6 +39,10 @@ const SESSION_EXPIRED_NOTICE = 'Your session has expired. Log in again.';
 const WRONG_CREDENTIALS_TITLE = 'Email or password is incorrect.';
 const DEFAULT_RETURN_URL = '/search';
 
+/** The inline title shown when the guest is signed in but the page the login continues to was not opened. */
+const NEXT_PAGE_UNOPENED_TITLE =
+  'You are logged in, but the next page could not be opened. Reload the page and log in again.';
+
 /** The path of this page's route, `login` in `app.routes.ts`, which a return URL may not lead back to. */
 const LOGIN_PATH = 'login';
 
@@ -48,6 +53,16 @@ const LOGIN_PATH = 'login';
  * notice box does not wait.
  */
 const NOTICE_ANNOUNCE_DELAY_MS = 100;
+
+/**
+ * The `Navigation.id` of the app's first navigation, the one that opens the
+ * URL the app loads with. The router numbers navigations from 1, in the order
+ * they are requested, and the app requests that one first; a reload starts
+ * the app, and the count, again. A route guard's redirect ends the
+ * navigation it guards and requests a new one, which therefore has a larger
+ * id even when no navigation has succeeded yet.
+ */
+const FIRST_NAVIGATION_ID = 1;
 
 /**
  * The login page, route `login`, with the query parameters `returnUrl`,
@@ -89,17 +104,32 @@ const NOTICE_ANNOUNCE_DELAY_MS = 100;
  * to the return URL in place of that entry. The one exception is the
  * register page's fresh hand-off, `registered=1` with an email waiting, which
  * shows the notice and the pre-filled form even to a signed-in guest who has
- * just created another account.
+ * just created another account. When either navigation, the one after a
+ * successful login or that move on, does not reach the next page, because
+ * the router resolves it with anything but `true`, as when another
+ * navigation supersedes it, or rejects it, as when that page's code fails to
+ * load, the signed-in guest stays here and the form shows with the inline
+ * error "You are logged in, but the next page could not be opened. Reload the
+ * page and log in again." The browser keeps failing a module it could not
+ * load until the page reloads, and the reload starts the app signed out,
+ * hence both steps. The rejection reason is neither shown nor logged.
  *
- * Focus: the submit button stays natively disabled while the login is
- * pending, which drops its focus to the document body. After a failure, once
- * the error has rendered, focus that was dropped goes to the first field the
- * error marks invalid, or back to the submit button, unless the guest or the
- * page moved focus while the login was pending or focus has left the page.
- * After a success, it goes
+ * Focus: when a navigation within the app opens this page with its form, as
+ * "Book" while signed out, "Log in again", the register page's hand-off or
+ * the route guard's redirect does, its heading takes focus once it renders,
+ * unless focus is on another element or outside the page by then. That
+ * includes the guard's redirect that ends the app's first navigation, as when
+ * a fresh load opens `/bookings` signed out; a fresh load or a reload of this
+ * page itself leaves focus alone. The submit button stays natively disabled
+ * while the login is pending, which drops its focus to the document body.
+ * After a failure, once the error has rendered, focus that was dropped goes
+ * to the first field the error marks invalid, or back to the submit button,
+ * unless the guest or the page moved focus while the login was pending or
+ * focus has left the page. After a success, it goes
  * to the heading of the page the guest lands on as soon as that heading
  * renders, unless focus has moved to another element or out of the page, or
- * the guest has navigated on, by then.
+ * the guest has navigated on, by then. When that page could not be opened,
+ * focus returns once the inline error has rendered, as after a failure.
  *
  * Validation: the page adds no validators of its own and never gates
  * submission on validity; the template's `required` attributes mark the
@@ -138,7 +168,11 @@ export class LoginPageComponent {
   /** Tells which element has focus, at submit and once a failed login's answer has rendered. */
   private readonly document = inject(DOCUMENT);
 
-  /** Registers the focus restore after the next render, outside an injection context. */
+  /**
+   * Registers the focus restore after the next render, outside an injection
+   * context, and the focus move onto this page's heading on entry; both end
+   * with the page.
+   */
   private readonly injector = inject(Injector);
 
   /**
@@ -232,13 +266,21 @@ export class LoginPageComponent {
    * That page shows its notice and pre-filled form, so the new account can log
    * in. A later visit to a `/login?registered=1` entry finds no email waiting,
    * because this page clears it when it reads it, and moves on as usual.
-   * Decided once, before the constructor reads and clears that email.
+   * Decided once, before the constructor reads and clears that email. It
+   * becomes `false`, so the form shows with the inline error, when that move
+   * on does not reach the return URL.
    */
-  protected readonly redirecting =
+  protected readonly redirecting = signal(
     this.auth.isAuthenticated() &&
-    !(this.route.snapshot.queryParamMap.get('registered') === '1' && this.auth.pendingLoginEmail() !== null);
+      !(this.route.snapshot.queryParamMap.get('registered') === '1' && this.auth.pendingLoginEmail() !== null),
+  );
+
+  /** `true` once this page is destroyed; a navigation that ends later shows nothing here. */
+  private readonly destroyed = signal(false);
 
   constructor() {
+    this.destroyRef.onDestroy(() => this.destroyed.set(true));
+
     this.route.queryParamMap
       .pipe(
         map((params) => {
@@ -277,7 +319,7 @@ export class LoginPageComponent {
       });
     }
 
-    if (this.redirecting) {
+    if (this.redirecting()) {
       // The page is created while the navigation that opened it activates its
       // route; navigating from here would cancel that navigation halfway, so
       // the redirect waits for it to end.
@@ -288,8 +330,19 @@ export class LoginPageComponent {
           takeUntilDestroyed(),
         )
         .subscribe(() => {
-          void this.router.navigateByUrl(safeReturnUrl(this.returnUrl(), this.urlSerializer), { replaceUrl: true });
+          void this.router
+            .navigateByUrl(safeReturnUrl(this.returnUrl(), this.urlSerializer), { replaceUrl: true })
+            .then(
+              (navigated) => {
+                if (!navigated) {
+                  this.showUnopenedNextPage(null);
+                }
+              },
+              () => this.showUnopenedNextPage(null),
+            );
         });
+    } else {
+      focusHeadingOnInAppEntry(this.document, this.injector, this.router);
     }
   }
 
@@ -297,8 +350,9 @@ export class LoginPageComponent {
    * Sends the form controls' current values unchanged, whatever their
    * validity. A submit while a login is already pending is ignored. On
    * success, `AuthService` has stored the session, the error is cleared and
-   * the guest continues to the safe return URL; on failure the error replaces
-   * the previous one inline.
+   * the guest continues to the safe return URL, or stays here with an inline
+   * error when that page cannot be opened; on failure the error replaces the
+   * previous one inline.
    */
   protected submit(): void {
     // The disabled submit button already blocks this; the guard keeps a second
@@ -336,11 +390,16 @@ export class LoginPageComponent {
           // guest who is now signed in.
           void this.router
             .navigateByUrl(safeReturnUrl(this.returnUrl(), this.urlSerializer), { replaceUrl: true })
-            .then((navigated) => {
-              if (navigated) {
-                focusLandingPageAfterRender(this.document, this.appInjector, this.router);
-              }
-            });
+            .then(
+              (navigated) => {
+                if (navigated) {
+                  focusLandingPageAfterRender(this.document, this.appInjector, this.router);
+                } else {
+                  this.showUnopenedNextPage({ trigger, focusMoves });
+                }
+              },
+              () => this.showUnopenedNextPage({ trigger, focusMoves }),
+            );
         },
         error: (err: unknown) => {
           this.showError(
@@ -354,65 +413,60 @@ export class LoginPageComponent {
   }
 
   /**
-   * Shows a failed attempt's error in a new alert region. The inline error
-   * updates an existing region in place, and assistive technology may not
-   * announce an alert whose text did not change, such as a repeated 401. So
-   * an error still on screen is removed by one synchronous render of this
-   * page and the new one inserted by a second, both in the task that received
-   * the answer: the browser never paints the page without an error, so the
-   * region is new but nothing on screen moves.
+   * Shows that the guest is signed in but the page the login continues to was
+   * not opened: the router resolved that navigation with anything but `true`,
+   * as when another navigation superseded it, or rejected it, as when that
+   * page's code failed to load. {@link redirecting} becomes `false`, so the
+   * form shows, and the inline error "You are logged in, but the next page
+   * could not be opened. Reload the page and log in again." renders through
+   * `ErrorMessageComponent`.
+   * The rejection reason is neither shown nor logged. After a submit, focus
+   * that the pending state dropped then returns as after a failed login. A
+   * page that a navigation has destroyed by then shows nothing.
+   *
+   * @param attempt - The submit whose navigation did not open the page, with
+   *   the element focused at submit and its record of focus moves, or `null`
+   *   for the move on of a guest already signed in when the page opened.
    */
-  private showError(error: UiError): void {
-    if (this.error() === null) {
-      this.error.set(error);
+  private showUnopenedNextPage(attempt: { trigger: HTMLElement | null; focusMoves: FocusMoves } | null): void {
+    if (this.destroyed()) {
       return;
     }
-    this.error.set(null);
-    this.changeDetector.detectChanges();
-    this.error.set(error);
-    this.changeDetector.detectChanges();
+    this.redirecting.set(false);
+    this.showError({ status: 0, title: NEXT_PAGE_UNOPENED_TITLE, detail: null, fieldErrors: [] });
+    if (attempt !== null) {
+      this.restoreFocusAfterError(attempt.trigger, attempt.focusMoves);
+    }
   }
 
   /**
-   * Moves focus once a failed login's error has rendered and the answer has
-   * re-enabled the submit button. Disabling the focused button while the
-   * request is pending drops focus to the document body, and only that drop
-   * is undone: focus moves only when nothing took focus while the request was
-   * pending, the document still has focus, and focus is on the body, on
-   * nothing, or still on that button. Anything else keeps it: the field Enter
-   * was pressed in, an element the guest or the page focused meanwhile, even
-   * one focus has since left, and a place outside the document, such as the
-   * browser's own controls a Tab past the page's last element reaches, where
-   * the body is active but the document has no focus. It goes to the first
-   * input, in form order, that the error marks invalid, and otherwise back to
-   * `trigger`, or to the submit button when `trigger` has left the document;
-   * only to an element that is still in the document and enabled. The page's
-   * own injector registers it, so a page destroyed before that render moves
-   * nothing.
+   * Shows `error` inline in a new alert region, so assistive technology
+   * announces it even when its text repeats, such as a repeated 401, as
+   * {@link showErrorInNewAlert} sets out.
+   */
+  private showError(error: UiError): void {
+    showErrorInNewAlert(this.error, error, this.changeDetector);
+  }
+
+  /**
+   * Moves focus that the pending state dropped, once the error on screen has
+   * rendered, to the first input the error marks invalid, back to `trigger`,
+   * or to the "Log in" button, as {@link restoreFocusAfterFailedSubmit} sets
+   * out. This page's own injector registers it, so a page destroyed before
+   * that render moves nothing.
    *
    * @param trigger - The element focused when the guest submitted, or `null`.
    * @param focusMoves - The record, started at submit, of the focus moves
    *   made while the request was pending.
    */
   private restoreFocusAfterError(trigger: HTMLElement | null, focusMoves: FocusMoves): void {
-    afterNextRender(
-      () => {
-        const active = this.document.activeElement;
-        const button = this.submitButton?.nativeElement ?? null;
-        if (
-          focusMoves.moved() ||
-          !this.document.hasFocus() ||
-          (active !== null && active !== this.document.body && active !== button)
-        ) {
-          return;
-        }
-
-        const target = this.firstInvalidInput() ?? (trigger?.isConnected ? trigger : button);
-        if (target !== null && target.isConnected && !target.matches(':disabled')) {
-          target.focus();
-        }
-      },
-      { injector: this.injector },
+    restoreFocusAfterFailedSubmit(
+      this.document,
+      this.injector,
+      trigger,
+      focusMoves,
+      () => this.submitButton?.nativeElement ?? null,
+      () => this.firstInvalidInput(),
     );
   }
 
@@ -566,8 +620,11 @@ function hasRawControlOrWhiteSpace(value: string): boolean {
   return /\s/.test(value);
 }
 
-/** Whether focus moved while a submit was pending, as {@link watchFocusMoves} records it. */
-interface FocusMoves {
+/**
+ * Whether focus moved while a submit was pending, as {@link watchFocusMoves}
+ * records it; the login and register pages keep one per attempt.
+ */
+export interface FocusMoves {
   /** Whether an element has taken focus since the record started, up to `stop`. */
   readonly moved: () => boolean;
   /** Ends the record; a later focus move no longer counts. Calling it again does nothing. */
@@ -585,7 +642,7 @@ interface FocusMoves {
  * @param document - The document the app renders into.
  * @returns The record, which keeps listening until its `stop` is called.
  */
-function watchFocusMoves(document: Document): FocusMoves {
+export function watchFocusMoves(document: Document): FocusMoves {
   let moved = false;
   const onFocusIn = (): void => {
     moved = true;
@@ -595,6 +652,92 @@ function watchFocusMoves(document: Document): FocusMoves {
     moved: () => moved,
     stop: () => document.removeEventListener('focusin', onFocusIn, true),
   };
+}
+
+/**
+ * Shows `next` through `error`, the inline error of the login or register
+ * page, in a new alert region. The inline error updates an existing region in
+ * place, and assistive technology may not announce an alert whose text did
+ * not change, such as a repeated 401 or 409. So an error still on screen is
+ * removed by one synchronous render of the page and the new one inserted by a
+ * second, both in the task that received the answer: the browser never paints
+ * the page without an error, so the region is new but nothing on screen
+ * moves.
+ *
+ * @param error - The page's inline error, which `ErrorMessageComponent` renders.
+ * @param next - The error to show.
+ * @param changeDetector - The page's change detector, which renders it synchronously.
+ */
+export function showErrorInNewAlert(
+  error: WritableSignal<UiError | null>,
+  next: UiError,
+  changeDetector: ChangeDetectorRef,
+): void {
+  if (error() === null) {
+    error.set(next);
+    return;
+  }
+  error.set(null);
+  changeDetector.detectChanges();
+  error.set(next);
+  changeDetector.detectChanges();
+}
+
+/**
+ * Moves focus once the inline error of a failed login or registration, or of
+ * the navigation after a successful one, has rendered and the answer has
+ * re-enabled the page's submit button. Disabling the focused button while the
+ * request is pending drops focus to the document body, and only that drop is
+ * undone: focus moves only when nothing took focus while the request was
+ * pending, the document still has focus, and focus is on the body, on
+ * nothing, or still on that button. Anything else keeps it: the field Enter
+ * was pressed in, an element the guest or the page focused meanwhile, even
+ * one focus has since left, and a place outside the document, such as the
+ * browser's own controls a Tab past the page's last element reaches, where
+ * the body is active but the document has no focus. It goes to the first
+ * input, in form order, that the error marks invalid, and otherwise back to
+ * `trigger`, or to the submit button when `trigger` has left the document;
+ * only to an element that is still in the document and enabled.
+ *
+ * @param document - The document the app renders into.
+ * @param injector - The page's own injector, which registers the move after
+ *   the next render, so a page destroyed before that render moves nothing.
+ * @param trigger - The element focused when the guest submitted, or `null`.
+ * @param focusMoves - The record, started at submit, of the focus moves made
+ *   while the request was pending.
+ * @param submitButton - Reads, once the error has rendered, the page's submit
+ *   button, or `null` when it is not rendered.
+ * @param firstInvalidInput - Reads, once the error has rendered, the first
+ *   input in form order that the error marks invalid, or `null` when it marks
+ *   none.
+ */
+export function restoreFocusAfterFailedSubmit(
+  document: Document,
+  injector: Injector,
+  trigger: HTMLElement | null,
+  focusMoves: FocusMoves,
+  submitButton: () => HTMLButtonElement | null,
+  firstInvalidInput: () => HTMLInputElement | null,
+): void {
+  afterNextRender(
+    () => {
+      const active = document.activeElement;
+      const button = submitButton();
+      if (
+        focusMoves.moved() ||
+        !document.hasFocus() ||
+        (active !== null && active !== document.body && active !== button)
+      ) {
+        return;
+      }
+
+      const target = firstInvalidInput() ?? (trigger?.isConnected ? trigger : button);
+      if (target !== null && target.isConnected && !target.matches(':disabled')) {
+        target.focus();
+      }
+    },
+    { injector },
+  );
 }
 
 /**
@@ -610,10 +753,12 @@ function watchFocusMoves(document: Document): FocusMoves {
  * a later page.
  *
  * @param document - The document the app renders into.
- * @param injector - An injector that outlives the page that navigated away.
+ * @param injector - The injector whose end also ends the wait: one that
+ *   outlives the page that navigated away, such as the application's, or the
+ *   landing page's own.
  * @param router - The router whose next navigation ends the wait.
  */
-function focusLandingPageAfterRender(document: Document, injector: Injector, router: Router): void {
+export function focusLandingPageAfterRender(document: Document, injector: Injector, router: Router): void {
   const watch = afterRender(
     () => {
       const active = document.activeElement;
@@ -650,11 +795,40 @@ function focusLandingPageAfterRender(document: Document, injector: Injector, rou
 }
 
 /**
- * The `returnUrl` that the register page handed over in the router state of
- * the navigation in progress, which history traversal and a reload restore
- * too, or `null` when that state carries none or a value that is not a string.
+ * Moves focus onto the heading of the page under construction, as
+ * {@link focusLandingPageAfterRender} does, when the navigation constructing
+ * it is not the app's first: it follows an earlier navigation that succeeded,
+ * or its id is later than {@link FIRST_NAVIGATION_ID}. The second covers a
+ * route guard's redirect that ends the app's first navigation, as when a
+ * fresh load opens `/bookings` signed out, which follows no successful
+ * navigation. The link or button that started an in-app navigation has then
+ * normally left with the previous page, and a redirected fresh load has
+ * focused nothing yet, so focus is on the body. The page the app's first
+ * navigation opens itself, after a fresh load or a reload, is left alone.
+ * Call it from the page's constructor, while that navigation is in progress,
+ * with the page's own injector, so the wait also ends with the page.
+ *
+ * @param document - The document the app renders into.
+ * @param injector - The constructing page's own injector.
+ * @param router - The router whose current navigation constructs the page.
  */
-function handedOverReturnUrl(router: Router): string | null {
+export function focusHeadingOnInAppEntry(document: Document, injector: Injector, router: Router): void {
+  const navigation = router.getCurrentNavigation();
+  if (navigation !== null && (navigation.previousNavigation !== null || navigation.id > FIRST_NAVIGATION_ID)) {
+    focusLandingPageAfterRender(document, injector, router);
+  }
+}
+
+/**
+ * The `returnUrl` that the other auth page handed over in the router state of
+ * the navigation in progress: the register page's hand-back to the login page,
+ * or the login page's "Create an account" state for the register page. History
+ * traversal and a reload restore that state too. `null` when that state
+ * carries none or a value that is not a string.
+ *
+ * @param router - The router whose current navigation carries the state.
+ */
+export function handedOverReturnUrl(router: Router): string | null {
   const value: unknown = router.getCurrentNavigation()?.extras.state?.['returnUrl'];
   return typeof value === 'string' ? value : null;
 }

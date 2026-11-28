@@ -1524,7 +1524,7 @@ for (const text of DEEP_LINK_GUESTS) {
   });
 }
 
-test('a guests field left empty is left out of the URL and the server uses 1', async ({ page }) => {
+test('a guests field left empty is left out of the URL and the search requests 1 guest', async ({ page }) => {
   await page.goto('/search');
   const { checkIn, checkOut } = await fillSearchForm(page, '');
 
@@ -1643,6 +1643,52 @@ test('a reused detail page loads once, for the hotel and stay it lands on', asyn
     expect(load.searchParams.get('guests')).toBe(String(firstStay.guests));
   });
 });
+
+/** How the hotel detail page that "View rooms" opens loads, and which heading must then have focus. */
+interface EntryFocusCase {
+  /** The heading that takes focus, for the test title. */
+  title: string;
+  /** Whether the page's `GET /api/hotels/{id}` gets no HTTP response, so its load fails. */
+  failLoad: boolean;
+  /** The test hook of the heading that must have focus. */
+  heading: string;
+}
+
+const ENTRY_FOCUS_CASES: readonly EntryFocusCase[] = [
+  { title: "the hotel's name once the hotel loads", failLoad: false, heading: 'hotel-name' },
+  { title: "the load error's heading when the hotel fails to load", failLoad: true, heading: 'load-error-heading' },
+];
+
+for (const c of ENTRY_FOCUS_CASES) {
+  test(`View rooms moves focus to ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(35, 37);
+    const link = await test.step('search Seattle hotels', async () => {
+      await page.goto('/search');
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      return page.locator(VIEW_ROOMS).first();
+    });
+    const id = ((await link.getAttribute('data-testid')) ?? '').slice('view-rooms-'.length);
+    expect(id).toMatch(/^\d+$/);
+
+    await test.step('click View rooms, which leaves with the search page', async () => {
+      if (c.failLoad) {
+        await page.route(
+          (url) => isApiEndpoint(url, `/hotels/${id}`),
+          (route) => route.abort(),
+        );
+      }
+      await link.click();
+      await expect(page).toHaveURL(new RegExp(`/hotels/${id}\\?`));
+    });
+
+    await test.step('the heading takes focus once it renders', async () => {
+      await expect(page.getByTestId(c.heading)).toBeFocused();
+      if (c.failLoad) {
+        await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(UNREACHABLE_TITLE);
+      }
+    });
+  });
+}
 
 /**
  * Asserts that the room table shows "Book" buttons and that every one is
@@ -2449,6 +2495,177 @@ test('registering and logging in move focus to the next page heading', async ({ 
     await logIn(page, email, password);
     await expect(page).toHaveURL('/search');
     await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeFocused();
+  });
+});
+
+test('Book while signed out moves focus to the login heading, and a reload of that page leaves focus alone', async ({ page }) => {
+  await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
+
+  const heading = page.getByRole('heading', { level: 1, name: 'Log in' });
+  await test.step('the login heading takes focus', async () => {
+    await expect(heading).toBeFocused();
+  });
+
+  await test.step('a reload opens the login page as the first page of the app, with focus left on the body', async () => {
+    await page.reload();
+    await expect(heading).toBeVisible();
+    await expect(heading).not.toBeFocused();
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
+  });
+});
+
+test('a fresh load of My bookings while signed out lands on the login page with focus on the login heading', async ({
+  page,
+}) => {
+  // The guard's redirect ends the app's first navigation, before any
+  // navigation has succeeded.
+  await page.goto('/bookings');
+
+  await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
+  await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
+});
+
+/**
+ * Records every uncaught exception, and every error the app reports to the
+ * console, such as Angular's report of a promise rejection nothing handled,
+ * except the browser's own "Failed to load resource" line for a request that
+ * `expectedFailure` matches. Only fixed labels are kept, an exception's error
+ * type or "console error", so no browser error text, which can carry URLs,
+ * tokens or email addresses, reaches the test output.
+ */
+function recordReportedErrors(page: Page, expectedFailure: (url: URL) => boolean): string[] {
+  const reported: string[] = [];
+  page.on('pageerror', (error) => {
+    reported.push(`uncaught ${error.name}`);
+  });
+  page.on('console', (message) => {
+    const source = new URL(message.location().url || 'about:blank');
+    if (
+      message.type() !== 'error' ||
+      (message.text().startsWith('Failed to load resource:') && expectedFailure(source))
+    ) {
+      return;
+    }
+    reported.push('console error');
+  });
+  return reported;
+}
+
+/** One of the web app's lazily loaded code chunks, served from the web origin's root. */
+const isCodeChunk = (url: URL): boolean => /^\/chunk-[^/]+\.js$/.test(url.pathname);
+
+test('a login whose next page fails to load stays on the login page, signed in, with an inline error', async ({ page, request }) => {
+  const { email, password } = await test.step('register a guest through the API', () => apiRegisterGuest(request));
+  const reported = recordReportedErrors(page, isCodeChunk);
+
+  await test.step('open the login page returning to My bookings, whose code is not loaded yet', async () => {
+    await page.goto('/login?returnUrl=%2Fbookings');
+    await expect(page.getByTestId('login-submit')).toBeVisible();
+  });
+
+  await test.step('fail every code chunk requested once the login has answered', async () => {
+    // The flag is set inside the login's own route, before its answer reaches
+    // the page, so the My bookings chunk that the answer leads to always
+    // fails; a response listener would race the router's chunk request.
+    let answered = false;
+    await page.route(isCodeChunk, (route) => (answered ? route.abort() : route.continue()));
+    await page.route(isLoginApi, async (route) => {
+      const response = await route.fetch();
+      if (route.request().method() === 'POST') {
+        answered = true;
+      }
+      await route.fulfill({ response });
+    });
+  });
+
+  await test.step('log in: the nav bar shows the signed-in guest', () => logIn(page, email, password));
+
+  await test.step('stay on the login page with the error inline and focus back on Log in', async () => {
+    await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(
+      'You are logged in, but the next page could not be opened. Reload the page and log in again.',
+    );
+    await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
+    // The pending state disabled the focused button; focus returns to it.
+    await expect(page.getByTestId('login-submit')).toBeFocused();
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+
+  await test.step('as the error says, a reload, which signs the guest out, and a new login open My bookings', async () => {
+    await page.unroute(isCodeChunk);
+    await page.reload();
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await logIn(page, email, password);
+    await expect(page).toHaveURL('/bookings');
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('My bookings');
+  });
+});
+
+test('a registration whose login page cannot be opened stays on the register page with an inline error and hands over no email', async ({
+  page,
+}) => {
+  const reported = recordReportedErrors(page, () => false);
+  await page.goto('/register');
+
+  await test.step('make the history update of the navigation to the login page throw', async () => {
+    // The register page's own code already holds most of the login page's,
+    // so whether the login route still has a chunk left to fail is a detail
+    // of the bundle. A throwing history update fails that navigation whatever
+    // the bundle: the router writes `/login?registered=1` with `pushState`
+    // just before it activates the login page, as Safari refuses when a page
+    // updates history too often, and then rejects the navigation's promise.
+    await page.evaluate(() => {
+      const pushState = History.prototype.pushState;
+      (window as unknown as Record<string, unknown>)['__originalPushState'] = pushState;
+      History.prototype.pushState = function (
+        this: History,
+        data: unknown,
+        unused: string,
+        url?: string | URL | null,
+      ): void {
+        if (String(url ?? '').includes('registered=1')) {
+          throw new DOMException('History updates are throttled.', 'SecurityError');
+        }
+        pushState.call(this, data, unused, url);
+      };
+    });
+  });
+
+  await test.step('register a new guest', async () => {
+    await fillBound(page, 'register-email', uniqueEmail());
+    await fillBound(page, 'register-password', uniquePassword());
+    await fillBound(page, 'register-full-name', 'States Guest');
+    const registration = page.waitForResponse(
+      (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId('register-submit').click();
+    expect((await registration).status()).toBe(201);
+  });
+
+  await test.step('stay on the register page with the error inline and focus back on Create account', async () => {
+    await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(
+      'Your account was created, but the login page could not be opened. Reload the page, then log in.',
+    );
+    await expect(page).toHaveURL('/register');
+    // The pending state disabled the focused button; focus returns to it.
+    await expect(page.getByTestId('register-submit')).toBeFocused();
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+
+  await test.step('a later /login?registered=1 in the app pre-fills no email', async () => {
+    // No link leads to /login?registered=1, so a history entry and the
+    // popstate event that Forward to it would bring open it within the app,
+    // where the email hand-off lives.
+    await page.evaluate(() => {
+      History.prototype.pushState = (window as unknown as Record<string, unknown>)[
+        '__originalPushState'
+      ] as History['pushState'];
+      history.pushState(null, '', '/login?registered=1');
+      window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+    });
+    await expect(page.getByTestId('login-notice')).toHaveText('Account created. Log in to continue.');
+    await expect(page).toHaveURL('/login?registered=1');
+    await expectControlValue(page, 'login-email', '');
   });
 });
 

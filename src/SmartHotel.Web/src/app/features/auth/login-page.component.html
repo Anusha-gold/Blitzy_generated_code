@@ -1,7 +1,8 @@
 <!-- A guest who is already signed in, as after Back to an earlier login
      entry, is sent on at once, so the form never shows; only the register
-     page's fresh hand-off shows it to them, for the account just created. -->
-<section *ngIf="!redirecting" class="auth-page">
+     page's fresh hand-off shows it to them, for the account just created, and
+     a move on that does not reach the next page, with its inline error. -->
+<section *ngIf="!redirecting()" class="auth-page">
   <h1 tabindex="-1">Log in</h1>
 
   <!-- The visible notice is in the page's first frame, so it never pushes the

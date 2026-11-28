@@ -38,8 +38,10 @@ import { SearchPageComponent } from './features/search/search-page.component';
  *
  * Search, the entry screen, is eager; the other routes use `loadComponent`.
  * Hotel detail may also load the bookings page module, for its confirmation
- * helper `bookingConfirmationState`. `authGuard` controls activation of the
- * bookings route, not the download of its code.
+ * helper `bookingConfirmationState`, and the login page module, for its
+ * entry-focus helper; the register page loads the login page module for the
+ * focus and inline-error helpers the two auth pages share. `authGuard`
+ * controls activation of the bookings route, not the download of its code.
  */
 export const routes: Routes = [
   { path: '', redirectTo: 'search', pathMatch: 'full' },

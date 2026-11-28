@@ -25,6 +25,7 @@ import { AuthService } from '../../core/auth/auth.service';
 import type { Session } from '../../core/auth/auth.service';
 import { UiError, toUiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
+import { focusHeadingOnInAppEntry } from '../auth/login-page.component';
 import { bookingConfirmationState } from '../bookings/bookings-page.component';
 import type { BookingConfirmationState } from '../bookings/bookings-page.component';
 
@@ -137,6 +138,16 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  * such as the 400 for invalid dates or a malformed `guests` or the 404 for an
  * unknown or non-integer hotel id, removes the previous hotel and is shown in
  * place of the content.
+ *
+ * Entry focus: when a navigation within the app opens this page, as "View
+ * rooms" does, the page's heading takes focus once it renders: the hotel's
+ * name when the first load completes, or the load error's heading shown in
+ * its place, unless focus is on another element or outside the page by then.
+ * The first page of a fresh load is left alone. The helper,
+ * `focusHeadingOnInAppEntry`, comes from the login page's module, which
+ * focuses its own heading the same way, so this page loads that module's
+ * code with its own, as it loads the bookings page's for
+ * {@link bookingConfirmationState}.
  *
  * Booking: "Book" while signed out makes no request and navigates to
  * `/login?returnUrl=<current URL>`, so the guest comes back here after logging
@@ -261,10 +272,14 @@ export class HotelDetailPageComponent {
   private readonly auth = inject(AuthService);
   private readonly destroyRef = inject(DestroyRef);
 
-  /** Tells which element has focus, when "Book" sends and once its answer is settled. */
+  /** Tells which element has focus, on entry, when "Book" sends and once its answer is settled. */
   private readonly document = inject(DOCUMENT);
 
-  /** Registers the focus restore after the next render, outside an injection context. */
+  /**
+   * Registers the focus restore after the next render, outside an injection
+   * context, and the focus move onto this page's heading on entry; both end
+   * with the page.
+   */
   private readonly injector = inject(Injector);
 
   /** Renders a session change at once, so focus on an outcome it removes can move on. */
@@ -454,6 +469,11 @@ export class HotelDetailPageComponent {
     toObservable(this.auth.session)
       .pipe(skip(1), takeUntilDestroyed())
       .subscribe((session) => this.sessionChanged(session));
+
+    // "View rooms" leaves with the search page, so focus is on the body. The
+    // heading renders only once the first load settles, and the wait retries
+    // on every render until then.
+    focusHeadingOnInAppEntry(this.document, this.injector, this.router);
   }
 
   /**
