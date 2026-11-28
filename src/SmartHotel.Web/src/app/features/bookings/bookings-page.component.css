@@ -46,9 +46,10 @@
   color: var(--sh-color-text-muted);
 }
 
-/* Ten columns overflow narrow screens, so the table scrolls sideways here, not the
-   page. Relative, so the absolute .visually-hidden spans stay inside the scroller.
-   :host has no overflow, so this region's global focus ring is not clipped. */
+/* Narrow screens get the compact rows below, so the table scrolls sideways here,
+   not the page, only if its content still overflows. Relative, so the absolute
+   .visually-hidden spans stay inside the scroller. :host has no overflow, so this
+   region's global focus ring is not clipped. */
 .bookings-scroll {
   position: relative;
   overflow-x: auto;
@@ -58,60 +59,58 @@
    table base. Paging and Cancel move no column and resize no row: Room type and
    Room fit their headers, Check-in to Status reserve the content width of their
    widest value (a date, "30 nights", "4 guests", a five-digit total,
-   "Confirmed"), the last column the Cancel button's label, padding, border and
-   height, and Hotel takes the rest. Total reserves seven digits instead when
-   any loaded booking, on any page, has six or more. Each width is also the
-   minimum while the table scrolls; wider content, as in a wider font, still
-   widens its column instead of overlapping. */
-.bookings th,
-.bookings td {
+   "Confirmed"), the last column the Cancel button's width and height, and
+   Hotel takes the rest. Total reserves seven digits instead when any loaded
+   booking, on any page, has six or more. The widths hold while the table fits
+   its region, as it does on viewports of 64rem and wider unless a room type or
+   a word of a hotel name is unusually long; wider content, as in a wider font,
+   still widens its column instead of overlapping. Only the hotel name wraps;
+   "Check-in" and "30 nights" would otherwise break. */
+th,
+td {
   box-sizing: content-box;
 }
 
-.bookings th:nth-child(4),
-.bookings th:nth-child(5) {
-  inline-size: 9.4ch;
-  min-inline-size: 9.4ch;
-}
-
-.bookings th:nth-child(6) {
-  inline-size: 7.75ch;
-  min-inline-size: 7.75ch;
-}
-
-.bookings th:nth-child(7) {
-  inline-size: 7.1ch;
-  min-inline-size: 7.1ch;
-}
-
-.bookings th:nth-child(8) {
-  inline-size: 9.1ch;
-  min-inline-size: 9.1ch;
-}
-
-.bookings.wide-totals th:nth-child(8) {
-  inline-size: 11.6ch;
-  min-inline-size: 11.6ch;
-}
-
-.bookings th:nth-child(9) {
-  inline-size: 9.4ch;
-  min-inline-size: 9.4ch;
-}
-
-.bookings th:last-child {
-  inline-size: calc(5.6ch + 1.875rem);
-  min-inline-size: calc(5.6ch + 1.875rem);
-}
-
-.bookings td:last-child {
-  block-size: 2.75rem;
-}
-
-/* Only the hotel name wraps; "Check-in" and "30 nights" would otherwise break. */
-.bookings th:not(:first-child),
-.bookings td:not(:first-child) {
+th ~ th,
+td ~ td {
   white-space: nowrap;
+}
+
+th:nth-child(4),
+th:nth-child(5),
+th:nth-child(9) {
+  inline-size: 9.4ch;
+}
+
+th:nth-child(6) {
+  inline-size: 7.75ch;
+}
+
+th:nth-child(7) {
+  inline-size: 7.1ch;
+}
+
+th:nth-child(8) {
+  inline-size: 9.1ch;
+}
+
+.wide-totals th:nth-child(8) {
+  inline-size: 11.6ch;
+}
+
+/* An invisible copy of the Cancel button's label, weight, padding and border
+   (src/styles.css), so the column is exactly the button's width whether or not
+   any row shows one. Hidden, it is also absent from the accessibility tree, so
+   the header's name stays "Actions". */
+th:last-child::after {
+  content: "Cancel";
+  visibility: hidden;
+  padding: 0 calc(0.875rem + 1px);
+  font-weight: 600;
+}
+
+td:last-child {
+  block-size: 2.75rem;
 }
 
 .num {
@@ -132,17 +131,69 @@
 
 /* Focus lands on this cell after a cancel; an inset ring stays inside the
    sideways-scrolling table region. */
-.bookings .status:focus-visible {
+.status:focus-visible {
   outline-offset: -2px;
 }
 
 /* The 2.75rem minimum height and the focus ring are the global button's, as
    is Cancel's disabled state; the pager's aria-disabled state is drawn below.
    The scroll margin makes scrollIntoView and focus scrolling, which stop at
-   the border box, also bring the whole 2px + 2px focus ring into view. */
-.bookings button,
-.pager button {
+   the border box, also bring the whole 2px + 2px focus ring into view. The
+   only buttons here are Cancel and the pager's. */
+button {
   scroll-margin-block: 0.5rem;
+}
+
+/* On viewports narrower than main's full 64rem measure each booking is a
+   compact block instead, so nothing scrolls sideways: the hotel is its title,
+   with Cancel on the same line, and the other cells flow into as many 8rem
+   columns as fit, each under its data-label. The labels are generated content,
+   so each cell's text is still its value alone. The viewport's width includes
+   the scrollbar, so a scrollbar that content growth adds, such as an error
+   above the list, never switches the layout. From 64rem up, main gives the
+   table over 60.5rem even beside a scrollbar, above its ~58.6rem minimum width
+   (~60rem with seven-digit totals). */
+@media (width < 64rem) {
+  thead {
+    display: none;
+  }
+
+  tr {
+    display: grid;
+    grid: none / repeat(auto-fill, minmax(8rem, 1fr));
+    border-block-end: 1px solid var(--sh-color-rule);
+  }
+
+  td {
+    border: 0;
+  }
+
+  /* Values wrap inside their column and start under their labels. */
+  td ~ td {
+    white-space: normal;
+    text-align: start;
+  }
+
+  td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--sh-color-text-muted);
+  }
+
+  td:first-child {
+    grid-column: 1 / -2;
+    font-weight: 700;
+  }
+
+  td:last-child {
+    grid-area: 1 / -2;
+  }
+
+  /* Tab scrolls a Cancel at the bottom edge up by this much more, so the
+     room and dates beneath it show too. */
+  button {
+    scroll-margin-block-end: 10rem;
+  }
 }
 
 .pager {

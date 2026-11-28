@@ -70,22 +70,29 @@
           </tr>
         </thead>
         <tbody>
+          <!-- data-label repeats each column header for the compact rows of
+               narrow screens, which hide the header row and show it as
+               generated content above the value. -->
           <tr *ngFor="let b of visibleBookings(); trackBy: trackById" [attr.data-testid]="'booking-row-' + b.id">
             <td>{{ b.hotelName }}</td>
-            <td>{{ b.roomTypeName }}</td>
-            <td class="num">{{ b.roomNumber }}</td>
-            <td><time [attr.datetime]="b.checkIn">{{ b.checkIn | date }}</time></td>
-            <td><time [attr.datetime]="b.checkOut">{{ b.checkOut | date }}</time></td>
-            <td class="num">{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
-            <td class="num">{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
-            <td class="num" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
+            <td data-label="Room type">{{ b.roomTypeName }}</td>
+            <td class="num" data-label="Room">{{ b.roomNumber }}</td>
+            <td data-label="Check-in"><time [attr.datetime]="b.checkIn">{{ b.checkIn | date }}</time></td>
+            <td data-label="Check-out"><time [attr.datetime]="b.checkOut">{{ b.checkOut | date }}</time></td>
+            <td class="num" data-label="Nights">{{ b.nights }} {{ b.nights === 1 ? 'night' : 'nights' }}</td>
+            <td class="num" data-label="Guests">{{ b.guests }} {{ b.guests === 1 ? 'guest' : 'guests' }}</td>
+            <td class="num" data-label="Total" [attr.data-testid]="'booking-total-' + b.id">{{ b.totalPrice | currency: 'USD' }}</td>
+            <!-- The status look is on the value alone, so the compact rows'
+                 "Status" label stays plain like the other labels. -->
             <td
               class="status"
-              [class.status-confirmed]="b.status === 'Confirmed'"
-              [class.status-cancelled]="b.status === 'Cancelled'"
+              data-label="Status"
               [attr.data-testid]="'booking-status-' + b.id"
               tabindex="-1"
-            >{{ b.status }}</td>
+            ><span
+              [class.status-confirmed]="b.status === 'Confirmed'"
+              [class.status-cancelled]="b.status === 'Cancelled'"
+            >{{ b.status }}</span></td>
             <td>
               <!-- The visible label "Cancel" starts the accessible name, and the
                    visually hidden rest names the booking: hotel, room type, room
