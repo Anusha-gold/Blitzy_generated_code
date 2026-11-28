@@ -1,7 +1,6 @@
 import { ChangeDetectionStrategy, Component, Injector, afterNextRender, computed, inject, signal } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, DOCUMENT, NgFor, NgIf } from '@angular/common';
-import { HttpErrorResponse } from '@angular/common/http';
 import { ActivatedRoute, ParamMap, Router, RouterLink } from '@angular/router';
 import { NonNullableFormBuilder, ReactiveFormsModule } from '@angular/forms';
 import { EMPTY, Observable, Subject, catchError, finalize, map, merge, switchMap, tap } from 'rxjs';
@@ -252,7 +251,7 @@ export class SearchPageComponent {
         this.searched.set(q);
         this.results.set(list);
       }),
-      catchError((err: HttpErrorResponse) => {
+      catchError((err: unknown) => {
         this.results.set(null);
         this.error.set(toUiError(err));
         return EMPTY;

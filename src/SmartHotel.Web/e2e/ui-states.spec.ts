@@ -12,7 +12,9 @@
  * stays open with the 401 inline and a "Log in again" back to the list. An
  * action, "Book" or "Cancel", stays on its page with the 401 inline. The
  * remaining tests cover related page states, such as the auth pages, URL
- * criteria, late answers, the request deadline and unusable response bodies.
+ * criteria, late answers, the request deadline, a request that fails with
+ * no HTTP response, a 5xx problem body shown only as generic text, and
+ * unusable response bodies and success statuses.
  *
  * Every test runs in a fresh browser context and therefore starts signed
  * out, because the session lives only in memory. Every guest is registered
@@ -208,6 +210,28 @@ const DEADLINE_CASES: readonly DeadlineCase[] = [
   },
 ];
 
+/**
+ * The message of the plain `Error` that {@link throwOnFirstSend} throws in
+ * place of a request. It is no HTTP response, so no inline error may show it.
+ */
+const NON_HTTP_ERROR_MESSAGE = 'non-http-marker: the request was never sent';
+
+/**
+ * The text of each field a stubbed 5xx problem body carries: its `title`,
+ * `detail`, `traceId`, and the one field name and message of its `errors`.
+ * A server fault shows only the generic text, so none may appear on screen.
+ */
+const SERVER_ERROR_MARKERS = {
+  title: 'server-title-marker',
+  detail: 'server-detail-marker',
+  traceId: 'server-trace-marker',
+  field: 'serverFieldMarker',
+  message: 'server-message-marker',
+} as const;
+
+/** The 5xx statuses of the server-error test, one test each. */
+const SERVER_ERROR_STATUSES: readonly number[] = [500, 503];
+
 /** A 200 body the page cannot use, stubbed in place of the API's answer. */
 interface UnusableBodyCase {
   /** What the body holds, for the test title. */
@@ -268,6 +292,99 @@ const UNUSABLE_READ_CASES: readonly UnusableReadCase[] = [
     body:
       '{"id":1,"name":"X","city":"Seattle","address":"Y","description":"Z",' +
       '"checkIn":"2099-02-30","checkOut":"2099-03-02","nights":2,"guests":1,"roomTypes":[]}',
+  },
+];
+
+/**
+ * Every field of a booking as the API writes it, each with its wire type, for
+ * the stubbed bookings answers to start from. The `createdAt` carries the
+ * microseconds the API stamps.
+ */
+const UNUSABLE_BOOKING_FIELDS: Readonly<Record<string, unknown>> = {
+  id: 7,
+  hotelId: 1,
+  hotelName: 'Stub Hotel',
+  roomTypeId: 1,
+  roomTypeName: 'Standard',
+  roomNumber: '101',
+  checkIn: '2099-01-10',
+  checkOut: '2099-01-12',
+  nights: 2,
+  guests: 1,
+  totalPrice: 200,
+  status: 'Confirmed',
+  createdAt: '2026-11-27T21:27:07.714883Z',
+};
+
+/**
+ * Returns {@link UNUSABLE_BOOKING_FIELDS} as JSON text with `changes` applied
+ * and the `omitted` fields left out.
+ */
+function unusableBookingJson(changes: Readonly<Record<string, unknown>>, omitted: readonly string[] = []): string {
+  const fields = Object.entries({ ...UNUSABLE_BOOKING_FIELDS, ...changes }).filter(([name]) => !omitted.includes(name));
+  return JSON.stringify(Object.fromEntries(fields));
+}
+
+/**
+ * A 2xx answer stubbed in place of a bookings endpoint's own: a success
+ * status the endpoint never gives, or a body the page cannot use.
+ */
+interface WrongStatusAnswer {
+  /** What the answer is, for the test title. */
+  title: string;
+  /** Its status, a 2xx. */
+  status: number;
+  /** The JSON text of its body; empty for none. */
+  body: string;
+}
+
+/** Answers to `GET /api/bookings` that My bookings cannot show, one test each. */
+const UNUSABLE_BOOKING_LISTS: readonly WrongStatusAnswer[] = [
+  { title: 'a 200 with {}', status: 200, body: '{}' },
+  { title: 'a 200 with null', status: 200, body: 'null' },
+  {
+    title: 'a 200 listing a booking whose id is the string "7"',
+    status: 200,
+    body: `[${unusableBookingJson({ id: '7' })}]`,
+  },
+  { title: 'a 200 listing a booking whose id is 0', status: 200, body: `[${unusableBookingJson({ id: 0 })}]` },
+  {
+    title: 'a 200 listing a booking without createdAt',
+    status: 200,
+    body: `[${unusableBookingJson({}, ['createdAt'])}]`,
+  },
+  {
+    title: 'a 200 listing two otherwise valid bookings that share an id',
+    status: 200,
+    body: `[${unusableBookingJson({})},${unusableBookingJson({ roomNumber: '102' })}]`,
+  },
+  {
+    title: 'a 200 listing a booking whose checkIn is in year 0000',
+    status: 200,
+    body: `[${unusableBookingJson({ checkIn: '0000-01-10' })}]`,
+  },
+  {
+    title: 'a 200 listing a booking whose createdAt is in year 0000',
+    status: 200,
+    body: `[${unusableBookingJson({ createdAt: '0000-11-27T21:27:07.714883Z' })}]`,
+  },
+  {
+    title: 'a 200 listing a booking whose totalPrice has three decimals',
+    status: 200,
+    body: `[${unusableBookingJson({ totalPrice: 200.001 })}]`,
+  },
+  { title: 'a 204 with no body', status: 204, body: '' },
+];
+
+/** Answers to "Book"'s `POST /api/bookings` that confirm no booking, one test each. */
+const WRONG_STATUS_BOOK_ANSWERS: readonly WrongStatusAnswer[] = [
+  { title: 'a 200 with an otherwise valid booking', status: 200, body: unusableBookingJson({}) },
+  { title: 'a 201 with {"id":1}', status: 201, body: '{"id":1}' },
+  { title: 'a 201 with a Cancelled booking', status: 201, body: unusableBookingJson({ status: 'Cancelled' }) },
+  {
+    title: 'a 201 with a booking whose totalPrice has three decimals',
+    status: 201,
+    body: unusableBookingJson({ totalPrice: 258.005 }),
   },
 ];
 
@@ -1064,6 +1181,227 @@ test('search while the service is unreachable shows the status-0 message, and Se
     await expect(error).toHaveCount(0);
   });
 });
+
+/**
+ * Makes the first `XMLHttpRequest` each document of the page opens for one
+ * target API endpoint throw a plain `Error`, carrying
+ * {@link NON_HTTP_ERROR_MESSAGE}, synchronously from `send`. Nothing reaches
+ * the network, and `HttpClient` fails that request with the `Error` itself,
+ * not an `HttpErrorResponse`. Every other request, a later one to the same
+ * endpoint included, is sent unchanged. The endpoint is compared by origin
+ * and path, as {@link isApiEndpoint} compares it; the query is ignored.
+ *
+ * @param endpoint - The endpoint's path below the API base, such as `/hotels`
+ *   or `/hotels/1`.
+ */
+async function throwOnFirstSend(page: Page, endpoint: string): Promise<void> {
+  const api = new URL(apiUrl());
+  await page.addInitScript(
+    ({ target, message }: { target: string; message: string }) => {
+      const targeted = new WeakMap<XMLHttpRequest, boolean>();
+      const open = XMLHttpRequest.prototype.open;
+      const send = XMLHttpRequest.prototype.send;
+      let thrown = false;
+
+      XMLHttpRequest.prototype.open = function (
+        this: XMLHttpRequest,
+        method: string,
+        url: string | URL,
+        async?: boolean,
+        username?: string | null,
+        password?: string | null,
+      ): void {
+        const requested = new URL(url, document.baseURI);
+        targeted.set(this, `${requested.origin}${requested.pathname}` === target);
+        open.call(this, method, url, async ?? true, username, password);
+      };
+
+      XMLHttpRequest.prototype.send = function (
+        this: XMLHttpRequest,
+        body?: Document | XMLHttpRequestBodyInit | null,
+      ): void {
+        if (!thrown && targeted.get(this) === true) {
+          thrown = true;
+          throw new Error(message);
+        }
+        send.call(this, body);
+      };
+    },
+    { target: `${api.origin}${api.pathname}${endpoint}`, message: NON_HTTP_ERROR_MESSAGE },
+  );
+}
+
+test('a search that fails without an HTTP response shows the status-0 message, and the next search runs', async ({ page }) => {
+  // The first search GET throws from `send`, so it fails with a plain Error
+  // and no response at all; the next one goes to the real API unchanged.
+  await throwOnFirstSend(page, '/hotels');
+  const sent: URL[] = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (isHotelSearch(url) && request.method() === 'GET') {
+      sent.push(url);
+    }
+  });
+
+  await test.step('fill a valid Seattle search for two guests', async () => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    await page.goto('/search');
+    await fillBound(page, 'search-city', 'Seattle');
+    await fillBound(page, 'search-check-in', checkIn);
+    await fillBound(page, 'search-check-out', checkOut);
+    await fillBound(page, 'search-guests', '2');
+  });
+
+  const error = page.getByTestId('inline-error');
+
+  await test.step('the failed search shows only "The service is unreachable."', async () => {
+    await page.getByTestId('search-submit').click();
+
+    // No response was received: the status-0 title alone, never the
+    // exception's own message.
+    const alert = error.getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText(NON_HTTP_ERROR_MESSAGE);
+
+    // The failed request has settled, and it never reached the network.
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.getByTestId('search-submit')).toBeEnabled();
+    await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+    expect(sent).toEqual([]);
+  });
+
+  await test.step('a search for one guest changes the URL, reaches the API and shows results', async () => {
+    // New criteria are a route change, so this proves the page's
+    // route-driven search survived the failure.
+    await fillBound(page, 'search-guests', '1');
+    const answered = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('search-submit').click();
+    expect((await answered).status()).toBe(200);
+    await expect(page).toHaveURL(/[?&]guests=1(&|$)/);
+    await expect(page.locator(HOTEL_RESULTS).first()).toBeVisible();
+    await expect(error).toHaveCount(0);
+    expect(sent.map((url) => url.searchParams.get('guests'))).toEqual(['1']);
+  });
+});
+
+test('a hotel load that fails without an HTTP response shows the status-0 message, and the reused page loads again', async ({ page, request }) => {
+  const [checkIn, checkOut] = utcDates(40, 42);
+  const stay = { city: 'Seattle', checkIn, checkOut, guests: 1 };
+
+  const [first, second] = await test.step('read two Seattle hotels through the API', async () => {
+    const search = await fixtureRequest('searching hotels', () =>
+      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', checkIn, checkOut, guests: 1 } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const body: unknown = await search.json();
+    const hotels: { id: number; name: string }[] = [];
+    for (const hotel of Array.isArray(body) ? (body as unknown[]) : []) {
+      if (isRecord(hotel) && typeof hotel['id'] === 'number' && typeof hotel['name'] === 'string') {
+        hotels.push({ id: hotel['id'], name: hotel['name'] });
+      }
+    }
+    expect(hotels.length, 'the fixture search returns two Seattle hotels').toBeGreaterThanOrEqual(2);
+    return [hotels[0], hotels[1]];
+  });
+
+  // The second hotel's first load throws from `send`, so it fails with a
+  // plain Error and no response at all; every other request is unchanged.
+  await throwOnFirstSend(page, `/hotels/${second.id}`);
+
+  await test.step('open the first hotel from a search', async () => {
+    await page.goto('/search');
+    await searchHotels(page, stay);
+    await openHotel(page, page.getByTestId(`view-rooms-${first.id}`));
+    await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
+  });
+
+  const error = page.getByTestId('inline-error');
+
+  await test.step('the second hotel\'s failed load shows only "The service is unreachable."', async () => {
+    await page.getByTestId('nav-search').click();
+    await expect(page).toHaveURL(/\/search$/);
+    await searchHotels(page, stay);
+    await page.getByTestId(`view-rooms-${second.id}`).click();
+    await expect(page).toHaveURL(new RegExp(`/hotels/${second.id}\\?`));
+
+    const alert = error.getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert).toHaveText(UNREACHABLE_TITLE);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText(NON_HTTP_ERROR_MESSAGE);
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+  });
+
+  await test.step('one history traversal back to the first hotel loads it on the same page instance', async () => {
+    // A mark on the page's host element survives only if the router reuses
+    // the component, so the load below comes from the same route stream that
+    // carried the failure.
+    const host = page.locator('app-hotel-detail-page');
+    await host.evaluate((element) => element.setAttribute('data-e2e-reused', 'yes'));
+    const loaded = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/hotels/${first.id}`) && r.request().method() === 'GET',
+    );
+
+    // The history holds /search, /search?<stay>, /hotels/<first>, /search,
+    // /search?<stay> and /hotels/<second>: three entries back is the first
+    // hotel, reached by one navigation that keeps the detail page.
+    await page.evaluate(() => history.go(-3));
+    expect((await loaded).status()).toBe(200);
+    await expect(page).toHaveURL(new RegExp(`/hotels/${first.id}\\?`));
+    await expect(page.getByTestId('hotel-name')).toHaveText(first.name);
+    await expect(error).toHaveCount(0);
+    await expect(host).toHaveAttribute('data-e2e-reused', 'yes');
+  });
+});
+
+for (const status of SERVER_ERROR_STATUSES) {
+  test(`a search answered ${status} with a problem body shows only "Request failed (${status})."`, async ({ page }) => {
+    // The search GET gets a 5xx labelled as a problem, every field holding
+    // marker text; a CORS preflight would go on to the real API unchanged.
+    await page.route(isHotelSearch, (route) =>
+      route.request().method() === 'GET'
+        ? route.fulfill({
+            status,
+            contentType: 'application/problem+json',
+            body: JSON.stringify({
+              type: 'about:blank',
+              title: SERVER_ERROR_MARKERS.title,
+              status,
+              detail: SERVER_ERROR_MARKERS.detail,
+              traceId: SERVER_ERROR_MARKERS.traceId,
+              errors: { [SERVER_ERROR_MARKERS.field]: [SERVER_ERROR_MARKERS.message] },
+            }),
+          })
+        : route.fallback(),
+    );
+
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const answered = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.goto(`/search?city=Seattle&checkIn=${checkIn}&checkOut=${checkOut}`);
+    expect((await answered).status()).toBe(status);
+
+    // The generic title alone: no detail paragraph, no field list, and no
+    // text the body carried anywhere on the page.
+    const alert = page.getByTestId('inline-error').getByRole('alert');
+    await expect(alert.locator('strong')).toHaveText(`Request failed (${status}).`);
+    await expect(alert).toHaveText(`Request failed (${status}).`);
+    await expect(alert.locator('p, ul, li')).toHaveCount(0);
+    for (const marker of Object.values(SERVER_ERROR_MARKERS)) {
+      await expect(page.locator('body')).not.toContainText(marker);
+    }
+    await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+    await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
+    await expect(page.getByTestId('search-empty')).toHaveCount(0);
+  });
+}
 
 for (const c of RAW_CRITERIA_CASES) {
   test(`${c.title} reaches the server as written and its ${c.status} shows inline`, async ({ page }) => {
@@ -2397,6 +2735,149 @@ test('server 401 on Cancel stays on My bookings with an inline error', async ({ 
     await expect(page).toHaveURL(bookingsUrl);
     await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
     await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+  });
+});
+
+for (const c of UNUSABLE_BOOKING_LISTS) {
+  test(`entering My bookings answered with ${c.title} shows inline and lists no booking`, async ({ page }) => {
+    await test.step('register and log in', () => registerAndLogIn(page));
+
+    await test.step('open My bookings while its list is stubbed', async () => {
+      await page.route(isBookingsCollection, (route) =>
+        route.request().method() === 'GET'
+          ? route.fulfill({ status: c.status, contentType: 'application/json', body: c.body })
+          : route.fallback(),
+      );
+      const list = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await page.getByTestId('nav-bookings').click();
+      expect((await list).status(), 'the stubbed list answers its status').toBe(c.status);
+    });
+
+    await test.step('the unexpected response shows inline, with no row and no empty-list message', async () => {
+      await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+      await expect(page.locator('[data-testid^="booking-row-"]')).toHaveCount(0);
+      await expect(page.getByTestId('bookings-empty')).toHaveCount(0);
+      // A success status ends no session: the guest stays signed in on the page.
+      await expect(page).toHaveURL(/\/bookings$/);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+    });
+  });
+}
+
+for (const c of WRONG_STATUS_BOOK_ANSWERS) {
+  test(`Book answered with ${c.title} shows inline and stays on the hotel page`, async ({ page, request }) => {
+    const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+    // Should the stub ever miss, the real POST books a room, which the
+    // reconciliation after the test then cancels.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, credentials));
+
+    const hotelUrl = await test.step('open a Seattle hotel', async () => {
+      const [checkIn, checkOut] = utcDates(25, 27);
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 2 });
+      await openHotel(page, page.locator(VIEW_ROOMS).first());
+      return page.url();
+    });
+
+    await test.step('click Book while its POST is stubbed', async () => {
+      const book = page.locator(`${BOOK_BUTTONS}:enabled`).first();
+      await expect(book).toBeVisible();
+      await page.route(isBookingsCollection, (route) =>
+        route.request().method() === 'POST'
+          ? route.fulfill({ status: c.status, contentType: 'application/json', body: c.body })
+          : route.fallback(),
+      );
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await book.click();
+      expect((await created).status(), 'the stubbed POST answers its status').toBe(c.status);
+    });
+
+    await test.step('the unexpected response shows inline on the same hotel page', async () => {
+      await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+      await expect(page).toHaveURL(hotelUrl);
+      await expect(page.getByTestId('hotel-name')).toBeVisible();
+      await expect(page.getByTestId('booking-confirmation')).toHaveCount(0);
+      await expect(page.getByTestId('nav-email')).toBeVisible();
+    });
+  });
+}
+
+test('Cancel answered with a 200 instead of 204 shows inline and keeps the row Confirmed', async ({ page, request }) => {
+  const credentials = await test.step('register and log in', () => registerAndLogIn(page));
+
+  const { session, id } = await test.step('book a later Seattle stay for the guest through the API', async () => {
+    const [checkIn, checkOut] = utcDates(160, 162);
+    const stay: Stay = { checkIn, checkOut, guests: 1 };
+
+    const search = await fixtureRequest('searching hotels', () =>
+      request.get(`${apiUrl()}/hotels`, { params: { city: 'Seattle', ...stay } }),
+    );
+    expect(search.status(), 'the fixture search returns 200').toBe(200);
+    const hotels: unknown = await search.json();
+    const hotel: unknown = Array.isArray(hotels) ? (hotels as unknown[])[0] : undefined;
+    const hotelId = isRecord(hotel) ? hotel['id'] : undefined;
+    expect(typeof hotelId === 'number' && Number.isInteger(hotelId), 'the fixture search returns a hotel').toBe(true);
+
+    const free = (await apiRoomTypes(request, Number(hotelId), stay)).find((rt) => rt.availableRooms > 0);
+    expect(free !== undefined, 'the hotel has a free room type').toBe(true);
+
+    const guest = await apiSignIn(request, credentials);
+    const bookingId = await apiBook(request, guest, {
+      hotelId: Number(hotelId),
+      roomTypeId: Number(free?.id),
+      ...stay,
+    });
+    return { session: guest, id: bookingId };
+  });
+
+  await test.step('open My bookings: the booking is Confirmed and offers Cancel', async () => {
+    const list = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await page.getByTestId('nav-bookings').click();
+    expect((await list).status(), 'the entry GET returns 200').toBe(200);
+    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+  });
+
+  const sent = await test.step('click Cancel while its DELETE is stubbed with a 200', async () => {
+    // The stubbed DELETE never reaches the API, so the booking stays
+    // Confirmed there; only a client that took the 200 for a cancellation
+    // would show it otherwise.
+    await page.route(
+      (url) => isApiEndpoint(url, `/bookings/${id}`),
+      (route) =>
+        route.request().method() === 'DELETE'
+          ? route.fulfill({ status: 200, contentType: 'application/json', body: '' })
+          : route.fallback(),
+    );
+    const recorded = recordApiRequests(page);
+    const answered = page.waitForResponse(
+      (r) => isApiEndpoint(r.url(), `/bookings/${id}`) && r.request().method() === 'DELETE',
+    );
+    await page.getByTestId(`cancel-${id}`).click();
+    expect((await answered).status(), 'the stubbed DELETE answers 200').toBe(200);
+    return recorded;
+  });
+
+  await test.step('the unexpected response shows inline and the row stays Confirmed with Cancel', async () => {
+    await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
+    await expect(page.getByTestId(`booking-status-${id}`)).toHaveText('Confirmed');
+    await expect(page.getByTestId(`cancel-${id}`)).toBeEnabled();
+    await expect(page.getByTestId('bookings-announcement')).not.toContainText('Booking cancelled');
+    await expect(page).toHaveURL(/\/bookings$/);
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+  });
+
+  await test.step('no reload follows, and the booking stays Confirmed on the server', async () => {
+    expect(
+      sent.map(({ method, url }) => `${method} ${apiRelativeTarget(url)}`),
+      'the API requests after the click',
+    ).toEqual([`DELETE /api/bookings/${id}`]);
+    expect(await apiBookingStatus(request, session, id), 'the server status of the booking').toBe('Confirmed');
   });
 });
 

@@ -615,7 +615,7 @@ export class BookingsPageComponent implements AfterViewInit {
           }
           this.settleCancel(b.id, owned, focusedElsewhere, false);
         },
-        error: (err: HttpErrorResponse) => {
+        error: (err: unknown) => {
           const uiError = toUiError(err);
           // With a 409 recorded, this error is its reload's. A 401 replaces
           // the 409, so "Log in again" shows; any other failure is added to
@@ -828,8 +828,8 @@ export class BookingsPageComponent implements AfterViewInit {
           }
           this.focusConfirmationAfterRender();
         },
-        error: (err: HttpErrorResponse) => {
-          if (err.status === 401) {
+        error: (err: unknown) => {
+          if (err instanceof HttpErrorResponse && err.status === 401) {
             // `replaceUrl` drops the rejected `/bookings` entry from history,
             // so Back does not return to a page that bounces to login again.
             // The session-ended notice stays hidden while the page leaves. A

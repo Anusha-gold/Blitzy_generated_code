@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
@@ -22,10 +23,12 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// <remarks>
 /// <para>
 /// When the <c>SMARTHOTEL_TEST_POSTGRES</c> environment variable is set to a non-blank value, its connection string
-/// selects the server and no Compose call is made; it must set <c>Host</c>. A blank value counts as unset. Otherwise
-/// the fixture starts the repository's <c>db-test</c> Compose service, a passwordless server published on host
-/// loopback port 55432, in its own Compose project <c>smarthotel-test</c>, and leaves it running: its data lives on
-/// tmpfs and the next run reuses it. The server user must be a superuser, or have <c>CREATEDB</c> and
+/// selects the server and no Compose call is made; it must set <c>Host</c>, and <c>SSL Mode=VerifyFull</c> unless
+/// every host it names is <c>localhost</c>, a loopback address or a Unix-domain socket, as
+/// <see cref="InitializeAsync"/> describes. A blank value counts as unset. Otherwise the fixture starts the
+/// repository's <c>db-test</c> Compose service, a passwordless server without TLS published on host loopback port
+/// 55432, in its own Compose project <c>smarthotel-test</c>, and leaves it running: its data lives on tmpfs and the
+/// next run reuses it. The server user must be a superuser, or have <c>CREATEDB</c> and
 /// <c>CREATEROLE</c> and, for each server log setting that could record the statement that sets a test role's
 /// password, either the <c>SET</c> privilege on it or a server value that keeps statement text out of the log; the
 /// remarks on <see cref="CreateDatabaseAsync"/> list those settings and values.
@@ -46,9 +49,10 @@ namespace SmartHotel.Api.IntegrationTests.Infrastructure;
 /// <c>Include Error Detail</c> off, so PostgreSQL's <c>DETAIL</c> text, which can contain key values, stays redacted
 /// in exceptions and logs. Each one is pooled without multiplexing, at Npgsql's default pool limits, whatever pool
 /// settings the server connection string carries, so a test can always derive an unpooled string from it. None names
-/// a client certificate. Those on <c>db-test</c>, which offers no TLS, have <c>SSL Mode=Disable</c>, and the fixture
-/// refuses to start whenever Npgsql could present an ambient certificate on the others, as
-/// <see cref="InitializeAsync"/> describes.
+/// a client certificate. Those on <c>db-test</c>, which offers no TLS, have <c>SSL Mode=Disable</c>. The others keep
+/// the <c>SSL Mode</c> of the string <c>SMARTHOTEL_TEST_POSTGRES</c> supplies, which is <c>VerifyFull</c> whenever one
+/// of its hosts is not local, and the fixture refuses to start whenever Npgsql could present an ambient certificate
+/// on them, as <see cref="InitializeAsync"/> describes.
 /// </para>
 /// <para>
 /// The members are safe to call concurrently from test classes that run in parallel.
@@ -100,7 +104,7 @@ public sealed partial class TestPostgres : IAsyncLifetime
     private const int ScramSaltLength = 16;
 
     private const string InvalidDatabaseConnectionString =
-        "The value is not a connection string that CreateDatabaseConnectionString returned.";
+        "The value does not have the form of a connection string that CreateDatabaseConnectionString returns.";
 
     // Npgsql 8's own defaults for the pool settings, which every test database's connection string carries whatever
     // the server string sets: no idle session kept open, at most 100 sessions, an idle one closed after 300 seconds and
@@ -194,6 +198,20 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// the assembly runs.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// The server connection string's <c>SSL Mode</c> and <c>Root Certificate</c> reach every connection the fixture
+    /// makes and every test database's connection string. The <c>db-test</c> Compose service is published on host
+    /// loopback only and offers no TLS, so the fixture connects to it with <c>SSL Mode=Disable</c>. A string that
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c> supplies keeps its own <c>SSL Mode</c> and <c>Root Certificate</c>, and any
+    /// <c>SSL Mode</c> is accepted while every host it names is local: <c>localhost</c>, a loopback address or a
+    /// Unix-domain socket, each host of a multi-host <c>Host</c> list counted, without its <c>:port</c> suffix. Once
+    /// one host is not local, the string must set <c>SSL Mode=VerifyFull</c>, which encrypts the connection and
+    /// verifies the server certificate's chain and host name: under any other mode the server user's login and the
+    /// statements that provision the test roles could cross the network in plain text, or reach a server whose
+    /// identity nothing checked. The fixture refuses a string that breaks this rule as soon as it is parsed, before it
+    /// first connects to the server.
+    /// </para>
+    /// <para>
     /// A test database's connection string names no client certificate, and Npgsql 8 then presents an ambient one on
     /// every connection that negotiates TLS: the file the <c>PGSSLCERT</c> environment variable names, even when it is
     /// empty, or else <c>postgresql.crt</c> in the PostgreSQL directory under the user's home. No connection string
@@ -202,19 +220,22 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// under that database's own login and on whichever host of the string answers it, so no connection the fixture
     /// makes beforehand can rule it out. Once the server string is selected, and before the fixture first connects to
     /// the server, the fixture therefore fails whenever the string's <c>SSL Mode</c> is not <c>Disable</c> and Npgsql
-    /// would find such a certificate. The <c>db-test</c> Compose service offers no TLS, so the fixture connects to it
-    /// with <c>SSL Mode=Disable</c>: its connections skip the TLS request, no ambient certificate can reach them, and
-    /// the default run is never refused for one. A string that <c>SMARTHOTEL_TEST_POSTGRES</c> supplies keeps its own
-    /// <c>SSL Mode</c> and <c>Root Certificate</c>. The environment and the certificate are only read, never changed.
+    /// would find such a certificate. A <c>db-test</c> run is never refused for one, because its connections skip the
+    /// TLS request. A server whose hosts are all local may avoid the certificate with <c>SSL Mode=Disable</c>; any
+    /// other server uses <c>VerifyFull</c>, so its run needs the certificate out of Npgsql's reach. The environment and
+    /// the certificate are only read, never changed.
+    /// </para>
     /// </remarks>
     /// <returns>
-    /// A task that completes once no ambient client certificate could reach a test database's connection and the
-    /// server answers <c>SELECT 1</c> on its maintenance database.
+    /// A task that completes once the server connection string's transport is accepted, no ambient client certificate
+    /// could reach a test database's connection, and the server answers <c>SELECT 1</c> on its maintenance database.
     /// </returns>
     /// <exception cref="InvalidOperationException">
-    /// <c>SMARTHOTEL_TEST_POSTGRES</c> is not a valid connection string or sets no <c>Host</c>; the repository root
-    /// cannot be found; the <c>docker</c> CLI cannot be started, or <c>docker compose up</c> fails or times out; Npgsql
-    /// would present an ambient client certificate on the test databases' connections, which ends the run before any
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c> is not a valid connection string, sets no <c>Host</c>, or names a host that is
+    /// neither <c>localhost</c>, a loopback address nor a Unix-domain socket without setting
+    /// <c>SSL Mode=VerifyFull</c>, which ends the run before any connection to the server; the repository root cannot
+    /// be found; the <c>docker</c> CLI cannot be started, or <c>docker compose up</c> fails or times out; Npgsql would
+    /// present an ambient client certificate on the test databases' connections, which ends the run before any
     /// connection to the server; the server rejects the login (SQLSTATE class 28), which ends the wait at once; a
     /// connection attempt fails in a way no retry changes; or the server does not accept connections within 15
     /// seconds.
@@ -361,10 +382,15 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// neither the password nor the verifier appears in their messages.
     /// </para>
     /// <para>
-    /// When a step fails, the database and the role are dropped again before the failure is reported, so a failed call
-    /// leaves nothing behind. The failure is reported as <see cref="DescribeServerFailure"/> describes it, with no
-    /// inner exception, because PostgreSQL's and Npgsql's messages can quote the username or the database; a refusal
-    /// to set the password adds its own fixed message, which names server settings only.
+    /// When a step fails, dropping the database and dropping the role are both attempted, each only if it exists and
+    /// neither cancelled by <paramref name="cancellationToken"/>, before the failure is reported. When both drops
+    /// succeed, the failed call leaves nothing behind, and a cancelled <paramref name="cancellationToken"/> is reported
+    /// as an <see cref="OperationCanceledException"/>. When either fails, the database or the role may remain, and the
+    /// message says that dropping them failed too, even when <paramref name="cancellationToken"/> was cancelled. Except
+    /// for that cancellation, the failure is reported as <see cref="DescribeServerFailure"/> describes it, in an
+    /// <see cref="InvalidOperationException"/>. None carries an inner exception, because PostgreSQL's and Npgsql's
+    /// messages can quote the username or the database; a refusal to set the password adds its own fixed message,
+    /// which names server settings only.
     /// </para>
     /// </remarks>
     /// <param name="connectionString">
@@ -373,14 +399,18 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <param name="cancellationToken">Cancels the statements. The cleanup after a failure is never cancelled.</param>
     /// <returns>A task that completes once the role and the database exist.</returns>
     /// <exception cref="ArgumentException">
-    /// <paramref name="connectionString"/> is not a connection string that
-    /// <see cref="CreateDatabaseConnectionString"/> returned.
+    /// <paramref name="connectionString"/> is <see langword="null"/> (an <see cref="ArgumentNullException"/>), empty or
+    /// blank, does not parse as an Npgsql connection string, or does not have the form
+    /// <see cref="CreateDatabaseConnectionString"/> gives it: a <c>Database</c> of <c>smarthotel_it_</c> and 32
+    /// lowercase hex digits, a <c>Username</c> exactly equal to it, and a <c>Password</c> of 64 lowercase hex
+    /// characters. No other setting is compared, so a string that passes need not be one this fixture returned.
     /// </exception>
     /// <exception cref="InvalidOperationException">
     /// The fixture has not been initialized, or a step failed, including the refusal to set the password while the
     /// server log could record it; the message is then the one <see cref="DescribeServerFailure"/> builds, which also
     /// says when dropping the database and the role again failed and, for that refusal, names the settings, and it
-    /// carries no inner exception.
+    /// carries no inner exception. A failed drop is reported this way even when <paramref name="cancellationToken"/>
+    /// was cancelled, and the database or the role may then remain.
     /// </exception>
     /// <exception cref="OperationCanceledException">
     /// <paramref name="cancellationToken"/> was cancelled, and the database and the role were dropped again.
@@ -478,8 +508,11 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// <param name="cancellationToken">Cancels the statements.</param>
     /// <returns>A task that completes once neither the database nor the role exists.</returns>
     /// <exception cref="ArgumentException">
-    /// <paramref name="connectionString"/> is not a connection string that
-    /// <see cref="CreateDatabaseConnectionString"/> returned.
+    /// <paramref name="connectionString"/> is <see langword="null"/> (an <see cref="ArgumentNullException"/>), empty or
+    /// blank, does not parse as an Npgsql connection string, or does not have the form
+    /// <see cref="CreateDatabaseConnectionString"/> gives it: a <c>Database</c> of <c>smarthotel_it_</c> and 32
+    /// lowercase hex digits, a <c>Username</c> exactly equal to it, and a <c>Password</c> of 64 lowercase hex
+    /// characters. No other setting is compared, so a string that passes need not be one this fixture returned.
     /// </exception>
     /// <exception cref="InvalidOperationException">
     /// The fixture has not been initialized, or dropping the database, the role or both failed; the message is then
@@ -520,12 +553,14 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// stopping or connecting a host that uses one, for test output without any value the failure carries.
     /// </summary>
     /// <remarks>
-    /// The description holds <paramref name="summary"/>, the type names of <paramref name="exception"/> and of every
-    /// exception inside it, outermost first, and the SQLSTATE of the first <see cref="PostgresException"/> among
-    /// them, as <see cref="DescribeFailure"/> builds it. A fixed sentence then says which server the test databases
-    /// are on: the one <c>SMARTHOTEL_TEST_POSTGRES</c> selects, or the <c>db-test</c> Compose service, with the
-    /// variable named as the way to use another server. The variable's value is never quoted. Callers throw a new
-    /// exception with this description and never attach <paramref name="exception"/> as its inner exception.
+    /// The description holds <paramref name="summary"/>, the exception type names and any SQLSTATE, as
+    /// <see cref="DescribeFailure"/> builds them: at most <see cref="MaxDescribedExceptions"/> (32) type names from a
+    /// breadth-first walk of <paramref name="exception"/> and the exceptions inside it, outermost first, ending with
+    /// <c>, and more.</c> when the walk stopped short, and the SQLSTATE of the first <see cref="PostgresException"/>
+    /// among the exceptions it visited. A fixed sentence then says which server the test databases are on: the one
+    /// <c>SMARTHOTEL_TEST_POSTGRES</c> selects, or the <c>db-test</c> Compose service, with the variable named as the
+    /// way to use another server. The variable's value is never quoted. Callers throw a new exception with this
+    /// description and never attach <paramref name="exception"/> as its inner exception.
     /// </remarks>
     /// <param name="summary">A fixed sentence naming the operation that failed.</param>
     /// <param name="exception">The failure to describe.</param>
@@ -550,12 +585,18 @@ public sealed partial class TestPostgres : IAsyncLifetime
     /// Describes a failed database or host operation for test output without any value the failure carries.
     /// </summary>
     /// <remarks>
-    /// The description holds <paramref name="summary"/>, the type names of <paramref name="exception"/> and of every
-    /// exception inside it, outermost first, and the SQLSTATE of the first <see cref="PostgresException"/> among
-    /// them. Messages, <see cref="Exception.Data"/> and every other PostgreSQL field, such as the message text,
-    /// detail, hint and the names of the constraint, table or column, are left out, because they can quote the
-    /// username, the database, part of the connection string or a key value. Callers therefore throw a new exception
-    /// with this description and never attach <paramref name="exception"/> as its inner exception.
+    /// The description holds <paramref name="summary"/>, then the type names of the exceptions a breadth-first walk
+    /// visits, in that order and so outermost first. The walk starts at <paramref name="exception"/> and goes from an
+    /// <see cref="AggregateException"/> to each item of its <see cref="AggregateException.InnerExceptions"/>, and
+    /// from any other exception to its <see cref="Exception.InnerException"/>. Each distinct exception, compared by
+    /// reference, is visited once, so a cycle ends the walk. The walk stops after
+    /// <see cref="MaxDescribedExceptions"/> (32) type names: when it reaches one more distinct exception, the list
+    /// ends with <c>, and more.</c> instead of <c>.</c>, and the exceptions left unvisited add nothing. The SQLSTATE
+    /// of the first <see cref="PostgresException"/> among the visited exceptions, in that order, follows the list.
+    /// Messages, <see cref="Exception.Data"/> and every other PostgreSQL field, such as the message text, detail, hint
+    /// and the names of the constraint, table or column, are left out, because they can quote the username, the
+    /// database, part of the connection string or a key value. Callers therefore throw a new exception with this
+    /// description and never attach <paramref name="exception"/> as its inner exception.
     /// </remarks>
     /// <param name="summary">A fixed sentence naming the operation that failed.</param>
     /// <param name="exception">The failure to describe.</param>
@@ -617,6 +658,8 @@ public sealed partial class TestPostgres : IAsyncLifetime
         return description.ToString();
     }
 
+    // Parses the string SMARTHOTEL_TEST_POSTGRES supplies and checks it before anything connects with it. Npgsql reads
+    // neither PGHOST nor PGSSLMODE, so the Host and SSL Mode checked here are the ones every connection uses.
     private static NpgsqlConnectionStringBuilder ParseConfiguredServer(string configured)
     {
         NpgsqlConnectionStringBuilder server;
@@ -636,7 +679,88 @@ public sealed partial class TestPostgres : IAsyncLifetime
             throw new InvalidOperationException($"{ServerVariable} must set Host.");
         }
 
+        // Off the machine, every other SSL Mode exposes the server user's login and the statements that provision the
+        // test roles: Disable never encrypts, Allow and Prefer fall back to plain text silently, Require verifies no
+        // certificate and VerifyCA no host name. A local host may keep any SSL Mode, because its connections never
+        // leave the machine. The message names neither the value nor a host.
+        if (server.SslMode != SslMode.VerifyFull && !AreAllHostsLocal(server.Host))
+        {
+            throw new InvalidOperationException(
+                $"{ServerVariable} names a host that is neither localhost, a loopback address nor a Unix-domain "
+                + "socket, so it must set SSL Mode=VerifyFull, which encrypts the connection and verifies the server "
+                + "certificate's chain and host name. Every host of a multi-host Host list counts, and SSL Mode "
+                + "applies to all of them. No connection was made. Set SSL Mode=VerifyFull, with Root Certificate "
+                + "naming the certificate authority when the system does not trust the server's certificate, or "
+                + "select a test server on the loopback interface.");
+        }
+
         return server;
+    }
+
+    // Whether every host of a Host value is local, so that no connection to it leaves the machine. The value is read
+    // as Npgsql 8 reads it, and Npgsql orders its Unix-domain socket test and its :port split differently for the two
+    // shapes a value takes, so each shape is classified in Npgsql's order for it. A value without a comma is one host,
+    // which Npgsql takes exactly as written: it tests the whole value for a socket first, and only when that fails
+    // splits off a :port and tests the host left. That value is therefore classified untrimmed in the same order: a
+    // padded value such as ' localhost' is not local, and /tmp:5432, or a:5432 on Windows, is a socket path. A value
+    // with a comma is a multi-host list, which Npgsql splits at its commas, trims entry by entry and splits each
+    // entry's :port before it tests the host left for a socket. Each trimmed entry is therefore split first and never
+    // tested whole: as a list entry, a:5432 on Windows names host a, which Npgsql reaches over TCP. Any entry that is
+    // not local makes the whole value not local.
+    private static bool AreAllHostsLocal(string hosts)
+    {
+        if (!hosts.Contains(','))
+        {
+            return IsUnixSocket(hosts) || IsLocalHost(SplitOffPort(hosts));
+        }
+
+        foreach (string entry in hosts.Split(','))
+        {
+            if (!IsLocalHost(SplitOffPort(entry.Trim())))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Classifies one host, its :port already split off, as Npgsql 8 connects to it. The host is local when it is a
+    // Unix-domain socket, localhost in any case, or an address IPAddress parses as a loopback address: [::1], any
+    // 127.0.0.0/8 address in a form IPAddress accepts, or its IPv4-mapped form. Anything else, a blank host included,
+    // is not local, so a value this cannot classify is held to the stricter rule.
+    private static bool IsLocalHost(ReadOnlySpan<char> host)
+    {
+        return IsUnixSocket(host)
+            || host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            || (IPAddress.TryParse(host, out IPAddress? address) && IPAddress.IsLoopback(address));
+    }
+
+    // Npgsql 8's Unix-domain socket test: a path the running platform treats as rooted, or a name that starts with @,
+    // an abstract socket. A blank host is no socket.
+    private static bool IsUnixSocket(ReadOnlySpan<char> host)
+    {
+        return !host.IsEmpty && (Path.IsPathRooted(host) || host[0] == '@');
+    }
+
+    // Npgsql 8's :port split. The host is the part before the last colon, taken only when no other colon precedes it
+    // or the ] of a bracketed IPv6 literal lies between the two, so [::1]:5432 gives [::1] and ::1 keeps its colons.
+    // Any other value is the host whole. The port is never parsed, so this never throws: Npgsql rejects a malformed
+    // port itself, when it first connects.
+    private static ReadOnlySpan<char> SplitOffPort(ReadOnlySpan<char> entry)
+    {
+        int portColon = entry.LastIndexOf(':');
+        if (portColon != -1)
+        {
+            int previousColon = entry[..portColon].LastIndexOf(':');
+            int closingBracket = entry.LastIndexOf(']');
+            if (previousColon == -1 || (portColon > closingBracket && previousColon < closingBracket))
+            {
+                return entry[..portColon];
+            }
+        }
+
+        return entry;
     }
 
     // Concurrent cold starts race to create the one db-test container, and every run but the winner then fails on the
@@ -977,9 +1101,10 @@ public sealed partial class TestPostgres : IAsyncLifetime
         throw new InvalidOperationException(
             $"Npgsql would present one ambient TLS client certificate on the connections of every test database, "
             + $"because {source}, so the test databases' login roles would share one TLS identity. For the test run, "
-            + $"unset {ClientCertificateVariable} and remove {ClientCertificateFile} from the PostgreSQL directory under "
-            + $"the user's home, or select the server through {ServerVariable} with SSL Mode=Disable in its "
-            + $"connection string.");
+            + $"unset {ClientCertificateVariable} and move {ClientCertificateFile} out of the PostgreSQL directory "
+            + $"under the user's home. Only a test server reached through localhost, a loopback address or a "
+            + $"Unix-domain socket may instead be selected through {ServerVariable} with SSL Mode=Disable in its "
+            + $"connection string; a server on any other host requires SSL Mode=VerifyFull.");
     }
 
     // Mirrors where Npgsql 8 finds a client certificate for a connection string that names none, and returns which
@@ -1260,9 +1385,12 @@ public sealed partial class TestPostgres : IAsyncLifetime
         }
     }
 
-    // A test database's connection string is accepted only in the form CreateDatabaseConnectionString builds, so the
-    // name that reaches SQL text is validated and the role is the database's own. The messages never quote the
-    // string, which carries a password.
+    // Checks the form of a test database's connection string, not where it came from: it must be non-blank and parse,
+    // its Database must be smarthotel_it_ and 32 lowercase hex digits, its Username must equal that name exactly, and
+    // its Password must be 64 lowercase hex characters, as in every string CreateDatabaseConnectionString builds. No
+    // other setting is compared, so passing a string that method returned stays the caller's duty. The checks keep the
+    // name that reaches SQL text in its validated form and make the role the database's own. The messages never quote
+    // the string, which carries a password.
     private static (string Name, string Password) ParseTestDatabase(string connectionString)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);

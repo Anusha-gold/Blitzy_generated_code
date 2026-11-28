@@ -29,12 +29,99 @@ map '${API_BASE_URL}' $smarthotel_api_base_url {
   '~^([^"\\\\\x00-\x1F\x7F]+)\z'   $1;
 }
 
+# The API's origin, for connect-src in the Content-Security-Policy below,
+# rebuilt as scheme://host[:port] from "apiBaseUrl" as the browser's URL
+# parser reads that value, so it names the origin the SPA sends requests to:
+# - Spaces before the scheme, the slashes after it, however many there are,
+#   an empty user name and password ("@" or ":@") and an empty port
+#   ("host:/api") are left out.
+# - The scheme and host may be in any case: source expressions match both
+#   case-insensitively.
+# - An IPv4 address is kept in its four-decimal form, without the trailing
+#   dot the browser drops from it. Any other host whose last label is a
+#   number, such as 0xC0.0.2.10 or 3221225994, is an IPv4 address in a form
+#   the browser rewrites, so it gives no origin.
+# - A domain name is kept as dot-separated labels of letters, digits and
+#   hyphens, with the trailing dot the browser keeps when it has one.
+# - A path, query, fragment or the end of the value must follow.
+# A source expression names a host only as such labels, so every other base
+# URL gives no origin: one with a user name or password, which the SPA
+# rejects as well; an IPv6 literal or a host with an underscore, which the
+# source-expression grammar has no form for and Chromium refuses; and a
+# percent-encoded or non-ASCII host or one with an empty label, whose
+# browser form nginx cannot compute or a source cannot name. Neither does a
+# base URL the map above serves as empty. connect-src is then 'self' alone,
+# and the browser refuses the SPA's requests to every other origin, the
+# API's included. No entry yields a wildcard.
+map $smarthotel_api_base_url $smarthotel_api_origin {
+  default                                                                                                                                                             '';
+  '~*^ *(https?):/*(?::?@)?((?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))\.?(?:(:[0-9]+)|:)?(?:[/?#]|\z)'  $1://$2$3;
+  '~*^ *https?:/*(?::?@)?(?:[a-z0-9-]+\.)*(?:[0-9]+|0x[0-9a-f]*)\.?(?:[:/?#]|\z)'                                                                                     '';
+  '~*^ *(https?):/*(?::?@)?([a-z0-9-]+(?:\.[a-z0-9-]+)*\.?)(?:(:[0-9]+)|:)?(?:[/?#]|\z)'                                                                              $1://$2$3;
+}
+
 server {
   listen 80;
   server_name _;
 
   root /usr/share/nginx/html;
   index index.html;
+
+  # The Server header and nginx's built-in error pages name no version.
+  server_tokens off;
+
+  # The renderer leaves an undefined input as its literal placeholder, which
+  # nginx reads as the same-named nginx variable (names are case-insensitive)
+  # and would refuse to start on. These declarations give such an input the
+  # value "" on every request, so both /config.json and the security headers
+  # below read it as empty. An undefined API_BASE_URL is then served as an
+  # empty API base URL, for which the SPA shows its boot-error state: no
+  # default URL is supplied. An undefined WEB_ENVIRONMENT falls back to
+  # Production, the SPA's strict mode, through the environment map's default.
+  # The declared names are lower-case and stay out of the renderer only
+  # because envsubst matches names case-sensitively and the image limits
+  # substitution to the two upper-case inputs.
+  set $api_base_url "";
+  set $web_environment "";
+
+  # Security headers, sent with every response, error responses included
+  # ("always"). A location that sets add_header of its own would otherwise
+  # drop these, so add_header_inherit merge makes every location send its own
+  # headers, such as its Cache-Control, in addition to these.
+  # - X-Frame-Options and frame-ancestors: no page, this site's own included,
+  #   may show the SPA in a frame, so no other site can overlay its forms or
+  #   buttons (clickjacking).
+  # - X-Content-Type-Options: browsers use the Content-Type sent and never
+  #   sniff a response into another type.
+  # - Referrer-Policy: the SPA's URLs carry search criteria in their query
+  #   string, so no request or link leaving a page sends a Referer.
+  # - Content-Security-Policy:
+  #   - default-src 'self': every resource type not listed, such as images
+  #     and fonts, loads from this origin only.
+  #   - script-src: scripts are this origin's module bundles only, and they
+  #     use neither eval nor new Function. The one inline code allowed is an
+  #     event handler: the production build loads the global stylesheet as
+  #     <link rel="stylesheet" href="styles-<hash>.css" media="print"
+  #     onload="this.media='all'">, and the sha256 source is the hash of the
+  #     handler text this.media='all' exactly, which 'unsafe-hashes' lets
+  #     match an event-handler attribute. Without it the stylesheet stays
+  #     media="print" and the app renders unstyled. Recompute it with
+  #     printf "%s" "this.media='all'" | openssl dgst -sha256 -binary | base64
+  #     whenever the built index.html changes that handler.
+  #   - style-src 'unsafe-inline': index.html's own <style> for the
+  #     boot-loading and boot-error states, the critical CSS the build inlines
+  #     into it, and the <style> elements Angular inserts for component styles
+  #     at run time carry no nonce.
+  #   - connect-src: 'self' for /config.json, and the API's origin from the
+  #     map above.
+  #   - object-src 'none', base-uri 'self' and form-action 'self': no plugin
+  #     content, no <base> element pointing elsewhere and no form submission
+  #     to another origin.
+  add_header_inherit merge;
+  add_header X-Frame-Options "DENY" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+  add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-hashes' 'sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc='; style-src 'self' 'unsafe-inline'; connect-src 'self' $smarthotel_api_origin; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
 
   # No access log: the image's default format records the request line with
   # its query string, the referrer, the user agent and the client and
@@ -47,11 +134,14 @@ server {
 
   # Compresses text responses for clients that accept gzip, because the image's
   # base configuration leaves compression off and the bundles make up most of
-  # a first load. text/html is always compressed once gzip is on, so it is not
-  # listed. Vary tells caches that the body depends on Accept-Encoding, and
-  # requests forwarded by a TLS-terminating proxy, which adds a Via header,
-  # are compressed too. Bodies under 256 bytes gain nothing and are sent as
-  # they are.
+  # a first load. nginx counts text/html as eligible without it being listed,
+  # so gzip_types names only the other types. An eligible response, HTML
+  # included, is still compressed only when the request's Accept-Encoding
+  # allows gzip and the exchange meets nginx's other conditions, such as the
+  # proxy and size rules that follow. Vary tells caches that the body depends
+  # on Accept-Encoding, and requests forwarded by a TLS-terminating proxy,
+  # which adds a Via header, are compressed too. Bodies under 256 bytes gain
+  # nothing and are sent as they are.
   gzip on;
   gzip_vary on;
   gzip_comp_level 6;
@@ -61,18 +151,6 @@ server {
 
   # Runtime configuration fetched by the SPA before bootstrap.
   location = /config.json {
-    # The renderer leaves an undefined input as its literal placeholder, which
-    # nginx reads as the same-named nginx variable (names are case-insensitive)
-    # and would refuse to start on. These declarations give such an input the
-    # value "". An undefined API_BASE_URL is then served as an empty API base
-    # URL, for which the SPA shows its boot-error state: no default URL is
-    # supplied. An undefined WEB_ENVIRONMENT falls back to Production, the
-    # SPA's strict mode, through the environment map's default. The declared
-    # names are lower-case and stay out of the renderer only because envsubst
-    # matches names case-sensitively and the image limits substitution to the
-    # two upper-case inputs.
-    set $api_base_url "";
-    set $web_environment "";
     default_type application/json;
     add_header Cache-Control "no-store" always;
     return 200 '{"apiBaseUrl":"$smarthotel_api_base_url","environment":"$smarthotel_environment"}';
@@ -82,8 +160,8 @@ server {
   # build names a changed file afresh, so a name never changes content and
   # browsers keep it for a year without revalidating. A missing hashed file,
   # such as one an earlier build's index.html still names, is a 404, never the
-  # HTML shell. The header is left off error responses, so a 404 is never
-  # cached as immutable.
+  # HTML shell. This Cache-Control is left off error responses, so a 404 is
+  # never cached as immutable; the security headers are still sent with it.
   location ~* "^/[a-z]+-[A-Z0-9]{8}\.(js|css)$" {
     add_header Cache-Control "public, max-age=31536000, immutable";
     try_files $uri =404;

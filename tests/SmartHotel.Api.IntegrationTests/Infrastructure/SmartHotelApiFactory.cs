@@ -198,9 +198,10 @@ public sealed class SmartHotelApiFactory : WebApplicationFactory<Program>, IAsyn
     /// string the data layer refuses, are reported by their own exception types. When database initialization fails,
     /// for example on a failed migration, the API writes its sanitized initialization-failure record, disposes its
     /// host and returns from its entry point without serving, so the reported type is the
-    /// <see cref="ObjectDisposedException"/> of the disposed host rather than the original failure's. The database
-    /// and the role are dropped when the factory is disposed, which xUnit also does for a fixture whose initialization
-    /// threw; a creation that fails partway drops them itself.
+    /// <see cref="ObjectDisposedException"/> of the disposed host rather than the original failure's. Disposing the
+    /// factory attempts to drop the database and the role and reports a drop that fails; xUnit also disposes a fixture
+    /// whose initialization threw. A creation that fails partway attempts both drops itself before it reports the
+    /// failure, and that failure's message says when they did not succeed.
     /// </remarks>
     /// <returns>A task that completes once the host is serving requests.</returns>
     /// <exception cref="InvalidOperationException">

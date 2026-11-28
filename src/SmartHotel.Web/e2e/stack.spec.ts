@@ -37,9 +37,47 @@
  * so the alert's colour, weight and padding must come from the host page
  * itself.
  *
+ * The next tests cover the web server's security headers. One parameterized
+ * test requests the shell at `/`, a deep link with search criteria,
+ * `/config.json`, a hashed bundle the served shell names, and a hashed name
+ * the build does not hold. Every answer, that 404 included, must carry
+ * exactly one X-Frame-Options `DENY`, X-Content-Type-Options `nosniff`,
+ * Referrer-Policy `no-referrer` and Content-Security-Policy. The policy must
+ * deny framing, allow no script but this origin's and hashed event handlers,
+ * and let the page connect only to its own origin and the API origin of
+ * `apiUrl()`. The Cache-Control each location sets must be sent unchanged
+ * beside them, which leaves the 404 without one, and neither the Server
+ * header nor the body may name a server version. The other test loads the
+ * shell in the browser under that policy: the search page renders, the global
+ * stylesheet's load handler switches it to `media="all"`, and the page reports
+ * no policy violation and writes nothing to the console.
+ *
+ * The last test checks the policy a Production deployment is served with,
+ * which the stack under test, a Development one, cannot show. One
+ * parameterized test starts the runtime image the web Dockerfile names, with
+ * that file's template filter, the checkout's nginx template and
+ * `WEB_ENVIRONMENT=Production`, once per API base URL. connect-src must admit
+ * the API origin of a host with a trailing dot; of an upper-case scheme and
+ * host with the default port and a trailing slash; of an IPv4 address with a
+ * port and of one with a trailing dot; of a value with a leading space, no
+ * slashes, an empty user name and an empty port; and of a plain host. It must
+ * be `'self'` alone for an IPv6 literal and for a base URL with a user name.
+ * A page served under the rendered policy then requests the API origin the
+ * browser derives from the base URL, which must succeed exactly when it is
+ * admitted, and an unrelated origin, which Chromium must refuse every time.
+ * The container publishes no port and the page's requests are answered in
+ * the browser, so this test reaches neither the stack nor the network.
+ *
  * API requests use absolute URLs from `apiUrl()`, because the configured
- * `baseURL` is the web origin.
+ * `baseURL` is the web origin. The security-header tests send nothing to the
+ * API, so they also pass against a web server the API's CORS policy does not
+ * admit.
  */
+import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+
 import {
   test,
   expect,
@@ -137,6 +175,99 @@ const CLOCK_INSTALLED_AT = new Date('2026-06-01T08:00:00Z');
  * exists to fire across the jump.
  */
 const CLOCK_PAUSED_AT = new Date('2026-06-02T08:00:00Z');
+
+/**
+ * A path in the build's hashed-bundle form that the served build does not
+ * hold, so the web server's hashed-asset location answers it with a 404
+ * rather than the HTML shell.
+ */
+const MISSING_HASHED_FILE = '/main-ZZZZZZZZ.js';
+
+/** The security headers every web server response carries, with their exact values. */
+const SECURITY_HEADERS: ReadonlyArray<readonly [string, string]> = [
+  ['x-frame-options', 'DENY'],
+  ['x-content-type-options', 'nosniff'],
+  ['referrer-policy', 'no-referrer'],
+];
+
+/**
+ * The Content-Security-Policy directives with a fixed source list, in the
+ * order the web server sends their sources. `connect-src`, which names the
+ * target's API origin, and `script-src`, which carries the build's handler
+ * hash, are checked on their own.
+ */
+const FIXED_CSP_DIRECTIVES: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ['default-src', ["'self'"]],
+  ['style-src', ["'self'", "'unsafe-inline'"]],
+  ['object-src', ["'none'"]],
+  ['base-uri', ["'self'"]],
+  ['form-action', ["'self'"]],
+  ['frame-ancestors', ["'none'"]],
+];
+
+/**
+ * The only `script-src` sources the policy may hold: this origin, the keyword
+ * that lets a hash match an event-handler attribute, and SHA-256 hashes. Any
+ * other source, `'unsafe-inline'` or `'unsafe-eval'` among them, would allow
+ * script the build does not ship.
+ */
+const ALLOWED_SCRIPT_SOURCE = /^(?:'self'|'unsafe-hashes'|'sha256-[A-Za-z0-9+/]+={0,2}')$/;
+
+/**
+ * The web workspace, the parent of this spec's directory: it holds the web
+ * image's Dockerfile and the nginx template.
+ */
+const WEB_WORKSPACE = join(__dirname, '..');
+
+/**
+ * Where the web image's runtime stage reads the nginx template, and where the
+ * production render mounts the checkout's template.
+ */
+const TEMPLATE_TARGET = '/etc/nginx/templates/default.conf.template';
+
+/** Runs a command and resolves with its output once it exits with code 0. */
+const execFileAsync = promisify(execFile);
+
+/**
+ * Upper bound for one production render: the `docker run` of the runtime
+ * image, its template rendering, the nginx start and the header request,
+ * with room for a first pull of the pinned image.
+ */
+const RENDER_TIMEOUT_MS = 120_000;
+
+/**
+ * Upper bound, in seconds, for the image's entrypoint inside the render
+ * container. With {@link RENDER_REQUEST_TIMEOUT_S} it lets the container end
+ * by itself even when the `docker` CLI that started it is stopped.
+ */
+const RENDER_ENTRYPOINT_TIMEOUT_S = 30;
+
+/** Upper bound, in seconds, for the header request inside the render container. */
+const RENDER_REQUEST_TIMEOUT_S = 10;
+
+/**
+ * The line the render container prints before the response headers, which
+ * keeps them apart from anything else written to its output.
+ */
+const HEADERS_BEGIN = '--- smarthotel-web response headers begin ---';
+
+/** The line the render container prints after the response headers. */
+const HEADERS_END = '--- smarthotel-web response headers end ---';
+
+/** The most lines of a failed render's error output that its error message quotes: its last ones. */
+const RENDER_OUTPUT_MAX_LINES = 20;
+
+/** The page origin the production-policy browser check serves its document from. */
+const POLICY_PAGE_ORIGIN = 'https://app.example.test';
+
+/** An origin that is not the API's: the production policy must refuse the page's requests to it. */
+const UNRELATED_ORIGIN = 'https://evil.example.test';
+
+/**
+ * How long the production-policy browser check waits for the browser to
+ * report the refused request to {@link UNRELATED_ORIGIN}.
+ */
+const VIOLATION_REPORT_TIMEOUT_MS = 5_000;
 
 /** Matches the SPA's request for its runtime configuration. */
 function isConfigRequest(url: URL): boolean {
@@ -256,6 +387,292 @@ const CONFIG_FAILURES: readonly ConfigFailure[] = [
     name: '/config.json does not answer within the configuration deadline',
   },
 ];
+
+/**
+ * Reads the served shell and returns the path of the main bundle it names, a
+ * hashed file such as `/main-VNW5AL5S.js`.
+ *
+ * @throws Error when the shell names no `main-<hash>.js` script.
+ */
+async function hashedBundlePath(web: APIRequestContext): Promise<string> {
+  const shell = await web.get('/', NO_REDIRECTS);
+  expect(shell.status(), 'GET / for the shell').toBe(200);
+  const bundle = /<script src="(main-[A-Z0-9]{8}\.js)"/.exec(await shell.text());
+  if (bundle === null) {
+    throw new Error('The served shell names no main-<hash>.js bundle.');
+  }
+  return `/${bundle[1]}`;
+}
+
+/** One web server response whose headers the security-header test checks. */
+interface WebResponseCase {
+  /** The response, as the test name states it. */
+  name: string;
+  /** The path to request on the web origin, or a function that reads it from the web server first. */
+  path: string | ((web: APIRequestContext) => Promise<string>);
+  /** The status the web server must answer with. */
+  status: number;
+  /**
+   * The answering location's own Cache-Control, which the security headers
+   * must not displace; absent when the response must carry none.
+   */
+  cacheControl?: string;
+}
+
+/** Every kind of web server response the security headers must reach. */
+const SECURITY_HEADER_CASES: readonly WebResponseCase[] = [
+  { name: 'the shell at /', path: '/', status: 200, cacheControl: 'no-cache' },
+  { name: 'the deep link /search?city=Seattle', path: '/search?city=Seattle', status: 200, cacheControl: 'no-cache' },
+  { name: '/config.json', path: '/config.json', status: 200, cacheControl: 'no-store' },
+  {
+    name: 'the hashed main bundle the shell names',
+    path: hashedBundlePath,
+    status: 200,
+    cacheControl: 'public, max-age=31536000, immutable',
+  },
+  {
+    // The hashed-asset location's immutable Cache-Control stays off its 404.
+    name: `the missing hashed file ${MISSING_HASHED_FILE} (404)`,
+    path: MISSING_HASHED_FILE,
+    status: 404,
+  },
+];
+
+/**
+ * Returns the value of the one `name` header `response` carries, and fails
+ * when it carries none or several: a second copy would mean a location sends
+ * the header again instead of adding its own headers to the server's.
+ *
+ * @param name - The header name, lower-cased.
+ */
+function singleHeader(response: APIResponse, name: string): string {
+  const values = response
+    .headersArray()
+    .filter((header) => header.name.toLowerCase() === name)
+    .map((header) => header.value);
+  expect(values, `${name} headers`).toHaveLength(1);
+  return values[0];
+}
+
+/**
+ * Parses a Content-Security-Policy into its directives, each lower-cased name
+ * mapped to its source list. A repeated directive keeps its first occurrence,
+ * as browsers do.
+ */
+function cspDirectives(policy: string): Map<string, string[]> {
+  const directives = new Map<string, string[]>();
+  for (const directive of policy.split(';')) {
+    const [name, ...sources] = directive.trim().split(/\s+/);
+    const key = name.toLowerCase();
+    if (key !== '' && !directives.has(key)) {
+      directives.set(key, sources);
+    }
+  }
+  return directives;
+}
+
+/** Where the browser test's init script keeps the policy violations the page reports. */
+interface CspViolationLog {
+  smarthotelCspViolations?: string[];
+}
+
+/** One production API base URL whose rendered policy the production-policy test checks. */
+interface ProductionOriginCase {
+  /** What the base URL exercises, as the test name states it. */
+  name: string;
+  /** The `API_BASE_URL` the web server is started with. */
+  apiBaseUrl: string;
+  /**
+   * Whether connect-src must admit the API origin the browser derives from
+   * {@link apiBaseUrl}. When it must not, connect-src is `'self'` alone.
+   */
+  admitted: boolean;
+}
+
+/**
+ * Production base URLs in the forms a deployment can write. The admitted ones
+ * are each a base URL the SPA accepts in Production, written in a form the
+ * browser's URL parser rewrites before it sends a request: the policy must
+ * name the origin the SPA actually calls. The others must leave connect-src
+ * at `'self'`, never widen it.
+ */
+const PRODUCTION_ORIGIN_CASES: readonly ProductionOriginCase[] = [
+  { name: 'a host with a trailing dot', apiBaseUrl: 'https://api.example.test./api', admitted: true },
+  {
+    name: 'an upper-case scheme and host, the default port and a trailing slash',
+    apiBaseUrl: 'HTTPS://API.Example.TEST:443/api/',
+    admitted: true,
+  },
+  { name: 'an IPv4 address with a port', apiBaseUrl: 'https://192.0.2.10:8443/api', admitted: true },
+  { name: 'an IPv4 address with a trailing dot', apiBaseUrl: 'https://192.0.2.10./api', admitted: true },
+  {
+    name: 'a leading space, no slashes, an empty user name and an empty port',
+    apiBaseUrl: ' https:@api.example.test:/api',
+    admitted: true,
+  },
+  { name: 'a plain host', apiBaseUrl: 'https://api.example.test/api', admitted: true },
+  {
+    name: 'an IPv6 literal, which no source expression can name',
+    apiBaseUrl: 'https://[2001:db8::1]/api',
+    admitted: false,
+  },
+  { name: 'a user name, which the SPA rejects', apiBaseUrl: 'https://user@api.example.test/api', admitted: false },
+];
+
+/** The runtime stage of the web image, as its Dockerfile sets it. */
+interface WebRuntime {
+  /** The final stage's base image, which serves the SPA. */
+  image: string;
+  /** The image's `NGINX_ENVSUBST_FILTER`, which limits template substitution to its two inputs. */
+  envsubstFilter: string;
+}
+
+/**
+ * Reads the runtime image and the template filter from the web image's
+ * Dockerfile, so the production render runs what the image runs.
+ *
+ * @throws Error when the Dockerfile names no stage or no filter.
+ */
+function webRuntime(): WebRuntime {
+  const dockerfile = readFileSync(join(WEB_WORKSPACE, 'Dockerfile'), 'utf8');
+  const stages = [...dockerfile.matchAll(/^FROM\s+(?:--\S+\s+)*(\S+)/gim)].map((stage) => stage[1]);
+  const filter = /^ENV\s+NGINX_ENVSUBST_FILTER=(?:'([^']*)'|([^\s'"]+))\s*$/m.exec(dockerfile);
+  if (stages.length === 0 || filter === null) {
+    throw new Error('The web Dockerfile names no FROM stage or no single-quoted or unquoted NGINX_ENVSUBST_FILTER.');
+  }
+  return { image: stages[stages.length - 1], envsubstFilter: filter[1] ?? filter[2] };
+}
+
+/** The members of the error `execFile` rejects with that a failed render reports. */
+interface ExecFailure {
+  /** The exit code, or a Node.js error code such as `ENOENT` when `docker` could not run. */
+  code?: unknown;
+  /** Whether the command was stopped, as it is at its deadline. */
+  killed?: unknown;
+  /** What the command wrote to stderr. */
+  stderr?: unknown;
+}
+
+/**
+ * Describes a failed production render in one message: the base URL and
+ * image, why `docker run` failed, and the last lines of its error output with
+ * control characters removed, each prefixed `  docker | ` so it cannot pass
+ * for this message. A Node.js error code is named only when it has the shape
+ * of one. The container's environment holds only the case's fixed values and
+ * the image's own, so that output can name nothing else.
+ */
+function renderFailure(apiBaseUrl: string, image: string, error: unknown): string {
+  const failure = (typeof error === 'object' && error !== null ? error : {}) as ExecFailure;
+  let reason = 'docker could not be run';
+  if (typeof failure.code === 'number') {
+    reason = `exit code ${failure.code}`;
+  } else if (typeof failure.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(failure.code)) {
+    reason = `docker could not be run: ${failure.code}`;
+  } else if (failure.killed === true) {
+    reason = `stopped after ${RENDER_TIMEOUT_MS} ms`;
+  }
+  const output = typeof failure.stderr === 'string' ? failure.stderr : '';
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) =>
+      [...line]
+        .filter((ch) => {
+          const code = ch.codePointAt(0) ?? 0;
+          return code >= 0x20 && (code < 0x7f || code > 0x9f);
+        })
+        .join(''),
+    )
+    .filter((line) => line.trim() !== '')
+    .slice(-RENDER_OUTPUT_MAX_LINES);
+  return [
+    `Rendering the nginx template in ${image} for API_BASE_URL ${JSON.stringify(apiBaseUrl)} failed (${reason}).`,
+    ...lines.map((line) => `  docker | ${line}`),
+  ].join('\n');
+}
+
+/**
+ * Starts the web image's runtime image as a Production deployment would, with
+ * `apiBaseUrl` as `API_BASE_URL` and the checkout's nginx template mounted
+ * read-only where the image keeps its own, and returns the one
+ * Content-Security-Policy nginx sends for `/`.
+ *
+ * The container publishes no port and has no network but its loopback: its
+ * entrypoint renders the template and starts nginx, and curl inside it then
+ * requests the headers. The image's input guard is not run: it only clears a
+ * value holding a single quote, a dollar sign or a backslash, which no case
+ * holds.
+ *
+ * @throws Error when the container fails, outlives {@link RENDER_TIMEOUT_MS}
+ *   or prints no header block.
+ */
+async function renderProductionPolicy(apiBaseUrl: string): Promise<string> {
+  const runtime = webRuntime();
+  // --mount reads its value as one CSV record, so the path is a quoted field
+  // and a comma or quote in it stays part of the path.
+  const templateSource = `"source=${join(WEB_WORKSPACE, 'nginx', 'default.conf.template').replace(/"/g, '""')}"`;
+  const script = [
+    `timeout ${RENDER_ENTRYPOINT_TIMEOUT_S} /docker-entrypoint.sh nginx >&2`,
+    `echo '${HEADERS_BEGIN}'`,
+    `curl -sS --max-time ${RENDER_REQUEST_TIMEOUT_S} -I http://127.0.0.1/`,
+    `echo '${HEADERS_END}'`,
+  ].join(' && ');
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      'docker',
+      [
+        'run',
+        '--rm',
+        '--network',
+        'none',
+        '--env',
+        `API_BASE_URL=${apiBaseUrl}`,
+        '--env',
+        'WEB_ENVIRONMENT=Production',
+        '--env',
+        `NGINX_ENVSUBST_FILTER=${runtime.envsubstFilter}`,
+        '--mount',
+        `type=bind,${templateSource},target=${TEMPLATE_TARGET},readonly`,
+        runtime.image,
+        'sh',
+        '-c',
+        script,
+      ],
+      { encoding: 'utf8', timeout: RENDER_TIMEOUT_MS, killSignal: 'SIGKILL' },
+    ));
+  } catch (error) {
+    throw new Error(renderFailure(apiBaseUrl, runtime.image, error));
+  }
+
+  const begin = stdout.indexOf(`${HEADERS_BEGIN}\n`);
+  const end = stdout.indexOf(HEADERS_END, begin);
+  if (begin === -1 || end === -1) {
+    throw new Error(
+      `The production render for API_BASE_URL ${JSON.stringify(apiBaseUrl)} printed no response headers.`,
+    );
+  }
+  const policies = stdout
+    .slice(begin + HEADERS_BEGIN.length + 1, end)
+    .split(/\r?\n/)
+    .filter((line) => /^content-security-policy:/i.test(line))
+    .map((line) => line.slice(line.indexOf(':') + 1).trim());
+  expect(policies, `Content-Security-Policy headers for API_BASE_URL ${JSON.stringify(apiBaseUrl)}`).toHaveLength(1);
+  return policies[0];
+}
+
+/** What the production-policy browser check observed in its page. */
+interface PolicyProbe {
+  /** The API origin the browser derives from the base URL, as the SPA does. */
+  apiOrigin: string;
+  /** The outcome of the page's request to the API origin: `HTTP <status>` or `refused`. */
+  api: string;
+  /** The outcome of the page's request to {@link UNRELATED_ORIGIN}. */
+  unrelated: string;
+  /** Each policy violation the page reported, as `<directive> <origin of the refused URL>`. */
+  violations: string[];
+  /** Whether the refusal of the unrelated request was reported within {@link VIOLATION_REPORT_TIMEOUT_MS}. */
+  unrelatedReported: boolean;
+}
 
 /** Builds an absolute API URL with `query` encoded, so `New York` is safe. */
 function apiQueryUrl(path: string, query: Record<string, string>): string {
@@ -481,6 +898,184 @@ for (const failure of CONFIG_FAILURES) {
       expect(appConsole, 'app console output').toEqual([]);
     } finally {
       config.release();
+      await page.unrouteAll({ behavior: 'wait' });
+    }
+  });
+}
+
+for (const target of SECURITY_HEADER_CASES) {
+  test(`security headers on ${target.name}: framing denied, nosniff, no-referrer and the Content-Security-Policy, with the location's own Cache-Control unchanged and no server version`, async ({
+    request: web,
+  }) => {
+    const path = typeof target.path === 'string' ? target.path : await target.path(web);
+    const response = await web.get(path, NO_REDIRECTS);
+    expect(response.status(), `GET ${path}`).toBe(target.status);
+
+    for (const [name, value] of SECURITY_HEADERS) {
+      expect(singleHeader(response, name), name).toBe(value);
+    }
+
+    const policy = cspDirectives(singleHeader(response, 'content-security-policy'));
+    for (const [name, sources] of FIXED_CSP_DIRECTIVES) {
+      expect(policy.get(name), `CSP ${name}`).toEqual(sources);
+    }
+    expect(policy.get('connect-src'), 'CSP connect-src').toEqual(["'self'", new URL(apiUrl()).origin]);
+    const scriptSources = policy.get('script-src') ?? [];
+    expect(scriptSources, 'CSP script-src').toContain("'self'");
+    expect(
+      scriptSources.filter((source) => !ALLOWED_SCRIPT_SOURCE.test(source)),
+      'CSP script-src sources other than self, unsafe-hashes and SHA-256 hashes',
+    ).toEqual([]);
+
+    expect(response.headers()['cache-control'], 'Cache-Control').toBe(target.cacheControl);
+    expect(response.headers()['server'] ?? '', 'Server header').not.toMatch(/\d/);
+    expect(await response.text(), 'body').not.toMatch(/nginx\/\d/);
+  });
+}
+
+test('security headers in the browser: under the Content-Security-Policy the shell boots, applies the global stylesheet and reports no violation', async ({
+  page,
+}) => {
+  // Registered before any page script runs, so a violation while the shell
+  // is parsed, such as a blocked stylesheet load handler, is recorded too.
+  await page.addInitScript(() => {
+    const violations: string[] = [];
+    (window as unknown as CspViolationLog).smarthotelCspViolations = violations;
+    document.addEventListener('securitypolicyviolation', (event) => {
+      violations.push(`${event.effectiveDirective}: ${event.blockedURI || 'inline code'}`);
+    });
+  });
+  const appConsole = recordAppConsole(page);
+
+  const shell = await page.goto('/');
+  expect(shell?.status(), 'GET / for the shell').toBe(200);
+  expect(shell?.headers()['content-security-policy'] ?? '', "the shell's Content-Security-Policy").toContain(
+    "frame-ancestors 'none'",
+  );
+
+  // The search page renders only once the module bundles have run and
+  // /config.json has loaded, which script-src and connect-src must allow.
+  await expect(page).toHaveURL(/\/search$/);
+  await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel', exact: true })).toBeVisible();
+
+  // The build loads the global stylesheet as media="print" and lets its
+  // inline load handler switch it to all, which the policy allows by hash.
+  const stylesheet = page.locator('head > link[rel="stylesheet"]');
+  await expect(stylesheet).toHaveCount(1);
+  await expect(stylesheet).toHaveAttribute('href', /^styles-[A-Z0-9]+\.css$/);
+  await expect(stylesheet).toHaveAttribute('media', 'all');
+
+  const violations = await page.evaluate(
+    () => (window as unknown as CspViolationLog).smarthotelCspViolations ?? null,
+  );
+  expect(violations, 'policy violations the page reported').toEqual([]);
+  expect(appConsole, 'console output').toEqual([]);
+});
+
+for (const target of PRODUCTION_ORIGIN_CASES) {
+  test(`production Content-Security-Policy for API_BASE_URL ${JSON.stringify(target.apiBaseUrl)}, ${target.name}: connect-src ${target.admitted ? 'admits the API origin, which Chromium matches' : "is 'self' alone"}, and a request to an unrelated origin is refused`, async ({
+    page,
+  }) => {
+    test.setTimeout(RENDER_TIMEOUT_MS + 30_000);
+
+    const renderedPolicy = await renderProductionPolicy(target.apiBaseUrl);
+    const policy = cspDirectives(renderedPolicy);
+    for (const [name, sources] of FIXED_CSP_DIRECTIVES) {
+      expect(policy.get(name), `CSP ${name}`).toEqual(sources);
+    }
+    const connectSources = policy.get('connect-src') ?? [];
+    expect(connectSources, 'CSP connect-src').toHaveLength(target.admitted ? 2 : 1);
+    expect(connectSources[0], "CSP connect-src's first source").toBe("'self'");
+
+    // The page is served under the rendered policy, and every request the
+    // browser sends is answered here, so nothing leaves it.
+    const reached: string[] = [];
+    await page.route(
+      () => true,
+      async (route) => {
+        const url = new URL(route.request().url());
+        if (url.origin === POLICY_PAGE_ORIGIN) {
+          await route.fulfill(
+            url.pathname === '/'
+              ? {
+                  status: 200,
+                  contentType: 'text/html',
+                  headers: { 'content-security-policy': renderedPolicy },
+                  body: '<!doctype html><title>SmartHotel policy check</title>',
+                }
+              : { status: 404 },
+          );
+          return;
+        }
+        reached.push(url.origin);
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/plain',
+          headers: { 'access-control-allow-origin': POLICY_PAGE_ORIGIN },
+          body: 'Healthy',
+        });
+      },
+    );
+    try {
+      await page.goto(`${POLICY_PAGE_ORIGIN}/`);
+      const probe = await page.evaluate(
+        async ({ apiBaseUrl, unrelatedOrigin, reportTimeoutMs }): Promise<PolicyProbe> => {
+          // The origin the SPA calls: it parses the base URL the same way.
+          const apiOrigin = new URL(apiBaseUrl).origin;
+          const violations: string[] = [];
+          let markReported = (): void => undefined;
+          const reported = new Promise<boolean>((resolve) => {
+            markReported = () => resolve(true);
+          });
+          document.addEventListener('securitypolicyviolation', (event) => {
+            const origin = /^https?:/i.test(event.blockedURI) ? new URL(event.blockedURI).origin : event.blockedURI;
+            violations.push(`${event.effectiveDirective} ${origin}`);
+            if (origin === unrelatedOrigin) {
+              markReported();
+            }
+          });
+          const attempt = async (url: string): Promise<string> => {
+            try {
+              return `HTTP ${(await fetch(url)).status}`;
+            } catch {
+              return 'refused';
+            }
+          };
+          const api = await attempt(`${apiOrigin}/api/health`);
+          const unrelated = await attempt(`${unrelatedOrigin}/api/health`);
+          // The page reports violations in the order the browser refuses the
+          // requests, so once the unrelated request's report is in, a report
+          // for the API request would be in as well.
+          const unrelatedReported = await Promise.race([
+            reported,
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), reportTimeoutMs)),
+          ]);
+          return { apiOrigin, api, unrelated, violations: [...violations], unrelatedReported };
+        },
+        {
+          apiBaseUrl: target.apiBaseUrl,
+          unrelatedOrigin: UNRELATED_ORIGIN,
+          reportTimeoutMs: VIOLATION_REPORT_TIMEOUT_MS,
+        },
+      );
+
+      expect(probe.unrelatedReported, `the page reported the refused request to ${UNRELATED_ORIGIN}`).toBe(true);
+      expect(probe.unrelated, `the request to ${UNRELATED_ORIGIN}`).toBe('refused');
+      expect(probe.api, `the request to the API origin ${probe.apiOrigin}`).toBe(
+        target.admitted ? 'HTTP 200' : 'refused',
+      );
+      const refusedOrigins = target.admitted ? [UNRELATED_ORIGIN] : [probe.apiOrigin, UNRELATED_ORIGIN];
+      expect(probe.violations, 'policy violations the page reported').toEqual(
+        refusedOrigins.map((origin) => `connect-src ${origin}`),
+      );
+      expect(reached, 'origins the page reached').toEqual(target.admitted ? [probe.apiOrigin] : []);
+      if (target.admitted) {
+        // The API source names exactly the origin the browser calls, in
+        // whatever form the base URL wrote it.
+        expect(connectSources[1], "CSP connect-src's API source").toMatch(/^https:\/\/[^*]+$/i);
+        expect(new URL(connectSources[1]).origin, "CSP connect-src's API source as an origin").toBe(probe.apiOrigin);
+      }
+    } finally {
       await page.unrouteAll({ behavior: 'wait' });
     }
   });

@@ -12,7 +12,6 @@ import {
 } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, DOCUMENT, DatePipe, NgFor, NgIf } from '@angular/common';
-import { HttpErrorResponse } from '@angular/common/http';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import type { ActivatedRouteSnapshot, RouterStateSnapshot } from '@angular/router';
 import { Subject, catchError, distinctUntilChanged, finalize, map, merge, of, switchMap, take, tap } from 'rxjs';
@@ -394,7 +393,7 @@ export class HotelDetailPageComponent {
     // that arrives once the app's teardown has destroyed the page.
     this.bookings.create(request).subscribe({
       next: (booking: Booking) => this.afterLoad(() => this.booked(attempt, booking, trigger)),
-      error: (err: HttpErrorResponse) => {
+      error: (err: unknown) => {
         const error = toUiError(err);
         this.afterLoad(() => this.bookingFailed(attempt, error, trigger));
       },
@@ -596,7 +595,7 @@ export class HotelDetailPageComponent {
         this.hotel.set(detail);
         answered = true;
       }),
-      catchError((err: HttpErrorResponse) => {
+      catchError((err: unknown) => {
         this.hotel.set(null);
         this.loadError.set(toUiError(err));
         answered = true;
@@ -637,7 +636,7 @@ export class HotelDetailPageComponent {
         this.hotel.set(detail);
         settled = true;
       }),
-      catchError((err: HttpErrorResponse) => {
+      catchError((err: unknown) => {
         this.hotel.set(null);
         this.loadError.set(toUiError(err));
         settled = true;

@@ -1,15 +1,18 @@
 /**
- * Maps a failed `HttpClient` response to the single shape every inline error
+ * Maps a failed `HttpClient` request to the single shape every inline error
  * renders from.
  *
  * The API answers every 4xx and 5xx status with an `application/problem+json`
  * body carrying `type`, `title`, `status`, `detail` and `traceId`; a 400 also
  * carries `errors`, an object mapping each invalid field to its messages. Only
- * a response whose `Content-Type` declares that media type is read as a
+ * a 4xx response whose `Content-Type` declares that media type is read as a
  * problem, so a JSON error from anything else, such as a proxy, gets the
  * generic text. Only `title`, `detail` and `errors` are read, and a value that
  * is empty or only whitespace counts as absent. The response status, not the
  * body's `status`, is authoritative, and `type` and `traceId` are never shown.
+ * A 5xx body is never read, whatever its media type: it reports a fault of the
+ * server, not of the request, and text from a misconfigured server or proxy
+ * could expose its internals, so every 5xx gets the generic text.
  *
  * Status `0` covers every request that got no response: a network failure, a
  * CORS rejection, the service down, or a request that passed its
@@ -18,11 +21,19 @@
  * {@link withRequestDeadline}, which turns an expired wait into such a status-0
  * error, so a peer that never answers ends in the same inline error.
  *
- * A 2xx status reaches the mapping only for a success response whose body the
- * app cannot use: one that failed its client's shape check under
- * {@link withResponseBody}, or JSON that `HttpClient` could not parse. Both
- * arrive as an `HttpErrorResponse` carrying that status, so a malformed success
- * body ends in an inline error too, never in a page reading a missing field.
+ * The error channel of an observable is untyped, so a request can also fail
+ * with a value that is not an `HttpErrorResponse`, such as an exception thrown
+ * synchronously while the request was being sent, which `loadingInterceptor`
+ * and `HttpClient` forward as an error notification. No HTTP response was
+ * received for it, so it maps to status `0` as well, and nothing of it, its
+ * message and stack included, is read or shown.
+ *
+ * A 2xx status reaches the mapping only for a success response the app cannot
+ * use: one whose client rejected its status, or its body, such as a body that
+ * failed its shape check under {@link withResponseBody}, or JSON that
+ * `HttpClient` could not parse. Each arrives as an `HttpErrorResponse`
+ * carrying the response's own status, so such a response ends in an inline
+ * error too, never in a page reading a missing field.
  *
  * Nothing here logs: an error body can echo user input. The result is plain
  * text that consumers render through interpolation only, never as HTML.
@@ -58,10 +69,10 @@ const FIELD_LABELS: ReadonlyMap<string, string> = new Map<string, string>([
 ]);
 
 /**
- * How long, in milliseconds, a request bounded by {@link withRequestDeadline}
- * may wait for its response before the operator aborts it: 30 seconds. That is
- * far above the API's one-second search latency target, so only a peer that
- * has stopped answering reaches it.
+ * Time, in milliseconds, allowed for a request bounded by
+ * {@link withRequestDeadline} to deliver its response, body included, before
+ * the operator aborts it: 30 seconds. It is a failure bound that keeps a page
+ * from waiting indefinitely, not the search performance target.
  */
 export const REQUEST_DEADLINE_MS = 30_000;
 
@@ -99,9 +110,9 @@ export function withRequestDeadline<T>(url: string): MonoTypeOperatorFunction<T>
  * the operator emits the response's body when `isBody` accepts it. Otherwise it
  * fails with an `HttpErrorResponse` carrying the response's own 2xx status,
  * URL and headers, statusText "Unexpected response body" and no body, which
- * {@link toUiError} maps to "The service sent an unexpected response.". The
- * caller therefore receives an `HttpErrorResponse` for every failure, as for
- * any other request. Errors from upstream pass through unchanged.
+ * {@link toUiError} maps to "The service sent an unexpected response.". Only
+ * a rejected body is converted: errors from upstream, and an exception that
+ * `isBody` throws, pass through unchanged, whatever their type.
  *
  * The operator never retries and never logs: the body can echo user input.
  *
@@ -130,54 +141,68 @@ export function withResponseBody<T>(
  * shows `title`, then `detail` when it is not `null`, then each field message.
  */
 export interface UiError {
-  /** HTTP status of the failed response; `0` when the service was unreachable. */
+  /**
+   * HTTP status of the failed response; `0` when no HTTP response was
+   * received: the service was unreachable, the request passed its deadline,
+   * or the request failed with a value that is not an `HttpErrorResponse`.
+   */
   status: number;
   /** Headline of the error; never empty or only whitespace. */
   title: string;
   /**
-   * Explanation of the error, or `null` when the response carried none or only
-   * whitespace.
+   * Explanation of the error from a 4xx problem body, or `null` when that body
+   * carried none or only whitespace, and for every other failure.
    */
   detail: string | null;
   /**
    * Validation messages per request field, in the order and with the field-name
    * casing the server sent. Blank messages are dropped, and a field left with
-   * no message is omitted. Empty when the response reported no field errors.
+   * no message is omitted. Empty when the response reported no field errors,
+   * and for every failure but a 4xx problem.
    */
   fieldErrors: { field: string; messages: string[] }[];
 }
 
 /**
- * Converts a failed `HttpClient` response into a {@link UiError}.
+ * Converts the value a failed `HttpClient` request delivered on its error
+ * channel into a {@link UiError}.
  *
  * The rules apply in this order, and the first that matches decides:
- * 1. Status `0` (network failure, CORS rejection, the service down, or a
+ * 1. A value that is not an `HttpErrorResponse`, such as an exception thrown
+ *    synchronously while the request was being sent, means no HTTP response
+ *    was received. It gives status `0` and the title "The service is
+ *    unreachable." with no detail and no field errors. Nothing of the value,
+ *    its message and stack included, is read.
+ * 2. Status `0` (network failure, CORS rejection, the service down, or a
  *    request that passed its deadline under {@link withRequestDeadline}) gives
- *    the title "The service is unreachable." with no detail and no field
- *    errors.
- * 2. A 2xx status (a success body that failed its check under
- *    {@link withResponseBody}, or JSON that `HttpClient` could not parse) gives
- *    the title "The service sent an unexpected response." with no detail and
- *    no field errors.
- * 3. A response whose `Content-Type` media type, without parameters and
+ *    the same title with no detail and no field errors.
+ * 3. A 2xx status (a success response whose client rejected its status or its
+ *    body, such as a body that failed its check under {@link withResponseBody},
+ *    or JSON that `HttpClient` could not parse) gives the title "The service
+ *    sent an unexpected response." with no detail and no field errors.
+ * 4. A 4xx response whose `Content-Type` media type, without parameters and
  *    ignoring case, is `application/problem+json` and whose body is a JSON
  *    object is read as ProblemDetails: a string `title` with non-whitespace
  *    text is used, otherwise a generic "Request failed (status)." title; a
  *    string `detail` with non-whitespace text is used, otherwise `null`; and
  *    each `errors` entry whose value is an array keeps its string messages with
  *    non-whitespace text, dropping entries left with none.
- * 4. Any other response (another or no media type, or a body that is text, an
- *    array, `null` or absent) gives the generic title with no detail and no
- *    field errors.
+ * 5. Any other response gives the generic title with no detail and no field
+ *    errors: a 4xx with another or no media type, or with a body that is
+ *    text, an array, `null` or absent, and every 5xx or other status whatever
+ *    its media type and body, so a server fault never shows the server's text.
  *
  * Text that is kept is returned exactly as the server sent it, untrimmed. The
- * status is always the response's own. The function is pure.
+ * status is the response's own, and `0` when no response was received. The
+ * function is pure.
  *
- * @param error - The error `HttpClient` emitted for the failed request.
+ * @param error - Any value the failed request's error channel delivered:
+ *   normally the `HttpErrorResponse` that `HttpClient` emitted, but the
+ *   channel is untyped, so every other value is accepted too.
  * @returns The error to render inline.
  */
-export function toUiError(error: HttpErrorResponse): UiError {
-  if (error.status === 0) {
+export function toUiError(error: unknown): UiError {
+  if (!(error instanceof HttpErrorResponse) || error.status === 0) {
     return { status: 0, title: UNREACHABLE_TITLE, detail: null, fieldErrors: [] };
   }
   if (error.status >= 200 && error.status < 300) {
@@ -185,7 +210,7 @@ export function toUiError(error: HttpErrorResponse): UiError {
   }
 
   const body: unknown = error.error;
-  if (!isProblemResponse(error) || !isRecord(body)) {
+  if (error.status < 400 || error.status >= 500 || !isProblemResponse(error) || !isRecord(body)) {
     return { status: error.status, title: genericTitle(error.status), detail: null, fieldErrors: [] };
   }
 

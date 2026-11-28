@@ -325,9 +325,9 @@ export class LoginPageComponent {
               }
             });
         },
-        error: (err: HttpErrorResponse) => {
+        error: (err: unknown) => {
           this.showError(
-            err.status === 401
+            err instanceof HttpErrorResponse && err.status === 401
               ? { ...toUiError(err), title: WRONG_CREDENTIALS_TITLE, detail: null, fieldErrors: [] }
               : toUiError(err),
           );

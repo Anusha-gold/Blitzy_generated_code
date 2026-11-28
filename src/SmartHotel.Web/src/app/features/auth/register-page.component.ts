@@ -15,7 +15,7 @@ import {
 } from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { DOCUMENT } from '@angular/common';
-import type { HttpErrorResponse } from '@angular/common/http';
+import { HttpErrorResponse } from '@angular/common/http';
 import { NonNullableFormBuilder, ReactiveFormsModule } from '@angular/forms';
 import { NavigationStart, Router, RouterLink, type Params } from '@angular/router';
 import { filter, finalize, take } from 'rxjs';
@@ -216,9 +216,9 @@ export class RegisterPageComponent {
             }
           });
         },
-        error: (err: HttpErrorResponse) => {
+        error: (err: unknown) => {
           this.showError(
-            err.status === 409
+            err instanceof HttpErrorResponse && err.status === 409
               ? { ...toUiError(err), title: EMAIL_TAKEN_TITLE, detail: null, fieldErrors: [] }
               : toUiError(err),
           );
