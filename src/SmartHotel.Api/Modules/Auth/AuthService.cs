@@ -72,9 +72,10 @@ public sealed partial class AuthService(
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The email is stored normalized, the full name trimmed, and the password hashed exactly as entered. A taken
-    /// email is found by a pre-check, or, when a concurrent registration of the same address wins the race, by the
-    /// unique-violation PostgreSQL reports on <c>UX_Guests_Email</c>; both give
+    /// The email is stored normalized, the full name trimmed of white space and U+FEFF by
+    /// <see cref="RegisterRequest.TrimFullName(string)"/>, the form its bounds measured, and the password hashed
+    /// exactly as entered. A taken email is found by a pre-check, or, when a concurrent registration of the same
+    /// address wins the race, by the unique-violation PostgreSQL reports on <c>UX_Guests_Email</c>; both give
     /// <see cref="RegisterResult.EmailTaken"/>. Every other database error, any other unique violation included,
     /// propagates.
     /// </para>
@@ -114,7 +115,7 @@ public sealed partial class AuthService(
         Guest registration = new()
         {
             Email = email,
-            FullName = request.FullName.Trim(),
+            FullName = RegisterRequest.TrimFullName(request.FullName),
             CreatedAt = timeProvider.GetUtcNow().UtcDateTime,
         };
         registration.PasswordHash = passwordHasher.HashPassword(registration, request.Password);

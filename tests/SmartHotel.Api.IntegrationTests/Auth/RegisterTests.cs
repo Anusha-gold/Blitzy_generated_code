@@ -80,6 +80,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     [InlineData("password-nul-appended", "password")]
     [InlineData("fullname-missing", "fullName")]
     [InlineData("fullname-blank", "fullName")]
+    [InlineData("fullname-feff-blank", "fullName")]
     [InlineData("fullname-too-long", "fullName")]
     [InlineData("fullname-supplementary-too-long", "fullName")]
     [InlineData("fullname-nul", "fullName")]
@@ -125,6 +126,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
     [Theory]
     [InlineData("email-and-short-password")]
     [InlineData("email-and-blank-fullname")]
+    [InlineData("email-and-feff-blank-fullname")]
     [InlineData("email-and-long-fullname")]
     [InlineData("every-field")]
     public async Task Register_SeveralInvalidFields_Returns400WithEveryKey(string caseLabel)
@@ -139,6 +141,10 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             "email-and-blank-fullname" => (
                 new { email = "not-an-email", password = ValidPassword, fullName = " \t " },
                 new[] { ("email", EmailMessage), ("fullName", FullNameRequiredMessage) }),
+            // White space and U+FEFF alone pass the required check, so the full-name bound reports the blank value.
+            "email-and-feff-blank-fullname" => (
+                new { email = "not-an-email", password = ValidPassword, fullName = " \uFEFF\t\uFEFF " },
+                new[] { ("email", EmailMessage), ("fullName", FullNameLengthMessage) }),
             "email-and-long-fullname" => (
                 new
                 {
@@ -918,24 +924,32 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
 
     // Each case puts one input exactly at its bound and keeps the others valid. The full-name limit counts characters
     // of the trimmed value, so 200 supplementary characters (400 UTF-16 code units) and 200 characters inside
-    // surrounding white space are within it.
+    // surrounding white space, with or without U+FEFF among it, are within it. Each case states the full name it
+    // expects stored, because string.Trim keeps U+FEFF and so cannot derive it.
     [Theory]
     [InlineData("fullname-at-limit")]
     [InlineData("fullname-supplementary-at-limit")]
     [InlineData("fullname-padded-at-limit")]
+    [InlineData("fullname-feff-padded-at-limit")]
     [InlineData("email-at-limit")]
     [InlineData("email-local-part-at-limit")]
     public async Task Register_InputAtBound_Returns201AndStoresTrimmedValues(string caseLabel)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
         ApiTestClient client = factory.CreateApiClient();
-        (string email, string fullName) = caseLabel switch
+        string nameAtLimit = new('n', MaxFullNameLength);
+        string supplementaryAtLimit = SupplementaryText(MaxFullNameLength);
+        (string email, string fullName, string expectedFullName) = caseLabel switch
         {
-            "fullname-at-limit" => (UniqueEmail("name"), new string('n', MaxFullNameLength)),
-            "fullname-supplementary-at-limit" => (UniqueEmail("name"), SupplementaryText(MaxFullNameLength)),
-            "fullname-padded-at-limit" => (UniqueEmail("name"), $" \t {new string('n', MaxFullNameLength)}\n "),
-            "email-at-limit" => (EmailOfLength(MaxEmailLength), ValidFullName),
-            "email-local-part-at-limit" => ($"{UniqueLocalPart(MaxLocalPartLength)}@example.test", ValidFullName),
+            "fullname-at-limit" => (UniqueEmail("name"), nameAtLimit, nameAtLimit),
+            "fullname-supplementary-at-limit" => (UniqueEmail("name"), supplementaryAtLimit, supplementaryAtLimit),
+            "fullname-padded-at-limit" => (UniqueEmail("name"), $" \t {nameAtLimit}\n ", nameAtLimit),
+            "fullname-feff-padded-at-limit" => (UniqueEmail("name"), $"\uFEFF \t{nameAtLimit}\n\uFEFF ", nameAtLimit),
+            "email-at-limit" => (EmailOfLength(MaxEmailLength), ValidFullName, ValidFullName),
+            "email-local-part-at-limit" => (
+                $"{UniqueLocalPart(MaxLocalPartLength)}@example.test",
+                ValidFullName,
+                ValidFullName),
             _ => throw new ArgumentOutOfRangeException(nameof(caseLabel), caseLabel, "Unknown registration case."),
         };
 
@@ -954,7 +968,7 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
             string.Equals(email.Trim().ToLowerInvariant(), guest.Email, StringComparison.Ordinal),
             "Expected the stored email to be the submitted email trimmed and in lower case.");
         Assert.True(
-            string.Equals(fullName.Trim(), guest.FullName, StringComparison.Ordinal),
+            string.Equals(expectedFullName, guest.FullName, StringComparison.Ordinal),
             "Expected the stored full name to be the submitted full name trimmed.");
     }
 
@@ -1046,6 +1060,11 @@ public sealed class RegisterTests(SmartHotelApiFactory factory) : IClassFixture<
                 cancellationToken),
             "fullname-blank" => client.RegisterAsync(
                 new { email = UniqueEmail("blank"), password = ValidPassword, fullName = " \t\n " },
+                cancellationToken),
+            // U+FEFF is not white space to .NET, so the value passes the required check, but a browser's trim strips
+            // it, so the name is blank to the guest.
+            "fullname-feff-blank" => client.RegisterAsync(
+                new { email = UniqueEmail("blank"), password = ValidPassword, fullName = "\uFEFF" },
                 cancellationToken),
             // 201 characters once the surrounding white space is trimmed.
             "fullname-too-long" => client.RegisterAsync(

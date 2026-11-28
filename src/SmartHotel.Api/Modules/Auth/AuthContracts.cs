@@ -40,9 +40,10 @@ namespace SmartHotel.Api.Modules.Auth;
 /// password followed by null characters would match the password's own hash.
 /// </param>
 /// <param name="FullName">
-/// Required. After trimming: not blank, at most 200 characters, and free of the null character (U+0000), which
-/// PostgreSQL text cannot store. The limit counts Unicode scalar values, the characters PostgreSQL counts for
-/// <c>varchar(200)</c>, so a character outside the Basic Multilingual Plane counts once.
+/// Required. After trimming white space and U+FEFF (zero width no-break space): not blank, at most 200 characters,
+/// and free of the null character (U+0000), which PostgreSQL text cannot store. The limit counts Unicode scalar
+/// values, the characters PostgreSQL counts for <c>varchar(200)</c>, so a character outside the Basic Multilingual
+/// Plane counts once.
 /// </param>
 public sealed partial record RegisterRequest(
     [ModelBinder(Name = RegisterRequest.EmailMember)]
@@ -80,6 +81,46 @@ public sealed partial record RegisterRequest(
     private const string PasswordNulMessage = "The value contains a character that is not allowed.";
     private const string FullNameMessage = "The value must not be blank and must be at most 200 characters.";
     private const string FullNameNulMessage = "The value contains a character that is not allowed.";
+
+    /// <summary>
+    /// Trims a full name into the form that registration measures and stores: every leading and trailing white-space
+    /// character and U+FEFF (zero width no-break space) removed, in any mix.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="string.Trim()"/> keeps U+FEFF, because <see cref="char.IsWhiteSpace(char)"/> does not count it, but a
+    /// browser client's <c>String.prototype.trim</c> strips it, so a name made only of such characters reads as empty
+    /// there. The rule is the one the API applies when it decides whether problem text is blank.
+    /// </remarks>
+    /// <param name="fullName">The full name as sent.</param>
+    /// <returns>
+    /// <paramref name="fullName"/> without its leading and trailing padding; empty when it holds nothing else.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="fullName"/> is <see langword="null"/>.</exception>
+    internal static string TrimFullName(string fullName)
+    {
+        ArgumentNullException.ThrowIfNull(fullName);
+
+        int start = 0;
+        while (start < fullName.Length && IsFullNamePadding(fullName[start]))
+        {
+            start++;
+        }
+
+        int end = fullName.Length;
+        while (end > start && IsFullNamePadding(fullName[end - 1]))
+        {
+            end--;
+        }
+
+        return fullName[start..end];
+    }
+
+    // Neither test matches half of a surrogate pair, so trimming never splits a character outside the Basic
+    // Multilingual Plane.
+    private static bool IsFullNamePadding(char character)
+    {
+        return char.IsWhiteSpace(character) || character == '\uFEFF';
+    }
 
     // Whether value holds at most MaxFullNameLength Unicode scalar values. Each scalar value takes one or two UTF-16
     // code units, so only a value of MaxFullNameLength + 1 to 2 * MaxFullNameLength code units needs counting, and
@@ -213,16 +254,24 @@ public sealed partial record RegisterRequest(
     }
 
     /// <summary>
-    /// The full-name bounds, applied to the trimmed value: at most <see cref="MaxFullNameLength"/> Unicode scalar
-    /// values, then no null character (U+0000). The value is not blank, so neither is its trimmed form.
+    /// The full-name bounds, applied to the value as <see cref="TrimFullName(string)"/> trims it: not blank, at most
+    /// <see cref="MaxFullNameLength"/> Unicode scalar values, then no null character (U+0000).
     /// </summary>
+    /// <remarks>
+    /// <see cref="RequiredAttribute"/> counts only white space as blank, so a value made of white space and U+FEFF
+    /// alone, a lone U+FEFF included, passes it; such a value is blank once trimmed and is refused here.
+    /// </remarks>
     [AttributeUsage(AttributeTargets.Parameter)]
     internal sealed class FullNameBoundsAttribute : MemberBoundsAttribute
     {
         /// <inheritdoc/>
         protected override string? FindViolation(string value)
         {
-            string trimmed = value.Trim();
+            string trimmed = TrimFullName(value);
+            if (trimmed.Length == 0)
+            {
+                return FullNameMessage;
+            }
 
             // Length counts UTF-16 code units, so it would count a character outside the Basic Multilingual Plane
             // twice; the column's varchar(200) limit counts characters, which are Unicode scalar values.
