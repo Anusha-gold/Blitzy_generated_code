@@ -14,9 +14,12 @@
  * remaining tests cover related page states, such as the auth pages and the
  * return URLs the login page refuses or keeps, URL criteria, late answers,
  * the request deadline, a request that fails with no HTTP response, a 5xx
- * problem body shown only as generic text, and unusable response bodies and
- * success statuses. Booking outcomes stay with the session that sent them:
- * "Log out" or the session's expiry while "Book" is in flight, a late 401
+ * problem body shown only as generic text, the hotel load's "Retry", unusable
+ * response bodies and success statuses, a hotel detail whose echoed stay
+ * contradicts the request, and a 201 whose My bookings page fails to load,
+ * which keeps the confirmed booking on the hotel page. Booking outcomes stay
+ * with the session that sent them: "Log out" or the session's expiry while
+ * "Book" is in flight, a late 401
  * notice that names no booking, a late notice's link once the clock has
  * passed the expiry, and the expiry checks that run when the timer is late.
  *
@@ -258,15 +261,44 @@ const UNUSABLE_LOGIN_BODIES: readonly UnusableBodyCase[] = [
   },
 ];
 
-/** A deep link whose page receives a 200 body it cannot render. */
+/**
+ * A deep link whose page receives a 200 body it cannot render. In `url` and
+ * `body`, `{checkIn}` and `{checkOut}` stand for the dates of a valid two-night
+ * stay, and `{laterDate}` for the date 1,095 days (three 365-day years) after
+ * `{checkOut}`, all from one clock read and as exact `yyyy-MM-dd` text, so
+ * `{laterDate}` never equals either stay date.
+ */
 interface UnusableReadCase extends UnusableBodyCase {
-  /** The page URL; `{stay}` stands for a valid `checkIn=…&checkOut=…` query. */
+  /** The page URL; `{stay}` stands for `checkIn={checkIn}&checkOut={checkOut}`. */
   url: string;
   /**
    * The target API endpoint of the page's `GET`, below the API base and with
    * the hotel id included, as {@link isApiEndpoint} takes it.
    */
   endpoint: string;
+}
+
+/**
+ * The fields of a complete hotel detail that answers `GET /api/hotels/1` for
+ * the two-night stay `{checkIn}` to `{checkOut}` and 3 guests, with one
+ * bookable room type, for the stubbed answers to start from.
+ */
+const ECHOED_DETAIL_FIELDS: Readonly<Record<string, unknown>> = {
+  id: 1,
+  name: 'Stub Hotel',
+  city: 'Seattle',
+  address: 'Stub Street 1',
+  description: 'Stub description',
+  checkIn: '{checkIn}',
+  checkOut: '{checkOut}',
+  nights: 2,
+  guests: 3,
+  roomTypes: [{ id: 1, name: 'Standard', maxGuests: 4, nightlyPrice: 100, availableRooms: 5, stayTotal: 200 }],
+};
+
+/** Returns {@link ECHOED_DETAIL_FIELDS} as JSON text with `changes` applied. */
+function echoedDetailJson(changes: Readonly<Record<string, unknown>>): string {
+  return JSON.stringify({ ...ECHOED_DETAIL_FIELDS, ...changes });
 }
 
 /** The deep links of the unusable-read test, one test each. */
@@ -297,6 +329,50 @@ const UNUSABLE_READ_CASES: readonly UnusableReadCase[] = [
       '{"id":1,"name":"X","city":"Seattle","address":"Y","description":"Z",' +
       '"checkIn":"2099-02-30","checkOut":"2099-03-02","nights":2,"guests":1,"roomTypes":[]}',
   },
+  // Complete details whose echo contradicts the request they answer.
+  {
+    title: 'a hotel detail echoing a check-in years after the requested check-out',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ checkIn: '{laterDate}' }),
+  },
+  {
+    title: 'a hotel detail echoing 1 guest for a 3-guest request',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ guests: 1 }),
+  },
+  {
+    title: 'a hotel detail echoing another hotel id',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ id: 2 }),
+  },
+  {
+    title: 'a hotel detail echoing 3 nights for a two-night stay',
+    url: '/hotels/1?{stay}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ nights: 3 }),
+  },
+  {
+    // The request itself is reversed, and the echo repeats it with its own
+    // day count, so only the order of the dates contradicts a 200.
+    title: 'a hotel detail echoing a reversed range',
+    url: '/hotels/1?checkIn={checkOut}&checkOut={checkIn}&guests=3',
+    endpoint: '/hotels/1',
+    body: echoedDetailJson({ checkIn: '{checkOut}', checkOut: '{checkIn}', nights: -2 }),
+  },
+];
+
+/**
+ * `guests` texts a detail deep link can carry that the API binds as 3, though
+ * none is the canonical `3`, one test each: leading zeros and a plus sign, and
+ * surrounding white space that .NET's `string.Trim()` removes: U+0085, which
+ * JavaScript's `trim()` keeps, a space and U+3000.
+ */
+const LENIENT_GUESTS_TEXTS: readonly { title: string; text: string }[] = [
+  { title: '"+003"', text: '+003' },
+  { title: 'U+0085, a space, "3" and U+3000', text: '\u0085 3\u3000' },
 ];
 
 /**
@@ -1433,6 +1509,105 @@ for (const status of SERVER_ERROR_STATUSES) {
     await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
     await expect(page.locator(HOTEL_RESULTS)).toHaveCount(0);
     await expect(page.getByTestId('search-empty')).toHaveCount(0);
+  });
+}
+
+/** The answer "Retry" gets after a hotel load answered 500, and where focus must then land. */
+interface RetryCase {
+  /** The outcome, for the test title. */
+  title: string;
+  /** Whether the retried `GET` is answered 500 too, rather than passed on to the API. */
+  failsAgain: boolean;
+  /** The test hook of the heading that must have focus once the retry has settled. */
+  heading: string;
+}
+
+/** The retries of the load-retry test, one test each. */
+const RETRY_CASES: readonly RetryCase[] = [
+  { title: 'loads the same stay and focuses the hotel heading', failsAgain: false, heading: 'hotel-name' },
+  {
+    title: 'that fails again shows the error with Retry and focuses its heading',
+    failsAgain: true,
+    heading: 'load-error-heading',
+  },
+];
+
+for (const c of RETRY_CASES) {
+  test(`Retry after a hotel load answered 500 ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const url = `/hotels/1?checkIn=${checkIn}&checkOut=${checkOut}&guests=2`;
+    const isDetail = (u: URL): boolean => isApiEndpoint(u, '/hotels/1');
+    const indicator = page.getByTestId('loading-indicator');
+    const retry = page.getByTestId('load-retry');
+    const alert = page.getByTestId('inline-error').getByRole('alert');
+
+    // The first detail GET is answered 500. The second, the retry, is held
+    // until the test lets it go, and is then answered 500 too when it fails
+    // again, or else reaches the API, as every later GET does.
+    let gets = 0;
+    let releaseRetry = (): void => undefined;
+    const retryReleased = new Promise<void>((resolve) => {
+      releaseRetry = resolve;
+    });
+    await page.route(isDetail, async (route) => {
+      if (route.request().method() !== 'GET') {
+        await route.fallback();
+        return;
+      }
+      gets += 1;
+      if (gets === 2) {
+        await retryReleased;
+      }
+      if (gets === 1 || (gets === 2 && c.failsAgain)) {
+        await route.fulfill({
+          status: 500,
+          contentType: 'application/problem+json',
+          body: JSON.stringify({ title: 'server-title-marker', status: 500 }),
+        });
+        return;
+      }
+      await route.fallback();
+    });
+    const sent = recordApiRequests(page);
+
+    await test.step('the failed load shows the generic error with Retry in place of the content', async () => {
+      const failed = page.waitForResponse((r) => isDetail(new URL(r.url())) && r.request().method() === 'GET');
+      await page.goto(url);
+      expect((await failed).status()).toBe(500);
+      await expect(alert).toHaveText('Request failed (500).');
+      await expect(retry).toHaveText('Retry');
+      await expect(retry).toHaveAttribute('type', 'button');
+      await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+      await expect(page.locator(BOOK_BUTTONS)).toHaveCount(0);
+    });
+
+    await test.step('while the retried GET is held, Retry is gone and the indicator shows', async () => {
+      await retry.click();
+      await expect.poll(() => gets, { message: 'Retry sends the GET again' }).toBe(2);
+      await expect(retry).toHaveCount(0);
+      await expect(page.getByTestId('inline-error')).toHaveCount(0);
+      await expect(indicator).toBeVisible();
+      releaseRetry();
+    });
+
+    await test.step(`once it settles, focus is on ${c.heading} and the URL is unchanged`, async () => {
+      await expect(indicator).toHaveCount(0);
+      await expect(page.getByTestId(c.heading)).toBeFocused();
+      await expect(page).toHaveURL(url);
+      if (c.failsAgain) {
+        await expect(alert).toHaveText('Request failed (500).');
+        await expect(retry).toBeVisible();
+        await expect(page.getByTestId('hotel-name')).toHaveCount(0);
+      } else {
+        await expect(page.locator('.hotel-stay')).toContainText(`${displayDate(checkIn)} to ${displayDate(checkOut)}`);
+        await expect(page.locator('.hotel-stay')).toContainText('2 guests');
+        await expect(page.locator(BOOK_BUTTONS)).not.toHaveCount(0);
+        await expectNoInlineError(page);
+      }
+      // The load and its one retry, for the same hotel and stay.
+      const stay = `GET /api/hotels/1 checkIn=${checkIn} checkOut=${checkOut} guests=2`;
+      expect(sent.map(describeStayRequest)).toEqual([stay, stay]);
+    });
   });
 }
 
@@ -2669,6 +2844,309 @@ test('a registration whose login page cannot be opened stays on the register pag
   });
 });
 
+/** What {@link failChunksOnceBooked} reports of the booking it lets through and the code it holds. */
+interface BookedChunkFailure {
+  /** The id the POST's 201 carried, or 0 before it has answered. */
+  bookingId(): number;
+  /**
+   * Waits until the page has requested a code chunk since the POST answered,
+   * which the route holds. When none comes, it fails within the expect
+   * timeout under `message`.
+   */
+  expectHeldChunk(message: string): Promise<void>;
+  /** Fails every held code chunk, and every later one, as a network error. */
+  failChunks(): void;
+}
+
+/**
+ * From now on, passes the page's `POST /api/bookings` on to the API and, once
+ * it has answered, holds every code chunk the page requests until
+ * {@link BookedChunkFailure.failChunks}, which fails them as network errors,
+ * as when the tab went offline once the server committed the booking. The
+ * flag is set inside the POST's own route, before its answer reaches the
+ * page, so the My bookings chunk that the answer leads to never loads; a
+ * response listener would race the router's chunk request.
+ */
+async function failChunksOnceBooked(page: Page): Promise<BookedChunkFailure> {
+  let bookingId = 0;
+  let answered = false;
+  let held = false;
+  let release = (): void => undefined;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(isCodeChunk, async (route) => {
+    if (!answered) {
+      await route.continue();
+      return;
+    }
+    held = true;
+    await released;
+    await route.abort();
+  });
+  await page.route(isBookingsCollection, async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body: unknown = await response.json();
+    bookingId = isRecord(body) && typeof body['id'] === 'number' ? body['id'] : 0;
+    answered = true;
+    await route.fulfill({ response });
+  });
+  return {
+    bookingId: () => bookingId,
+    async expectHeldChunk(message) {
+      await expect.poll(() => held, { message }).toBe(true);
+    },
+    failChunks: () => release(),
+  };
+}
+
+/**
+ * How the revalidation after a 201 whose My bookings page failed to load is
+ * answered: by the API, or not at all, as when the tab is offline.
+ */
+interface UnopenedConfirmationCase {
+  /** The revalidation's outcome, for the test title. */
+  title: string;
+  /** Whether the revalidation `GET` fails as a network error. */
+  revalidationFails: boolean;
+  /** Days from today of check-in and check-out, for one {@link utcDates} call. */
+  offsets: readonly [number, number];
+}
+
+/** The revalidations of the unopened-confirmation test, one test each. */
+const UNOPENED_CONFIRMATION_CASES: readonly UnopenedConfirmationCase[] = [
+  { title: 'and the fresh count', revalidationFails: false, offsets: [160, 162] },
+  {
+    title: 'through a failed revalidation, whose Retry restores the table',
+    revalidationFails: true,
+    offsets: [165, 167],
+  },
+];
+
+for (const c of UNOPENED_CONFIRMATION_CASES) {
+  test(`a 201 whose My bookings page fails to load keeps the confirmed booking on the hotel page ${c.title}`, async ({
+    page,
+    request,
+  }) => {
+    const [checkIn, checkOut] = utcDates(...c.offsets);
+    const stay: Stay = { checkIn, checkOut, guests: 1 };
+    const indicator = page.getByTestId('loading-indicator');
+    const notice = page.getByTestId('late-booking');
+    const link = page.getByTestId('late-booking-bookings');
+
+    const guest = await test.step('register and log in', async () => {
+      const credentials = await registerAndLogIn(page);
+      // Recorded before "Book" is clicked, so the booking it makes is
+      // cancelled after the test whatever the test reads of its answer.
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, credentials));
+      return credentials;
+    });
+    const hotelId = await test.step('search Seattle for the stay', () =>
+      searchFirstHotelId(page, { city: 'Seattle', ...stay }),
+    );
+
+    const shown = await test.step('open the hotel and pick an enabled Book', async () => {
+      const hotel = await openHotel(page, page.getByTestId(`view-rooms-${hotelId}`));
+      const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+      expect(testId).toMatch(/^book-\d+$/);
+      const id = Number(testId.slice('book-'.length));
+      const name = (await page.getByTestId(`room-type-row-${id}`).locator('td').first().innerText()).trim();
+      const count = await readAvailableCount(page, id);
+      expect(count, 'the room type has a room to book and one more left').toBeGreaterThanOrEqual(2);
+      return { hotel, roomType: { id, name }, count, url: page.url() };
+    });
+    const book = page.getByTestId(`book-${shown.roomType.id}`);
+    const count = page.getByTestId(`available-count-${shown.roomType.id}`);
+    const detailPath = `/api/hotels/${hotelId}`;
+    const reported = recordReportedErrors(
+      page,
+      (url) => isCodeChunk(url) || (c.revalidationFails && isApiEndpoint(url, `/hotels/${hotelId}`)),
+    );
+
+    const { chunks, revalidation } = await test.step('hold the code chunks requested once the POST has answered', async () => {
+      const failure = await failChunksOnceBooked(page);
+      // Held too, so every "Book" can be seen to stay disabled until it answers.
+      const gate = await holdRequest(page, (url) => isApiEndpoint(url, `/hotels/${hotelId}`), 'GET');
+      return { chunks: failure, revalidation: gate };
+    });
+    const sent = recordApiRequests(page);
+
+    await test.step('click Book: the API creates the booking, and every Book stays disabled while My bookings loads', async () => {
+      const created = page.waitForResponse(
+        (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+      );
+      await book.click();
+      expect((await created).status(), 'Book answers 201').toBe(201);
+      expect(chunks.bookingId(), 'the 201 carries the booking id').toBeGreaterThan(0);
+      await chunks.expectHeldChunk('the 201 starts loading My bookings');
+      await expectEveryBookDisabled(page);
+      await expect(notice).toHaveCount(0);
+    });
+
+    await test.step('My bookings fails to load: the page stays with a notice', async () => {
+      chunks.failChunks();
+      await expect(notice).toBeVisible();
+      await expect(page.getByTestId('late-booking-message')).toHaveText(
+        `Your booking of ${shown.roomType.name} at ${shown.hotel.name} ` +
+          `from ${displayDate(checkIn)} to ${displayDate(checkOut)} ` +
+          'is confirmed. No payment is taken online in this version.',
+      );
+      await expect(link).toHaveText('View it in My bookings');
+      await expect(page).toHaveURL(shown.url);
+    });
+
+    await test.step('every Book stays disabled while the revalidation is pending', async () => {
+      await revalidation.expectArrival('the unopened confirmation revalidates the stay');
+      await expect(indicator).toBeVisible();
+      await expectEveryBookDisabled(page);
+      await expect(count).toHaveText(String(shown.count));
+    });
+
+    if (c.revalidationFails) {
+      await test.step('the failed revalidation shows in place of the table with Retry, and the notice stays', async () => {
+        await revalidation.abort();
+        await expect(page.getByTestId('load-error-heading')).toBeVisible();
+        await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(UNREACHABLE_TITLE);
+        await expect(page.getByTestId('rooms-scroll')).toHaveCount(0);
+        await expect(notice).toBeVisible();
+        await expect(link).toBeFocused();
+      });
+
+      await test.step('Retry reads the stay again: the table returns with the fresh count, beside the notice', async () => {
+        const reread = page.waitForResponse((r) => isApiEndpoint(r.url(), `/hotels/${hotelId}`) && r.request().method() === 'GET');
+        await page.getByTestId('load-retry').click();
+        expect((await reread).status()).toBe(200);
+        await expect(count).toHaveText(String(shown.count - 1));
+        await expect(book).toBeEnabled();
+        await expect(notice).toBeVisible();
+        await expect(page.getByTestId('late-booking-message')).toContainText('is confirmed.');
+        await expect(page.getByTestId('hotel-name')).toBeFocused();
+        await expectNoInlineError(page);
+      });
+    } else {
+      await test.step('the fresh count arrives: one room fewer, Book enabled again, focus on the link', async () => {
+        const reread = page.waitForResponse((r) => isApiEndpoint(r.url(), `/hotels/${hotelId}`) && r.request().method() === 'GET');
+        await revalidation.release();
+        expect((await reread).status()).toBe(200);
+        await expect(count).toHaveText(String(shown.count - 1));
+        await expect(book).toBeEnabled();
+        await expect(link).toBeFocused();
+        await expectNoInlineError(page);
+      });
+    }
+
+    await test.step('one POST was sent, the URL is unchanged and nothing was reported', async () => {
+      await expect(indicator).toHaveCount(0);
+      await expect(page).toHaveURL(shown.url);
+      // Every API request since the page showed the hotel: the one POST, the
+      // revalidation, and the retry when the revalidation failed.
+      const read = `GET ${detailPath} checkIn=${checkIn} checkOut=${checkOut} guests=1`;
+      expect(sent.map((r) => (r.method === 'POST' ? `POST ${apiRelativeTarget(r.url)}` : describeStayRequest(r)))).toEqual(
+        c.revalidationFails ? ['POST /api/bookings', read, read] : ['POST /api/bookings', read],
+      );
+      expect(await apiAvailableCount(request, String(hotelId), stay, shown.roomType.id)).toBe(shown.count - 1);
+      expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+    });
+
+    await test.step('with the code back, the link still cannot open My bookings: the notice says to reload', async () => {
+      // The browser keeps failing the module it could not load, so the
+      // router's second attempt fails without a request, and the notice
+      // shows how to reach the booking.
+      await page.unroute(isCodeChunk);
+      await link.click();
+      await expect(notice.getByTestId('inline-error').getByRole('alert')).toHaveText(
+        'My bookings could not be opened. Reload the page, log in again and open My bookings to see this booking.',
+      );
+      await expect(notice).toBeVisible();
+      await expect(link).toBeVisible();
+      await expect(page).toHaveURL(shown.url);
+      expect(sent.filter((r) => r.method === 'POST')).toHaveLength(1);
+      expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+    });
+
+    await test.step('as the notice says, a reload, a new login and My bookings show the booking', async () => {
+      await page.reload();
+      await expect(page.getByTestId('nav-login')).toBeVisible();
+      await page.getByTestId('nav-login').click();
+      await logIn(page, guest.email, guest.password);
+      await page.getByTestId('nav-bookings').click();
+      await expect(page).toHaveURL('/bookings');
+      await expect(page.getByTestId(`booking-status-${chunks.bookingId()}`)).toHaveText('Confirmed');
+    });
+  });
+}
+
+test('a 201 whose My bookings page fails to load once the session expired shows only the neutral notice', async ({
+  page,
+  request,
+}) => {
+  // Installed before the app loads, so the app's Date and timers run on a
+  // clock the test can move forward; until then it keeps pace with real time.
+  await page.clock.install();
+  const [checkIn, checkOut] = utcDates(175, 177);
+  const stay: Stay = { checkIn, checkOut, guests: 1 };
+  const indicator = page.getByTestId('loading-indicator');
+  const reported = recordReportedErrors(page, isCodeChunk);
+
+  const expiresAt = await test.step('register and log in', async () => {
+    const { guest, expiresAt: expiry } = await registerAndLogInWithExpiry(page);
+    // Recorded before "Book" is clicked; the API session is the server's own,
+    // so the faked browser clock never expires it.
+    cancelGuestBookingsAfterTest(page, await apiSignIn(request, guest));
+    return expiry;
+  });
+
+  const { hotel, roomTypeId, url, shownCount } = await test.step('open a Seattle hotel', async () => {
+    await searchHotels(page, { city: 'Seattle', ...stay });
+    const opened = await openHotel(page, page.locator(VIEW_ROOMS).first());
+    const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+    expect(testId).toMatch(/^book-\d+$/);
+    const id = Number(testId.slice('book-'.length));
+    return { hotel: opened, roomTypeId: id, url: page.url(), shownCount: await readAvailableCount(page, id) };
+  });
+
+  const chunks = await failChunksOnceBooked(page);
+  const sent = recordApiRequests(page);
+
+  await test.step('ten seconds before the session expires, Book is answered 201 and My bookings starts loading', async () => {
+    await fastForwardToExpiry(page, expiresAt, -10_000);
+    await expect(page.getByTestId('nav-email')).toBeVisible();
+    const created = page.waitForResponse(
+      (r) => isBookingsCollection(new URL(r.url())) && r.request().method() === 'POST',
+    );
+    await page.getByTestId(`book-${roomTypeId}`).click();
+    expect((await created).status(), 'Book answers 201').toBe(201);
+    await chunks.expectHeldChunk('the 201 starts loading My bookings');
+    await expectEveryBookDisabled(page);
+  });
+
+  await test.step('the session expires while My bookings loads, which then fails', async () => {
+    await fastForwardToExpiry(page, expiresAt, 5_000);
+    await expect(page.getByTestId('nav-login')).toBeVisible();
+    await expect(page.getByTestId('nav-email')).toHaveCount(0);
+    chunks.failChunks();
+  });
+
+  await test.step('only the neutral notice shows, on the same stay, with its counts revalidated', async () => {
+    await expect(page.getByTestId('booking-session-ended')).toHaveText(SESSION_ENDED_MESSAGE);
+    await expect(indicator).toHaveCount(0);
+    await expect(page).toHaveURL(url);
+    await expect(page.getByTestId('late-booking')).toHaveCount(0);
+    await expect(page.getByTestId('hotel-name')).toHaveText(hotel.name);
+    await expectNoInlineError(page);
+    await expect(page.getByTestId(`available-count-${roomTypeId}`)).toHaveText(String(shownCount - 1));
+    expect(sent.map((r) => (r.method === 'POST' ? `POST ${apiRelativeTarget(r.url)}` : describeStayRequest(r)))).toEqual([
+      'POST /api/bookings',
+      `GET /api/hotels/${hotel.id} checkIn=${checkIn} checkOut=${checkOut} guests=${stay.guests}`,
+    ]);
+    expect(reported, 'uncaught exceptions and console errors').toEqual([]);
+  });
+});
+
 test('a guest sent from Book to log in who registers first returns to the hotel', async ({ page }) => {
   const hotelPath = await test.step('click Book on a hotel while signed out', () => bookSignedOut(page));
 
@@ -3052,21 +3530,48 @@ for (const c of UNUSABLE_LOGIN_BODIES) {
 
 for (const c of UNUSABLE_READ_CASES) {
   test(`${c.title} shows inline and renders no hotel`, async ({ page }) => {
+    const [checkIn, checkOut, laterDate] = utcDates(30, 32, 32 + 3 * 365);
+    const fill = (text: string): string =>
+      text
+        .replace(/\{stay\}/g, 'checkIn={checkIn}&checkOut={checkOut}')
+        .replace(/\{checkIn\}/g, checkIn)
+        .replace(/\{checkOut\}/g, checkOut)
+        .replace(/\{laterDate\}/g, laterDate);
+    const body = fill(c.body);
     await page.route(
       (url) => isApiEndpoint(url, c.endpoint),
-      (route) => route.fulfill({ status: 200, contentType: 'application/json', body: c.body }),
+      (route) => route.fulfill({ status: 200, contentType: 'application/json', body }),
     );
 
-    const [checkIn, checkOut] = utcDates(30, 32);
     const read = page.waitForResponse(
       (r) => isApiEndpoint(r.url(), c.endpoint) && r.request().method() === 'GET',
     );
-    await page.goto(c.url.replace('{stay}', `checkIn=${checkIn}&checkOut=${checkOut}`));
+    await page.goto(fill(c.url));
     expect((await read).status()).toBe(200);
 
     await expect(page.getByTestId('inline-error')).toContainText(UNEXPECTED_RESPONSE_TITLE);
     await expect(page.locator(`${HOTEL_RESULTS}, [data-testid="hotel-name"]`)).toHaveCount(0);
     await expect(page.getByTestId('search-empty')).toHaveCount(0);
+    await expect(page.locator(BOOK_BUTTONS)).toHaveCount(0);
+  });
+}
+
+for (const { title, text } of LENIENT_GUESTS_TEXTS) {
+  test(`a detail deep link with guests ${title}, which the API reads as 3, shows the hotel for 3 guests`, async ({
+    page,
+  }) => {
+    const [checkIn, checkOut] = utcDates(30, 32);
+    const read = page.waitForResponse((r) => isApiEndpoint(r.url(), '/hotels/1') && r.request().method() === 'GET');
+    await page.goto(`/hotels/1?checkIn=${checkIn}&checkOut=${checkOut}&guests=${encodeURIComponent(text)}`);
+    const response = await read;
+    expect(new URL(response.url()).searchParams.get('guests')).toBe(text);
+    expect(response.status()).toBe(200);
+
+    await expect(page.getByTestId('hotel-name')).toHaveText(/\S/);
+    await expect(page.locator('.hotel-stay')).toContainText(`${displayDate(checkIn)} to ${displayDate(checkOut)}`);
+    await expect(page.locator('.hotel-stay')).toContainText('2 nights, 3 guests');
+    await expect(page.locator(BOOK_BUTTONS)).not.toHaveCount(0);
+    await expectNoInlineError(page);
   });
 }
 

@@ -189,6 +189,82 @@ function isHotelDetail(body: unknown): body is HotelDetail {
   );
 }
 
+/** The party size the API's hotel endpoints use when the query omits `guests`. */
+const DEFAULT_GUESTS = 1;
+
+/** The length of one UTC calendar day in milliseconds; UTC has no daylight-saving shifts. */
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * Matches one character that .NET's `char.IsWhiteSpace` accepts, the set
+ * `string.Trim()` removes from both ends: U+0009 to U+000D, the Unicode space
+ * separators (U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and
+ * U+3000), U+0085, U+2028 and U+2029. Unlike JavaScript's `trim()`, it takes
+ * U+0085 and leaves U+FEFF. Each is one UTF-16 code unit, as each .NET `char` is.
+ */
+const DOTNET_WHITE_SPACE = /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]$/;
+
+/**
+ * Returns `text` without the white space .NET's `string.Trim()` removes from
+ * both ends ({@link DOTNET_WHITE_SPACE}), scanning each end once, so a long
+ * text costs linear time.
+ */
+function trimDotNetWhiteSpace(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && DOTNET_WHITE_SPACE.test(text[start])) {
+    start += 1;
+  }
+  while (end > start && DOTNET_WHITE_SPACE.test(text[end - 1])) {
+    end -= 1;
+  }
+  return text.slice(start, end);
+}
+
+/**
+ * Returns the party size the API binds from the `guests` text a request
+ * carried, or `null` when it binds none, so that request can only get a 400.
+ * An omitted `guests` binds {@link DEFAULT_GUESTS}. A present one is read as
+ * the API's binder reads it: its surrounding white space trimmed as .NET's
+ * `string.Trim()` trims it ({@link trimDotNetWhiteSpace}), then an optional
+ * `+` or `-` followed by ASCII digits and nothing else, whose value is a
+ * 32-bit signed integer, leading zeros allowed.
+ */
+function boundGuests(text: string | undefined): number | null {
+  if (text === undefined) {
+    return DEFAULT_GUESTS;
+  }
+  const value = trimDotNetWhiteSpace(text);
+  if (!/^[+-]?[0-9]+$/.test(value)) {
+    return null;
+  }
+  const guests = Number(value);
+  return guests >= MIN_ROUTE_ID && guests <= MAX_ROUTE_ID ? guests : null;
+}
+
+/**
+ * Whether a complete detail body ({@link isHotelDetail}) answers the request
+ * for the hotel `id` and the stay `q`, as every 200 from the API does: its
+ * `id` is `id`; its `checkIn` and `checkOut` are the request's texts exactly,
+ * because the API accepts only exact `yyyy-MM-dd` dates and echoes them; its
+ * `checkIn` is before its `checkOut`; its `nights` is the count of UTC days
+ * between them; and its `guests` is the party size the API binds from the
+ * request ({@link boundGuests}). The stay rules themselves, such as the
+ * earliest check-in or the longest stay, are the server's alone and are not
+ * checked here.
+ */
+function answersRequest(body: HotelDetail, id: number, q: StayQuery): boolean {
+  const nights = (Date.parse(`${body.checkOut}T00:00:00Z`) - Date.parse(`${body.checkIn}T00:00:00Z`)) / MS_PER_DAY;
+  return (
+    body.id === id &&
+    body.checkIn === q.checkIn &&
+    body.checkOut === q.checkOut &&
+    body.checkIn < body.checkOut &&
+    body.nights === nights &&
+    body.guests === boundGuests(q.guests)
+  );
+}
+
 /**
  * Typed client for the anonymous catalogue endpoints under `/api/hotels`: the
  * hotel search and the hotel detail.
@@ -212,7 +288,9 @@ function isHotelDetail(body: unknown): body is HotelDetail {
  * of the API's C# `int`, or a `checkIn` that is not an exact `yyyy-MM-dd`
  * calendar date, fails as an `HttpErrorResponse` carrying that 200, which
  * `toUiError` shows as "The service sent an unexpected response."; an empty
- * search list `[]` is valid.
+ * search list `[]` is valid. A detail body whose echoed hotel id, dates,
+ * nights or party size contradict the request fails the same way
+ * ({@link HotelsApiService.getHotel}).
  * Apart from that deadline and that check the returned observables are the
  * `HttpClient` requests unchanged, except for a hotel id that is not an
  * integer literal, which sends nothing and fails with a local 404 carrying
@@ -292,11 +370,26 @@ export class HotelsApiService {
    * A request with no response within `REQUEST_DEADLINE_MS` is aborted and
    * fails with status 0.
    *
+   * A 200 is used only when it answers this request: beyond being a complete
+   * hotel detail, its `id` is the id sent, its `checkIn` and `checkOut` are
+   * the dates sent, exactly, with `checkIn` first, its `nights` is the count
+   * of UTC days between them, and its `guests` is the party size the server
+   * binds from the `guests` sent: 1 when it was omitted, otherwise its text
+   * with the surrounding white space .NET's `string.Trim()` removes, U+0085
+   * included and U+FEFF not, read as an optional sign and ASCII digits within
+   * the 32-bit signed range. The server echoes every one of them from the
+   * request it validated, so a 200 that contradicts the request is for
+   * another hotel or stay, and Book must not be offered against it. Such a
+   * 200 fails exactly like an incomplete body. The server's stay rules, such
+   * as the earliest check-in or the longest stay, are not checked here.
+   *
    * @param id - The hotel's id: the route's path segment text, unchanged.
    * @param q - The stay as the page holds it, sent unchanged like the search
    *   criteria.
-   * @returns The checked 200 body: the hotel with its room types; a body
-   *   that is not a complete hotel detail fails with that 200 status.
+   * @returns The checked 200 body: the hotel with its room types for the
+   *   requested stay; a body that is not a complete hotel detail, or whose
+   *   echoed hotel id, dates, nights or party size contradict the request,
+   *   fails with that 200 status.
    */
   getHotel(id: string, q: StayQuery): Observable<HotelDetail> {
     const segment = hotelIdSegment(id);
@@ -305,8 +398,10 @@ export class HotelsApiService {
     }
     const params = withStayParams(new HttpParams(), q);
     const url = `${this.config.apiBaseUrl}/hotels/${segment}`;
+    const hotelId = Number(segment);
+    const isAnswer = (body: unknown): body is HotelDetail => isHotelDetail(body) && answersRequest(body, hotelId, q);
     return this.http
       .get<unknown>(url, { params, observe: 'response' })
-      .pipe(withRequestDeadline(url), withResponseBody(isHotelDetail));
+      .pipe(withRequestDeadline(url), withResponseBody(isAnswer));
   }
 }

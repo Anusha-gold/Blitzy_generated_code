@@ -1,7 +1,10 @@
 <!-- The answer to a booking made for another hotel or stay than the one on
-     screen. It renders only while the session state it was settled for is
-     current: the session that sent the booking, or the signed-out state of
-     that booking's own 401. "Log out" or the session's expiry removes it in
+     screen, or a 201 for the stay on screen whose navigation to My bookings
+     did not open that page, as when its code failed to load; focus then
+     moves to the link, never back to "Book". It renders only while the
+     session state it was settled for is current: the session that sent the
+     booking, or the signed-out state of that booking's own 401. "Log out" or
+     the session's expiry removes it in
      the render that shows the change, so it never shows after its session,
      and an answer whose session ended before it was settled never shows
      here at all. For the sending session it names the room type, hotel and
@@ -15,8 +18,10 @@
      confirmation as after a booking on the current view; its click handler
      checks again that the session is current and unexpired, and otherwise
      drops the notice and opens My bookings with no state, so the guard asks
-     for a login. A click with a modifier key or another button is left to
-     the browser, whose new tab gets neither the booking nor the session. -->
+     for a login. When the link's navigation does not open My bookings, the
+     notice stays and says why inline below the link. A click with a
+     modifier key or another button is left to the browser, whose new tab
+     gets neither the booking nor the session. -->
 <div #lateNotice *ngIf="lateOutcome() as late" class="late-booking" data-testid="late-booking">
   <p role="status" data-testid="late-booking-message">
     <ng-container *ngIf="late.attempt as attempt; else unnamedBooking">
@@ -28,11 +33,13 @@
     <ng-template #unnamedBooking>Your booking could not be confirmed.</ng-template>
   </p>
   <a
+    #lateBookingLink
     *ngIf="late.confirmation"
     href="/bookings"
     (click)="openLateBooking($event, late)"
     data-testid="late-booking-bookings"
   >View it in My bookings</a>
+  <app-error-message [error]="late.linkError"></app-error-message>
   <app-error-message [error]="late.error">
     <a
       *ngIf="late.error?.status === 401"
@@ -63,12 +70,17 @@
      reason the fresh counts are missing. Only one of this block and the hotel
      content below renders at a time, so both can carry the booking error's
      "Log in again" link under one test hook. The heading takes focus from
-     script only: on entry from within the app when the load failed, and
-     after a booking answer whose revalidation failed has removed the room
-     table and the pressed "Book" with it. -->
+     script only: on entry from within the app when the load failed, after a
+     booking answer whose revalidation failed has removed the room table and
+     the pressed "Book" with it, and after a "Retry" that failed again.
+     "Retry" loads the URL's hotel and stay again, keeping the booking
+     outcomes shown for it; it leaves with this block while the request
+     runs. -->
 <ng-container *ngIf="loadError() as e">
   <h1 #loadErrorHeading tabindex="-1" data-testid="load-error-heading">Hotel</h1>
-  <app-error-message [error]="e"></app-error-message>
+  <app-error-message [error]="e">
+    <button type="button" data-testid="load-retry" (click)="retry()">Retry</button>
+  </app-error-message>
   <app-error-message [error]="bookError()">
     <a
       *ngIf="bookError()?.status === 401"

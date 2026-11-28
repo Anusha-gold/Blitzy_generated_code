@@ -68,9 +68,10 @@ interface BookErrorShown {
 
 /**
  * A booking's answer shown in the late-booking notice rather than above the
- * room table, because it was for another hotel or stay than the one on
- * screen, with the session state it was settled for; shown only while that
- * state is current.
+ * room table, with the session state it was settled for; shown only while that
+ * state is current. The answer was for another hotel or stay than the one on
+ * screen, or it was a 201 for the stay on screen whose navigation to My
+ * bookings did not open that page.
  */
 interface LateBookingOutcome {
   /**
@@ -88,12 +89,28 @@ interface LateBookingOutcome {
   confirmation: BookingConfirmationState | null;
   /** The failure as shown inline, or `null` when the booking was created. */
   error: UiError | null;
+  /**
+   * Why the notice's link did not open My bookings, shown inline inside the
+   * notice, or `null` while no click on it has failed.
+   */
+  linkError: UiError | null;
 }
+
+/**
+ * The inline title shown when a navigation to My bookings that carries a
+ * created booking does not open that page. The browser keeps failing a page
+ * module it could not load until the page is reloaded, and a reload starts
+ * the app signed out, hence both steps.
+ */
+const BOOKINGS_UNOPENED_TITLE =
+  'My bookings could not be opened. Reload the page, log in again and open My bookings to see this booking.';
 
 /**
  * Whether a booking submitted for `booked` belongs to the hotel and stay on
  * screen: the same hotel id, dates and party size. Both are the server's own
- * echoes, so two URLs the server reads alike compare equal.
+ * echoes, which `HotelsApiService.getHotel` accepts only when they match the
+ * request they answer, so two URLs the server reads alike compare equal and
+ * neither names another hotel or stay than the one it was loaded for.
  */
 function isSameStay(shown: HotelDetail, booked: HotelDetail): boolean {
   return (
@@ -137,7 +154,12 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  * detail then reuses the room rows whose room-type ids recur. A failed load,
  * such as the 400 for invalid dates or a malformed `guests` or the 404 for an
  * unknown or non-integer hotel id, removes the previous hotel and is shown in
- * place of the content.
+ * place of the content. So is a 200 that `HotelsApiService.getHotel` rejects
+ * because its echoed hotel id, dates, nights or party size contradict the
+ * request, shown as "The service sent an unexpected response." with no room
+ * table and no "Book". Every error shown in place of the content, after a
+ * load or a revalidation, offers "Retry", which loads the URL's hotel and
+ * stay again without a reload ({@link HotelDetailPageComponent.retry}).
  *
  * Entry focus: when a navigation within the app opens this page, as "View
  * rooms" does, the page's heading takes focus once it renders: the hotel's
@@ -201,7 +223,15 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  *   booking in the router state ({@link bookingConfirmationState}), held only
  *   in memory and never written to the browser's history, and
  *   `BookingsPageComponent` confirms it from its own list of the caller's
- *   bookings. Any failure, status 0 included, is shown above the room table.
+ *   bookings. Every "Book" stays disabled while that navigation runs. When it
+ *   does not open My bookings, because another navigation superseded it or
+ *   that page's code failed to load, the page stays on this view and, while
+ *   the sending session is still current and live, shows the booking as
+ *   confirmed in the late-booking notice described below, with its link to
+ *   My bookings, which then takes focus; it revalidates the stay, so "Book"
+ *   is enabled again only from the fresh counts, and it never sends the
+ *   booking again. Once that session has ended, the answer is suppressed as
+ *   above. Any failure, status 0 included, is shown above the room table.
  *   A 409 means the room type has no room free for the stay any more, so the
  *   page also revalidates the stay in place.
  * - Another hotel or stay, or none after a failed load: the answer leaves the
@@ -217,7 +247,11 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  *   overlap the stay on screen, it changed or exposed a change in the very
  *   rooms the table counts, whatever the party size, so the page revalidates
  *   that stay as well. The next load or booking clears the notice; a
- *   revalidation does not.
+ *   revalidation and a "Retry" do not. When the link's own navigation does
+ *   not open My bookings, the notice stays and shows inline that My bookings
+ *   could not be opened and that a reload, which signs the guest out, a new
+ *   login and My bookings show the booking: the browser keeps failing a page
+ *   module it could not load until the page is reloaded.
  *
  * A revalidation reads the stay on screen again and goes through the same
  * cancel-on-supersede pipeline as the route's loads, so a route change ends
@@ -239,7 +273,8 @@ function overlapsStay(shown: HotelDetail, booked: HotelDetail): boolean {
  * above. It is then refused, so the error above the table or the notice
  * stays in view, unless the session ended during the wait and the answer was
  * suppressed, when it proceeds; a 201 for the stay on screen instead goes to
- * `/bookings` with its confirmation, superseding the held navigation. The
+ * `/bookings` with its confirmation, superseding the held navigation, and
+ * shows the late-booking notice when that page does not open. The
  * request's deadline bounds only its network wait: an answer that arrives
  * while a load runs is settled once that load has, so the hold can also wait
  * for the load. While the hold lasts, no navigation, the one to `/login`
@@ -292,8 +327,16 @@ export class HotelDetailPageComponent {
   @ViewChild('lateNotice') private lateNotice?: ElementRef<HTMLDivElement>;
 
   /**
+   * The late-booking notice's "View it in My bookings" link, rendered while it
+   * shows a created booking; where focus lands when a 201 for the stay on
+   * screen did not open My bookings.
+   */
+  @ViewChild('lateBookingLink') private lateBookingLink?: ElementRef<HTMLAnchorElement>;
+
+  /**
    * The loaded hotel's heading, focusable from script only; where focus lands
-   * when the end of a session removes the late-booking notice that held it.
+   * when the end of a session removes the late-booking notice that held it,
+   * and after a "Retry" that loaded the hotel.
    */
   @ViewChild('hotelHeading') private hotelHeading?: ElementRef<HTMLHeadingElement>;
 
@@ -308,7 +351,7 @@ export class HotelDetailPageComponent {
    * The heading of the load error shown in place of the content, focusable
    * from script only; where focus lands after a booking answer when a failed
    * revalidation has removed the room table, and the "Book" and rooms region
-   * with it.
+   * with it, and after a "Retry" that failed again.
    */
   @ViewChild('loadErrorHeading') private loadErrorHeading?: ElementRef<HTMLHeadingElement>;
 
@@ -323,7 +366,7 @@ export class HotelDetailPageComponent {
    */
   protected readonly hotel = signal<HotelDetail | null>(null);
 
-  /** `true` while a route-driven load is in flight; hides the previous hotel. */
+  /** `true` while a route-driven load or its retry is in flight; hides the previous hotel. */
   protected readonly loadPending = signal(false);
 
   /**
@@ -364,24 +407,35 @@ export class HotelDetailPageComponent {
   private readonly refreshPending = signal(false);
 
   /**
-   * `true` while this page's booking request, or the revalidation after its
-   * answer, is in flight; disables every "Book".
+   * `true` while the navigation to My bookings that a 201 for the stay on
+   * screen started is in flight: the booking is made, so no "Book" may offer
+   * another one before that page opens or the page has shown the outcome.
    */
-  protected readonly bookingPending = computed(() => this.postPending() || this.refreshPending());
+  private readonly confirmationPending = signal(false);
+
+  /**
+   * `true` while this page's booking request, the revalidation after its
+   * answer, or the navigation to My bookings after its 201 is in flight;
+   * disables every "Book".
+   */
+  protected readonly bookingPending = computed(
+    () => this.postPending() || this.refreshPending() || this.confirmationPending(),
+  );
 
   /**
    * The answer last settled for a booking submitted for another hotel or
-   * stay than the one on screen, with the session state it belongs to; `null`
-   * when there is none. Read through
-   * {@link HotelDetailPageComponent.lateOutcome}.
+   * stay than the one on screen, or for a 201 whose navigation to My bookings
+   * did not open it, with the session state it belongs to; `null` when there
+   * is none. Read through {@link HotelDetailPageComponent.lateOutcome}.
    */
   private readonly lateOutcomeShown = signal<LateBookingOutcome | null>(null);
 
   /**
    * The answer to a booking submitted for another hotel or stay than the one
-   * on screen, shown as a notice at the top of the page while the session
-   * state it was settled for is current; `null` otherwise. A session that
-   * ends hides it, with its link to My bookings, in the same render.
+   * on screen, or a 201 for the stay on screen whose navigation to My bookings
+   * did not open it, shown as a notice at the top of the page while the
+   * session state it was settled for is current; `null` otherwise. A session
+   * that ends hides it, with its link to My bookings, in the same render.
    */
   protected readonly lateOutcome = computed<LateBookingOutcome | null>(() => {
     const late = this.lateOutcomeShown();
@@ -401,7 +455,13 @@ export class HotelDetailPageComponent {
    */
   private readonly refresh$ = new Subject<() => void>();
 
-  /** Emits when a route-driven load settles, with a hotel or with an error. */
+  /**
+   * Asks for the route's hotel and stay to be loaded again, from the load
+   * error's "Retry".
+   */
+  private readonly retry$ = new Subject<void>();
+
+  /** Emits when a route-driven load or its retry settles, with a hotel or with an error. */
   private readonly loadSettled$ = new Subject<void>();
 
   /**
@@ -422,22 +482,8 @@ export class HotelDetailPageComponent {
     this.destroyRef.onDestroy(() => this.destroyed.set(true));
 
     const loads$ = merge(this.route.paramMap, this.route.queryParamMap).pipe(
-      // Either stream only signals a committed navigation. The router assigns
-      // the route's new snapshot before it emits the query and then the path
-      // parameters, so reading both from the snapshot never pairs an old id
-      // with a new stay. The texts go out as the URL holds them; an absent
-      // `guests` is sent as 1, the server's own default.
-      map(() => {
-        const { paramMap, queryParamMap } = this.route.snapshot;
-        return {
-          id: paramMap.get('id') ?? '',
-          stay: {
-            checkIn: queryParamMap.get('checkIn') ?? '',
-            checkOut: queryParamMap.get('checkOut') ?? '',
-            guests: queryParamMap.get('guests') ?? '1',
-          },
-        };
-      }),
+      // Either stream only signals a committed navigation; see routeStay.
+      map(() => this.routeStay()),
       // Entry emits once per stream, a navigation changing both id and query
       // emits twice, and an unrelated query parameter changes no criterion:
       // each of those loads at most once.
@@ -448,14 +494,21 @@ export class HotelDetailPageComponent {
           a.stay.checkOut === b.stay.checkOut &&
           a.stay.guests === b.stay.guests,
       ),
-      map(({ id, stay }) => () => this.load(id, stay)),
+      map(({ id, stay }) => () => this.load(id, stay, false)),
     );
 
-    // Route loads and revalidations share one switchMap, so whichever starts
-    // last ends the other and only one GET at a time writes `hotel`. Each
-    // emission maps to a thunk that switchMap runs only after it has ended the
-    // previous request.
-    merge(loads$, this.refresh$.pipe(map((settled) => () => this.refresh(settled))))
+    // "Retry" reads the route as a navigation's load does and loads that
+    // same stay again, whatever the last load was.
+    const retries$ = this.retry$.pipe(
+      map(() => this.routeStay()),
+      map(({ id, stay }) => () => this.load(id, stay, true)),
+    );
+
+    // Route loads, retries and revalidations share one switchMap, so
+    // whichever starts last ends the others and only one GET at a time writes
+    // `hotel`. Each emission maps to a thunk that switchMap runs only after it
+    // has ended the previous request.
+    merge(loads$, retries$, this.refresh$.pipe(map((settled) => () => this.refresh(settled))))
       .pipe(
         switchMap((run) => run()),
         takeUntilDestroyed(),
@@ -627,7 +680,9 @@ export class HotelDetailPageComponent {
    * out. Otherwise the browser's own navigation is prevented and the router
    * navigates to `/bookings`: with the booking in the router state
    * ({@link bookingConfirmationState}) while its session is live, for the
-   * same confirmation as after a booking on the current view. Once it is not,
+   * same confirmation as after a booking on the current view; when that
+   * navigation does not open My bookings, the notice stays and shows why
+   * inline ({@link HotelDetailPageComponent.lateBookingUnopened}). Once it is not,
    * the stale outcomes are dropped first
    * ({@link HotelDetailPageComponent.dropStaleOutcomes}), a current session
    * whose `expiresAt` has passed is cleared, as `authGuard` clears it, and the
@@ -646,7 +701,12 @@ export class HotelDetailPageComponent {
 
     const current = this.auth.session();
     if (late.confirmation !== null && late.owner !== null && this.isCurrentState(late.owner, current)) {
-      void this.router.navigate(['/bookings'], { state: late.confirmation });
+      const unopened = (): void => this.lateBookingUnopened(late);
+      void this.router.navigate(['/bookings'], { state: late.confirmation }).then((navigated) => {
+        if (!navigated) {
+          unopened();
+        }
+      }, unopened);
       return;
     }
 
@@ -660,6 +720,44 @@ export class HotelDetailPageComponent {
   /** Identifies a room type row by its id for `NgFor`. */
   protected trackById(_index: number, rt: RoomTypeAvailability): number {
     return rt.id;
+  }
+
+  /**
+   * Sends `GET /api/hotels/{id}` again for the hotel and stay of the current
+   * URL, from the "Retry" button of the error shown in place of the content
+   * after a failed load or revalidation, so the guest need not reload the
+   * page or enter the criteria again. It runs as
+   * {@link HotelDetailPageComponent.load} describes, in the switchMap the
+   * route's loads and the revalidations share, so a newer navigation or
+   * revalidation ends it and it ends one still in flight. Unlike a
+   * navigation's load it keeps the booking outcomes of this stay in view:
+   * the error above the table, the late-booking notice and the session-ended
+   * notice. The button leaves with the error while the request runs; once it
+   * settles, focus left on the document body moves to the hotel's heading,
+   * or to the load error's heading when it failed again.
+   */
+  protected retry(): void {
+    this.retry$.next();
+  }
+
+  /**
+   * Reads the hotel id and stay that the route's current snapshot holds. The
+   * route's parameter streams only signal a committed navigation: the router
+   * assigns the route's new snapshot before it emits the query and then the
+   * path parameters, so reading both from the snapshot never pairs an old id
+   * with a new stay. The texts go out as the URL holds them; an absent
+   * `guests` is sent as 1, the server's own default.
+   */
+  private routeStay(): { id: string; stay: StayQuery & { guests: string } } {
+    const { paramMap, queryParamMap } = this.route.snapshot;
+    return {
+      id: paramMap.get('id') ?? '',
+      stay: {
+        checkIn: queryParamMap.get('checkIn') ?? '',
+        checkOut: queryParamMap.get('checkOut') ?? '',
+        guests: queryParamMap.get('guests') ?? '1',
+      },
+    };
   }
 
   /**
@@ -778,12 +876,14 @@ export class HotelDetailPageComponent {
    * Settles a 201. With `owner` `null`, the sending session had ended, so it
    * is suppressed as {@link HotelDetailPageComponent.suppressAnswer}
    * describes. For the hotel and stay on screen it navigates to My bookings
-   * with the booking in the router state. Otherwise it reports the booking in
-   * the late-outcome notice, bound to its session, as confirmed with no
-   * payment taken online and with the "View it in My bookings" link, and
-   * stays on the current view, which it revalidates when the booked room may
-   * be one its table counts, and then returns focus to `trigger` as after a
-   * failed booking.
+   * with the booking in the router state, keeping every "Book" disabled until
+   * that page opens; when it does not, the booking is reported as
+   * {@link HotelDetailPageComponent.confirmationUnopened} describes.
+   * Otherwise it reports the booking in the late-outcome notice, bound to its
+   * session, as confirmed with no payment taken online and with the "View it
+   * in My bookings" link, and stays on the current view, which it revalidates
+   * when the booked room may be one its table counts, and then returns focus
+   * to `trigger` as after a failed booking.
    */
   private booked(attempt: BookingAttempt, booking: Booking, trigger: HTMLElement | null, owner: AnswerOwner | null): void {
     this.postPending.set(false);
@@ -793,16 +893,26 @@ export class HotelDetailPageComponent {
     }
 
     const shown = this.hotel();
+    const confirmation = bookingConfirmationState(booking);
     if (shown !== null && isSameStay(shown, attempt.hotel)) {
-      void this.router.navigate(['/bookings'], { state: bookingConfirmationState(booking) });
+      // Raised in the turn that lowers postPending, so no "Book" is enabled
+      // in between. The rejection reason is neither shown nor logged.
+      this.confirmationPending.set(true);
+      const unopened = (): void => this.confirmationUnopened(attempt, owner.session, confirmation, trigger);
+      void this.router.navigate(['/bookings'], { state: confirmation }).then((navigated) => {
+        if (!navigated) {
+          unopened();
+        }
+      }, unopened);
       return;
     }
 
     this.lateOutcomeShown.set({
       attempt,
       owner: owner.session,
-      confirmation: bookingConfirmationState(booking),
+      confirmation,
       error: null,
+      linkError: null,
     });
     const restore = (): void => this.restoreFocusAfterBooking(trigger, false);
     if (shown !== null && overlapsStay(shown, attempt.hotel)) {
@@ -857,6 +967,7 @@ export class HotelDetailPageComponent {
       owner: owner.session,
       confirmation: null,
       error,
+      linkError: null,
     });
     const restore = (): void => this.restoreFocusAfterBooking(trigger, false);
     if (error.status === 409 && shown !== null && overlapsStay(shown, attempt.hotel)) {
@@ -874,7 +985,8 @@ export class HotelDetailPageComponent {
    * dates or status and never says the booking was cancelled. When the answer
    * created or exposed a change in the rooms the table counts, `changesRooms`
    * for a 201 or a 409 together with the same hotel and overlapping dates,
-   * the stay on screen is revalidated, with the counts any visitor sees.
+   * the stay on screen is revalidated, with the counts any visitor sees,
+   * unless a navigation's load, which reads fresh counts itself, is in flight.
    * Focus then moves as after a failed booking.
    *
    * @param attempt - The booking the answer is for.
@@ -885,11 +997,114 @@ export class HotelDetailPageComponent {
     this.sessionEnded.set(true);
     const shown = this.hotel();
     const restore = (): void => this.restoreFocusAfterBooking(trigger, false);
-    if (changesRooms && shown !== null && overlapsStay(shown, attempt.hotel)) {
+    if (changesRooms && shown !== null && !this.loadPending() && overlapsStay(shown, attempt.hotel)) {
       this.revalidate(restore);
     } else {
       restore();
     }
+  }
+
+  /**
+   * Reports a booking the server created for the stay on screen when the
+   * navigation to My bookings that hands it over did not open that page: the
+   * router resolved it with anything but `true`, as when another navigation
+   * superseded it, or rejected it, as when that page's code failed to load.
+   * A page that is destroyed by then shows nothing. The booking is never sent
+   * again.
+   *
+   * While `owner` is still the current and live session, the late-booking
+   * notice shows the booking as confirmed, with no payment taken online and
+   * with its "View it in My bookings" link, so the guest sees that it is made
+   * and need not book again. The stay on screen is revalidated, as after a
+   * late 201 for rooms its table counts, so every "Book" stays disabled until
+   * the fresh counts arrive; a revalidation that fails shows its error in
+   * place of the content, with "Retry", and the notice stays. Focus then moves
+   * to that link when it is still on the document body, on nothing or on
+   * `trigger`, never back to the "Book" that made the booking. Once `owner`
+   * has ended, the answer is suppressed instead, as
+   * {@link HotelDetailPageComponent.suppressAnswer} describes.
+   *
+   * @param attempt - The booking the 201 is for.
+   * @param owner - The session the 201 was settled for.
+   * @param confirmation - The router state that hands the booking over.
+   * @param trigger - The element focused when the request was sent, or `null`.
+   */
+  private confirmationUnopened(
+    attempt: BookingAttempt,
+    owner: Session | null,
+    confirmation: BookingConfirmationState,
+    trigger: HTMLElement | null,
+  ): void {
+    if (this.destroyed()) {
+      return;
+    }
+    this.confirmationPending.set(false);
+    if (!this.isCurrentState(owner, this.auth.session())) {
+      this.suppressAnswer(attempt, trigger, true);
+      return;
+    }
+
+    this.lateOutcomeShown.set({ attempt, owner, confirmation, error: null, linkError: null });
+    const focus = (): void => this.focusLateBookingLink(trigger);
+    const shown = this.hotel();
+    // A navigation's load in flight replaces the view and reads fresh counts itself.
+    if (shown !== null && !this.loadPending() && overlapsStay(shown, attempt.hotel)) {
+      this.revalidate(focus);
+    } else {
+      focus();
+    }
+  }
+
+  /**
+   * Moves focus, once the late-booking notice has rendered, to its "View it
+   * in My bookings" link when focus is still on the document body, on nothing
+   * or on `trigger`; anything else the guest focused meanwhile keeps focus.
+   *
+   * @param trigger - The element focused when the booking was sent, or `null`.
+   */
+  private focusLateBookingLink(trigger: HTMLElement | null): void {
+    afterNextRender(
+      () => {
+        const active = this.document.activeElement;
+        if (active !== null && active !== this.document.body && active !== trigger) {
+          return;
+        }
+        const link = this.lateBookingLink?.nativeElement;
+        if (link?.isConnected) {
+          link.focus();
+        }
+      },
+      { injector: this.injector },
+    );
+  }
+
+  /**
+   * Shows, inside the late-booking notice that `late` was read from, why its
+   * link did not open My bookings: the router resolved that navigation with
+   * anything but `true` or rejected it, as when that page's code failed to
+   * load, which the browser keeps failing until the page is reloaded. The
+   * notice stays, with its link, and its inline error reads "My bookings could
+   * not be opened. Reload the page, log in again and open My bookings to see
+   * this booking.", because the reload starts the app signed out. The
+   * rejection reason is neither shown nor logged. Nothing changes once the
+   * page is destroyed or the notice has been replaced or dropped. A repeated
+   * failure replaces the error in a new alert region, so assistive
+   * technology announces it again.
+   *
+   * @param late - The outcome whose link was clicked.
+   */
+  private lateBookingUnopened(late: LateBookingOutcome): void {
+    if (this.destroyed() || this.lateOutcomeShown() !== late) {
+      return;
+    }
+    if (late.linkError !== null) {
+      this.lateOutcomeShown.set({ ...late, linkError: null });
+      this.changeDetector.detectChanges();
+    }
+    this.lateOutcomeShown.set({
+      ...late,
+      linkError: { status: 0, title: BOOKINGS_UNOPENED_TITLE, detail: null, fieldErrors: [] },
+    });
   }
 
   /**
@@ -1009,18 +1224,32 @@ export class HotelDetailPageComponent {
    * a revalidation still in flight, and a booking still in flight keeps every
    * "Book" disabled until its answer is settled against this load's outcome.
    *
+   * A retry ({@link HotelDetailPageComponent.retry}) clears only the load
+   * error: the booking outcomes belong to the stay it loads again, so the
+   * error above the table, the late-booking notice and the session-ended
+   * notice stay. Once it has settled and rendered, focus left on the document
+   * body, as when the removed "Retry" button had it, moves to the hotel's
+   * heading or to the load error's heading shown in its place.
+   *
    * The error handling sits inside this inner observable, so a failed load
    * never ends the outer route stream and the next route change loads again.
    * `switchMap` ends the superseded request, running its `finalize`, before
    * it calls this method, so an old request never clears the new one's
    * `loadPending`; only a load that answered signals `loadSettled$`.
+   *
+   * @param id - The hotel id as the URL holds it.
+   * @param stay - The stay as the URL holds it.
+   * @param retried - Whether this is a retry of the current stay rather than
+   *   a navigation's load.
    */
-  private load(id: string, stay: StayQuery): Observable<HotelDetail | null> {
+  private load(id: string, stay: StayQuery, retried: boolean): Observable<HotelDetail | null> {
     this.loadPending.set(true);
     this.loadError.set(null);
-    this.bookErrorShown.set(null);
-    this.lateOutcomeShown.set(null);
-    this.sessionEnded.set(false);
+    if (!retried) {
+      this.bookErrorShown.set(null);
+      this.lateOutcomeShown.set(null);
+      this.sessionEnded.set(false);
+    }
     let settled = false;
 
     return this.hotels.getHotel(id, stay).pipe(
@@ -1037,9 +1266,33 @@ export class HotelDetailPageComponent {
       finalize(() => {
         this.loadPending.set(false);
         if (settled) {
+          // A booking answer that waited for this load settles first, so the
+          // focus it restores takes precedence over the retry's.
           this.loadSettled$.next();
+          if (retried) {
+            this.focusHeadingAfterRetry();
+          }
         }
       }),
+    );
+  }
+
+  /**
+   * Moves focus, once a settled retry has rendered, to the hotel's heading,
+   * or to the load error's heading when the retry failed, unless focus is
+   * on another element than the document body by then.
+   */
+  private focusHeadingAfterRetry(): void {
+    afterNextRender(
+      () => {
+        const active = this.document.activeElement;
+        if (active !== null && active !== this.document.body) {
+          return;
+        }
+        const headings = [this.hotelHeading?.nativeElement, this.loadErrorHeading?.nativeElement];
+        headings.find((heading) => heading?.isConnected)?.focus();
+      },
+      { injector: this.injector },
     );
   }
 
@@ -1062,7 +1315,9 @@ export class HotelDetailPageComponent {
    * suppressed because its session ended calls this too, once the
    * session-ended notice is shown. An answer that arrives once the page is
    * destroyed never calls this, and a 201 for the stay on screen whose
-   * session is still live navigates to My bookings instead.
+   * session is still live navigates to My bookings instead, or, when that
+   * page does not open, focuses the late-booking notice's link
+   * ({@link HotelDetailPageComponent.confirmationUnopened}).
    *
    * @param trigger - The element focused when the request was sent, or `null`.
    * @param unauthorized - Whether the booking failed with 401.
