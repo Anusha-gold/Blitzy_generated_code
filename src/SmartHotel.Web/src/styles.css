@@ -51,9 +51,13 @@ h3 {
   margin-block: 1.5rem 0.75rem;
 }
 
+/* Each page's h1 takes focus from script. The scroll margin makes
+   scrollIntoView and focus scrolling, which stop at the border box, also
+   bring the whole 2px + 2px focus ring into view. */
 h1 {
   font-size: 1.75rem;
   margin-block-start: 0.5rem;
+  scroll-margin-block: 0.5rem;
 }
 
 h2 {
@@ -143,6 +147,19 @@ button:not(:disabled):active {
 
 input:not(:disabled):active {
   border-color: var(--sh-color-accent-pressed);
+}
+
+/* A field the server rejected (aria-invalid). The pages mark it with the error
+   colour and an inset shadow, which forced colours replace and drop, so here
+   its edge changes shape instead: 3px dashed rather than a valid field's 1px
+   solid, inside the solid 2px focus outline. The padding gives up the 2px the
+   border adds, so neither the field nor its text moves. */
+@media (forced-colors: active) {
+  input[aria-invalid="true"] {
+    padding: calc(0.375rem - 2px) calc(0.5rem - 2px);
+    border-width: 3px;
+    border-style: dashed;
+  }
 }
 
 /* No pointer-events: none here (disabled already blocks activation), so the

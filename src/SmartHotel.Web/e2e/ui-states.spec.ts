@@ -1159,15 +1159,19 @@ for (const c of HELD_SEARCH_CASES) {
         .evaluate((slot) => slot.getBoundingClientRect().height);
 
       const gate = await holdRequest(page, isHotelSearch, 'GET');
-      await submit.click();
+      // From the keyboard: the focused Search button activated with Enter.
+      await submit.focus();
+      await page.keyboard.press('Enter');
       await gate.expectArrival('Search sends the GET');
       return { gate, slotHeight };
     });
 
-    await test.step('while the GET is held the indicator shows and Search is disabled', async () => {
+    await test.step('while the GET is held the indicator shows, Search is disabled and the heading holds focus', async () => {
       await expect(indicator).toBeVisible();
       await expect(indicator).toHaveAttribute('role', 'progressbar');
       await expect(submit).toBeDisabled();
+      // The disabled button lost focus to the page heading, not to the body.
+      await expect(page.getByRole('heading', { level: 1, name: 'Find a hotel' })).toBeFocused();
 
       // Forced colours drop fills and gradients. The banner keeps a solid edge
       // that takes no space, so it still fills exactly the idle slot, and the
@@ -1188,8 +1192,159 @@ for (const c of HELD_SEARCH_CASES) {
       await expect(page.locator(c.outcome).first()).toBeVisible();
       await expect(indicator).toHaveCount(0);
       await expect(submit).toBeEnabled();
-      // The pending state disabled the focused button; focus returns to it.
+      // Focus that the heading held while the button was disabled returns to it.
       await expect(submit).toBeFocused();
+    });
+  });
+}
+
+/**
+ * A form submitted from the keyboard on a small screen scrolled down to its
+ * submit button, so that its heading is above the screen, with entries the
+ * API rejects and the request held by a {@link RequestGate}.
+ */
+interface ScrolledSubmitCase {
+  /** The submit button's label, for the test title. */
+  title: string;
+  /** The page holding the form. */
+  path: string;
+  /** The name of the page heading, which holds focus while the request is held. */
+  heading: string;
+  /** The submit button's test hook. */
+  submit: string;
+  /** The target API endpoint the submit sends its request to. */
+  endpoint: (url: URL) => boolean;
+  /** The request's method. */
+  method: string;
+  /**
+   * Fills the form with entries the API rejects, the last into the field
+   * just before the submit button, which a Tab from it reaches; `request`
+   * arranges any fixture data they need.
+   */
+  fill(page: Page, request: APIRequestContext): Promise<void>;
+  /** The status the API answers. */
+  status: number;
+  /** The test hook of the element that takes focus once the answer shows. */
+  focusedAfter: string;
+}
+
+/** The scrolled submits, one test each. */
+const SCROLLED_SUBMIT_CASES: readonly ScrolledSubmitCase[] = [
+  {
+    title: 'Search',
+    path: '/search',
+    heading: 'Find a hotel',
+    submit: 'search-submit',
+    endpoint: isHotelSearch,
+    method: 'GET',
+    fill: async (page) => {
+      // A check-out on the check-in day, which the API answers with a 400.
+      const [day] = utcDates(100);
+      await fillBound(page, 'search-city', 'Seattle');
+      await fillBound(page, 'search-check-in', day);
+      await fillBound(page, 'search-check-out', day);
+      await fillBound(page, 'search-guests', '2');
+    },
+    status: 400,
+    focusedAfter: 'search-submit',
+  },
+  {
+    title: 'Log in',
+    path: '/login',
+    heading: 'Log in',
+    submit: 'login-submit',
+    endpoint: isLoginApi,
+    method: 'POST',
+    fill: async (page, request) => {
+      // A registered guest with a wrong password, which the API answers with
+      // a 401: one character longer than the guest's own, so never equal to it.
+      const guest = await apiRegisterGuest(request);
+      await fillBound(page, 'login-email', guest.email);
+      await fillBound(page, 'login-password', `${guest.password}x`);
+    },
+    status: 401,
+    focusedAfter: 'login-submit',
+  },
+  {
+    title: 'Create account',
+    path: '/register',
+    heading: 'Register',
+    submit: 'register-submit',
+    endpoint: isRegisterApi,
+    method: 'POST',
+    fill: async (page) => {
+      await fillBound(page, 'register-email', uniqueEmail());
+      // Seven characters: the server's rule is 8 to 128, so it answers 400
+      // and creates no account.
+      await fillBound(page, 'register-password', 'x'.repeat(7));
+      await fillBound(page, 'register-full-name', 'States Guest');
+    },
+    status: 400,
+    // The first, and only, field the 400 marks invalid.
+    focusedAfter: 'register-password',
+  },
+];
+
+for (const c of SCROLLED_SUBMIT_CASES) {
+  test(`${c.title} pressed on a small screen scrolled past the heading shows the heading that holds focus while pending`, async ({
+    page,
+    request,
+  }) => {
+    await page.setViewportSize({ width: 320, height: 256 });
+    const heading = page.getByRole('heading', { level: 1, name: c.heading });
+    const submit = page.getByTestId(c.submit);
+
+    const gate = await test.step(`fill the form, Tab to ${c.title} at the end of the page and press Enter, holding the request`, async () => {
+      await page.goto(c.path);
+      await c.fill(page, request);
+      await page.keyboard.press('Tab');
+      await expect(submit).toBeFocused();
+      // At the end of the page the button shows and the heading is wholly
+      // above the screen.
+      await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      await expect(submit).toBeInViewport({ ratio: 1 });
+      await expect(heading).not.toBeInViewport();
+
+      const held = await holdRequest(page, c.endpoint, c.method);
+      await page.keyboard.press('Enter');
+      await held.expectArrival(`${c.title} sends its request`);
+      return held;
+    });
+
+    await test.step('while the request is held the heading holds focus, scrolled into view with its focus ring', async () => {
+      await expect(submit).toBeDisabled();
+      await expect(heading).toBeFocused();
+      await expect(heading).toBeInViewport({ ratio: 1 });
+      // The ring, drawn outside the border box, shows whole as well.
+      const ringShows = await heading.evaluate((element) => {
+        const style = getComputedStyle(element);
+        const ring = parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset);
+        const box = element.getBoundingClientRect();
+        const { clientWidth, clientHeight } = document.documentElement;
+        return (
+          style.outlineStyle !== 'none' &&
+          ring > 0 &&
+          box.top - ring >= 0 &&
+          box.left - ring >= 0 &&
+          box.bottom + ring <= clientHeight &&
+          box.right + ring <= clientWidth
+        );
+      });
+      expect(ringShows, "the heading's focus ring is drawn and shows whole").toBe(true);
+    });
+
+    await test.step(`once released the API answers ${c.status} and focus moves on from the heading`, async () => {
+      const answered = page.waitForResponse(
+        (r) => c.endpoint(new URL(r.url())) && r.request().method() === c.method,
+      );
+      await gate.release();
+      expect((await answered).status()).toBe(c.status);
+
+      await expect(page.getByTestId('inline-error')).toBeVisible();
+      await expect(submit).toBeEnabled();
+      const focused = page.getByTestId(c.focusedAfter);
+      await expect(focused).toBeFocused();
+      await expect(focused).toBeInViewport();
     });
   });
 }
@@ -1216,6 +1371,152 @@ test('search with check-out equal to check-in shows an inline 400', async ({ pag
   await expect(checkOut).toHaveAttribute('aria-invalid', 'true');
   await expect(checkOut).toHaveAccessibleDescription('The date must be after the check-in date.');
   await expect(page.getByTestId('search-check-in')).not.toHaveAttribute('aria-invalid');
+});
+
+/**
+ * A Seattle search the server rejects with check-out among the rejected
+ * fields, then check-out edited to two days after check-in without searching
+ * again: the edit ends check-out's field error and leaves any other field's.
+ */
+interface EditedCheckOutCase {
+  /** What else the edit ends or leaves, for the test title. */
+  title: string;
+  /**
+   * Days from today of the rejected check-in and check-out, and of the
+   * check-out then entered, for one {@link utcDates} call.
+   */
+  offsets: readonly [number, number, number];
+  /**
+   * The server's message for check-in, which must outlast the edit together
+   * with its mark, or `null` when the server rejected check-out alone and the
+   * whole error must go.
+   */
+  checkInMessage: string | null;
+}
+
+/** The rejected searches, one test each. */
+const EDITED_CHECK_OUT_CASES: readonly EditedCheckOutCase[] = [
+  { title: 'and the whole error when it was the only one', offsets: [30, 30, 32], checkInMessage: null },
+  // A day the client reads as past is past for the server too, whenever the
+  // request arrives.
+  { title: "but not the rejected check-in's", offsets: [-1, -1, 1], checkInMessage: 'The date cannot be in the past.' },
+];
+
+for (const c of EDITED_CHECK_OUT_CASES) {
+  test(`editing a rejected check-out without searching again ends its field error, ${c.title}`, async ({ page }) => {
+    const [checkIn, checkOut, corrected] = utcDates(...c.offsets);
+    const checkInField = page.getByTestId('search-check-in');
+    const checkOutField = page.getByTestId('search-check-out');
+    const fieldMessages = page.getByTestId('inline-error').getByRole('alert').locator('li');
+    const checkOutMessage = 'The date must be after the check-in date.';
+
+    await test.step('a Seattle search the server rejects marks check-out invalid', async () => {
+      await page.goto('/search');
+      const response = page.waitForResponse(
+        (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+      );
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      expect((await response).status()).toBe(400);
+
+      await expect(checkOutField).toHaveAttribute('aria-invalid', 'true');
+      await expect(checkOutField).toHaveAttribute('aria-describedby', /\S/);
+      await expect(checkOutField).toHaveAccessibleDescription(checkOutMessage);
+      if (c.checkInMessage === null) {
+        await expect(checkInField).not.toHaveAttribute('aria-invalid');
+        await expect(fieldMessages).toHaveText([`Check-out: ${checkOutMessage}`]);
+      } else {
+        await expect(checkInField).toHaveAttribute('aria-invalid', 'true');
+        await expect(fieldMessages).toHaveText([`Check-in: ${c.checkInMessage}`, `Check-out: ${checkOutMessage}`]);
+      }
+    });
+
+    await test.step('editing check-out, without searching, ends its message and mark', async () => {
+      const searchUrl = page.url();
+      const sent = recordApiRequests(page);
+      await fillBound(page, 'search-check-out', corrected);
+      await expect(checkOutField).not.toHaveAttribute('aria-invalid');
+      await expect(checkOutField).not.toHaveAttribute('aria-describedby');
+      // No answer cleared it: the edit sent nothing and left the URL as it was.
+      expect(sent, 'API requests sent by the edit').toEqual([]);
+      await expect(page).toHaveURL(searchUrl);
+    });
+
+    if (c.checkInMessage === null) {
+      await test.step('check-out was the only field the server rejected, so the whole error is gone', async () => {
+        await expectNoInlineError(page);
+      });
+    } else {
+      const message = c.checkInMessage;
+      await test.step('check-in keeps its message and mark', async () => {
+        await expect(fieldMessages).toHaveText([`Check-in: ${message}`]);
+        await expect(checkInField).toHaveAttribute('aria-invalid', 'true');
+        await expect(checkInField).toHaveAccessibleDescription(message);
+      });
+    }
+  });
+}
+
+test('in forced colours a rejected search field keeps a dashed edge, distinct from valid fields and the focus ring', async ({
+  page,
+}) => {
+  const [day] = utcDates(30);
+  const checkIn = page.getByTestId('search-check-in');
+  const checkOut = page.getByTestId('search-check-out');
+  // The size of the input's border box, and how far its text is inset from it.
+  const geometry = (field: Locator) =>
+    field.evaluate((input) => {
+      const box = input.getBoundingClientRect();
+      const style = getComputedStyle(input);
+      return {
+        size: [box.width, box.height],
+        inset: [
+          parseFloat(style.borderTopWidth) + parseFloat(style.paddingTop),
+          parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft),
+        ],
+      };
+    });
+
+  await page.goto('/search');
+  await page.emulateMedia({ forcedColors: 'active' });
+  await expect(checkOut).toBeVisible();
+  const valid = await geometry(checkOut);
+
+  await test.step('a search with check-out on the check-in day marks check-out invalid', async () => {
+    const response = page.waitForResponse(
+      (r) => isHotelSearch(new URL(r.url())) && r.request().method() === 'GET',
+    );
+    await searchHotels(page, { city: 'Seattle', checkIn: day, checkOut: day, guests: 1 });
+    expect((await response).status()).toBe(400);
+    await expect(checkOut).toHaveAttribute('aria-invalid', 'true');
+  });
+
+  await test.step('forced colours drop the error colour and shadow, so the edge itself changes shape', async () => {
+    await expect(checkOut).toHaveCSS('box-shadow', 'none');
+    await expect(checkOut).toHaveCSS('border-style', 'dashed');
+    await expect(checkOut).toHaveCSS('border-width', '3px');
+    await expect(checkIn).toHaveCSS('border-style', 'solid');
+    await expect(checkIn).toHaveCSS('border-width', '1px');
+    // The padding gives up what the border adds: the field keeps its size and
+    // its text stays where it was.
+    expect(await geometry(checkOut)).toEqual(valid);
+  });
+
+  await test.step('focused, it shows the solid focus ring outside its dashed edge', async () => {
+    await checkOut.focus();
+    await expect(checkOut).toHaveCSS('outline-style', 'solid');
+    await expect(checkOut).toHaveCSS('outline-width', '2px');
+    await expect(checkOut).toHaveCSS('outline-offset', '2px');
+    await expect(checkOut).toHaveCSS('border-style', 'dashed');
+    await expect(checkOut).toHaveCSS('border-width', '3px');
+  });
+
+  await test.step('without forced colours the rejected field keeps its error-coloured solid edge', async () => {
+    await page.emulateMedia({ forcedColors: 'none' });
+    await expect(checkOut).toHaveCSS('border-style', 'solid');
+    await expect(checkOut).toHaveCSS('border-width', '1px');
+    await expect(checkOut).toHaveCSS('border-color', 'rgb(176, 0, 32)');
+    await expect(checkOut).toHaveCSS('box-shadow', 'rgb(176, 0, 32) 0px 0px 0px 1px inset');
+  });
 });
 
 test('search with no availability shows the empty message', async ({ page }) => {
@@ -2329,12 +2630,19 @@ test('a 201 answered after the session expired shows only the neutral notice and
     return { hotel: opened, roomTypeId: id, url: page.url(), shownCount: await readAvailableCount(page, id) };
   });
 
-  const post = await test.step('ten seconds before the session expires, click Book and hold its POST', async () => {
+  const rooms = page.getByTestId('rooms-scroll');
+  const post = await test.step('ten seconds before the session expires, press Enter on Book and hold its POST', async () => {
     await fastForwardToExpiry(page, expiresAt, -10_000);
     await expect(page.getByTestId('nav-email')).toBeVisible();
     const gate = await holdRequest(page, isBookingsCollection, 'POST');
-    await page.getByTestId(`book-${roomTypeId}`).click();
+    // From the keyboard: the focused "Book" activated with Enter.
+    await page.getByTestId(`book-${roomTypeId}`).focus();
+    await page.keyboard.press('Enter');
     await gate.expectArrival('Book sends the POST');
+    // Every "Book" is disabled while the POST is held, and the focus the
+    // pressed one lost went to the rooms region, not to the body.
+    await expectEveryBookDisabled(page);
+    await expect(rooms).toBeFocused();
     return gate;
   });
 
@@ -2345,6 +2653,7 @@ test('a 201 answered after the session expired shows only the neutral notice and
     await expect(page.getByTestId('nav-login')).toBeVisible();
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
     await expect(indicator).toBeVisible();
+    await expect(rooms).toBeFocused();
   });
 
   const visited = recordVisitedPaths(page);
@@ -2374,10 +2683,94 @@ test('a 201 answered after the session expired shows only the neutral notice and
     expect(sent.map(describeStayRequest)).toEqual([
       `GET /api/hotels/${hotel.id} checkIn=${checkIn} checkOut=${checkOut} guests=${stay.guests}`,
     ]);
-    // Focus returns to the pressed "Book", as after a failed booking.
+    // Focus returns from the rooms region to the pressed "Book", as after a
+    // failed booking.
     await expect(page.getByTestId(`book-${roomTypeId}`)).toBeFocused();
   });
 });
+
+/**
+ * A "Book" pressed from the keyboard whose POST is held and then fails with
+ * no HTTP response, so the answer neither revalidates the stay nor leaves the
+ * pressed "Book" disabled: only where focus has been while the POST was held
+ * decides where it goes.
+ */
+interface HeldBookFocusCase {
+  /** Where focus ends up, for the test title. */
+  title: string;
+  /**
+   * Whether the guest moves focus off the rooms region and back while the
+   * POST is held, which makes the region the guest's own choice.
+   */
+  refocuses: boolean;
+}
+
+/** The held bookings, one test each. */
+const HELD_BOOK_FOCUS_CASES: readonly HeldBookFocusCase[] = [
+  { title: 'focus left on the rooms region returns to the pressed Book', refocuses: false },
+  { title: 'the rooms region the guest tabbed back to keeps focus', refocuses: true },
+];
+
+for (const c of HELD_BOOK_FOCUS_CASES) {
+  test(`a held Book that fails: ${c.title}`, async ({ page, request }) => {
+    const [checkIn, checkOut] = utcDates(119, 121);
+    const rooms = page.getByTestId('rooms-scroll');
+
+    await test.step('register and log in', async () => {
+      // Recorded before "Book" is pressed, so a booking a POST that slipped
+      // past the gate committed is cancelled after the test.
+      cancelGuestBookingsAfterTest(page, await apiSignIn(request, await registerAndLogIn(page)));
+    });
+
+    const book = await test.step('open a Seattle hotel', async () => {
+      await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+      await openHotel(page, page.locator(VIEW_ROOMS).first());
+      const testId = (await page.locator(`${BOOK_BUTTONS}:enabled`).first().getAttribute('data-testid')) ?? '';
+      expect(testId).toMatch(/^book-\d+$/);
+      return page.getByTestId(testId);
+    });
+
+    const post = await test.step('press Enter on Book and hold its POST: the rooms region takes focus', async () => {
+      const gate = await holdRequest(page, isBookingsCollection, 'POST');
+      // From the keyboard: the focused "Book" activated with Enter.
+      await book.focus();
+      await page.keyboard.press('Enter');
+      await gate.expectArrival('Book sends the POST');
+      await expectEveryBookDisabled(page);
+      await expect(rooms).toBeFocused();
+      return gate;
+    });
+
+    if (c.refocuses) {
+      await test.step('Shift+Tab leaves the rooms region for Log out, and Tab brings focus back to it', async () => {
+        await page.keyboard.press('Shift+Tab');
+        await expect(page.getByTestId('nav-logout')).toBeFocused();
+        await page.keyboard.press('Tab');
+        await expect(rooms).toBeFocused();
+      });
+    }
+
+    await test.step('the POST fails with no response: the status-0 error shows and Book is enabled again', async () => {
+      // A network error: the request never reaches the API.
+      await post.abort();
+      await expect(page.getByTestId('inline-error').getByRole('alert')).toHaveText(UNREACHABLE_TITLE);
+      await expect(page.getByTestId('loading-indicator')).toHaveCount(0);
+      // The render that re-enables "Book" is the one after which focus moves.
+      await expect(book).toBeEnabled();
+    });
+
+    if (c.refocuses) {
+      await test.step('focus stays on the rooms region the guest chose, not on Book', async () => {
+        await expect(rooms).toBeFocused();
+        await expect(book).not.toBeFocused();
+      });
+    } else {
+      await test.step('focus returns from the rooms region to the pressed Book', async () => {
+        await expect(book).toBeFocused();
+      });
+    }
+  });
+}
 
 test('a late-booking notice leaves with its link to My bookings when its session expires', async ({ page, request }) => {
   // Installed before the app loads, as in the test above.
@@ -2527,7 +2920,15 @@ test('duplicate registration shows an inline 409', async ({ page }) => {
     const registration = page.waitForResponse(
       (r) => isRegisterApi(new URL(r.url())) && r.request().method() === 'POST',
     );
-    await page.getByTestId('register-submit').click();
+    const submit = page.getByTestId('register-submit');
+    const gate = await holdRequest(page, isRegisterApi, 'POST');
+    await submit.click();
+    await gate.expectArrival('Create account sends the POST');
+    // While the POST is held the button is disabled, and the focus it lost
+    // went to the page heading, not to the body.
+    await expect(submit).toBeDisabled();
+    await expect(page.getByRole('heading', { level: 1, name: 'Register' })).toBeFocused();
+    await gate.release();
     expect((await registration).status()).toBe(409);
   });
 
@@ -2536,7 +2937,7 @@ test('duplicate registration shows an inline 409', async ({ page }) => {
       'An account with this email already exists.',
     );
     await expect(page).toHaveURL(/\/register$/);
-    // The pending state disabled the focused button; focus returns to it.
+    // Focus that the heading held while the button was disabled returns to it.
     await expect(page.getByTestId('register-submit')).toBeFocused();
   });
 });
@@ -2562,7 +2963,7 @@ test('wrong password shows an inline 401', async ({ page }) => {
     await expect(page).toHaveURL(/\/login(?:\?|$)/);
     await expect(page.getByTestId('nav-login')).toBeVisible();
     await expect(page.getByTestId('nav-email')).toHaveCount(0);
-    // The pending state disabled the focused button; focus returns to it.
+    // Focus that the heading held while the button was disabled returns to it.
     await expect(page.getByTestId('login-submit')).toBeFocused();
   });
 
@@ -2601,10 +3002,13 @@ test('wrong password shows an inline 401', async ({ page }) => {
     );
     await page.getByTestId('login-submit').click();
     await expect(page.getByTestId('login-submit')).toBeDisabled();
+    // The focus the disabled button lost went to the page heading, not to the body.
+    await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
     await expect(page.getByTestId('inline-error')).toContainText('Email or password is incorrect.');
 
     release();
     expect((await login).status()).toBe(401);
+    // Focus returns from the heading to the button.
     await expect(page.getByTestId('login-submit')).toBeFocused();
     await expect(page.getByRole('alert')).toContainText('Email or password is incorrect.');
     // A new alert region, so assistive technology announces the repeated error.
@@ -2700,6 +3104,106 @@ test('a fresh load of My bookings while signed out lands on the login page with 
   await expect(page.getByRole('heading', { level: 1, name: 'Log in' })).toBeFocused();
 });
 
+/** How a link within the app opens the register page, and where focus must then be. */
+interface RegisterEntryCase {
+  /** The link and its activation, for the test title. */
+  title: string;
+  /** The page the guest starts on, the app's first. */
+  from: string;
+  /** The test hook of the link that opens the register page. */
+  link: string;
+  /** Activates the link. */
+  activate(link: Locator): Promise<void>;
+  /**
+   * Whether the link stays on screen after the navigation, as the nav bar's
+   * does, and so keeps focus; otherwise it leaves with its page and the
+   * register heading takes focus.
+   */
+  survives: boolean;
+}
+
+/**
+ * The entries, one test each. `press` focuses the link before it presses
+ * Enter, as a guest who tabbed to it does.
+ */
+const REGISTER_ENTRY_CASES: readonly RegisterEntryCase[] = [
+  {
+    title: '"Create an account" by Enter',
+    from: '/login',
+    link: 'register-link',
+    activate: (link) => link.press('Enter'),
+    survives: false,
+  },
+  {
+    title: '"Create an account" by a pointer click',
+    from: '/login',
+    link: 'register-link',
+    activate: (link) => link.click(),
+    survives: false,
+  },
+  {
+    title: 'nav "Register" by Enter',
+    from: '/search',
+    link: 'nav-register',
+    activate: (link) => link.press('Enter'),
+    survives: true,
+  },
+  {
+    title: 'nav "Register" by a pointer click',
+    from: '/search',
+    link: 'nav-register',
+    activate: (link) => link.click(),
+    survives: true,
+  },
+];
+
+for (const c of REGISTER_ENTRY_CASES) {
+  test(`${c.title} opens the register page with focus on ${c.survives ? 'the link, which stays' : 'its heading'}`, async ({
+    page,
+  }) => {
+    await page.goto(c.from);
+    const link = page.getByTestId(c.link);
+    const heading = page.getByRole('heading', { level: 1, name: 'Register' });
+
+    await test.step(`activate ${c.title}`, async () => {
+      await c.activate(link);
+      await expect(page).toHaveURL('/register');
+      // The render that shows the heading is the one that would move focus.
+      await expect(heading).toBeVisible();
+    });
+
+    if (c.survives) {
+      await test.step('the link keeps focus', async () => {
+        await expect(link).toBeFocused();
+        await expect(heading).not.toBeFocused();
+      });
+    } else {
+      await test.step('the link left with the login page, and the register heading takes focus', async () => {
+        await expect(link).toHaveCount(0);
+        await expect(heading).toBeFocused();
+      });
+    }
+  });
+}
+
+test('a reload of the register page leaves focus on the body', async ({ page }) => {
+  await page.goto('/login');
+  const heading = page.getByRole('heading', { level: 1, name: 'Register' });
+
+  await test.step('"Create an account" opens the register page with focus on its heading', async () => {
+    await page.getByTestId('register-link').click();
+    await expect(page).toHaveURL('/register');
+    await expect(heading).toBeFocused();
+  });
+
+  await test.step('a reload opens the register page as the first page of the app, with focus left on the body', async () => {
+    await page.reload();
+    await expect(heading).toBeVisible();
+    await expect(heading).not.toBeFocused();
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
+  });
+});
+
 /**
  * Records every uncaught exception, and every error the app reports to the
  * console, such as Angular's report of a promise rejection nothing handled,
@@ -2760,7 +3264,7 @@ test('a login whose next page fails to load stays on the login page, signed in, 
       'You are logged in, but the next page could not be opened. Reload the page and log in again.',
     );
     await expect(page).toHaveURL('/login?returnUrl=%2Fbookings');
-    // The pending state disabled the focused button; focus returns to it.
+    // Focus that the heading held while the button was disabled returns to it.
     await expect(page.getByTestId('login-submit')).toBeFocused();
     expect(reported, 'uncaught exceptions and console errors').toEqual([]);
   });
@@ -2821,7 +3325,7 @@ test('a registration whose login page cannot be opened stays on the register pag
       'Your account was created, but the login page could not be opened. Reload the page, then log in.',
     );
     await expect(page).toHaveURL('/register');
-    // The pending state disabled the focused button; focus returns to it.
+    // Focus that the heading held while the button was disabled returns to it.
     await expect(page.getByTestId('register-submit')).toBeFocused();
     await expect(page.getByTestId('nav-login')).toBeVisible();
     expect(reported, 'uncaught exceptions and console errors').toEqual([]);

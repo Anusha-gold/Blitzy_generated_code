@@ -121,12 +121,15 @@ const FIRST_NAVIGATION_ID = 1;
  * includes the guard's redirect that ends the app's first navigation, as when
  * a fresh load opens `/bookings` signed out; a fresh load or a reload of this
  * page itself leaves focus alone. The submit button stays natively disabled
- * while the login is pending, which drops its focus to the document body.
- * After a failure, once the error has rendered, focus that was dropped goes
- * to the first field the error marks invalid, or back to the submit button,
- * unless the guest or the page moved focus while the login was pending or
- * focus has left the page. After a success, it goes
- * to the heading of the page the guest lands on as soon as that heading
+ * while the login is pending, and a disabled button loses focus, so a submit
+ * from the focused button first hands focus to this page's heading, which
+ * stays rendered and focusable meanwhile; Enter in a field leaves focus in
+ * that field. After a failure, once the error has rendered, focus still on
+ * the heading, or dropped to the document body, goes to the first field the
+ * error marks invalid, or back to the submit button, unless the guest or the
+ * page moved focus while the login was pending or focus has left the page.
+ * After a success, this page and its heading leave the document, and focus
+ * goes to the heading of the page the guest lands on as soon as that heading
  * renders, unless focus has moved to another element or out of the page, or
  * the guest has navigated on, by then. When that page could not be opened,
  * focus returns once the inline error has rendered, as after a failure.
@@ -190,6 +193,9 @@ export class LoginPageComponent {
 
   /** The "Log in" button, which the pending state disables. */
   @ViewChild('submitButton') private submitButton?: ElementRef<HTMLButtonElement>;
+
+  /** The page's "Log in" heading, which holds focus while a login sent from the "Log in" button is pending. */
+  @ViewChild('heading') private heading?: ElementRef<HTMLHeadingElement>;
 
   /**
    * The credentials as the inputs report them; a `type="email"` input already
@@ -352,7 +358,8 @@ export class LoginPageComponent {
    * success, `AuthService` has stored the session, the error is cleared and
    * the guest continues to the safe return URL, or stays here with an inline
    * error when that page cannot be opened; on failure the error replaces the
-   * previous one inline.
+   * previous one inline. A submit from the focused "Log in" button hands
+   * focus to the page heading while the login is pending.
    */
   protected submit(): void {
     // The disabled submit button already blocks this; the guard keeps a second
@@ -363,9 +370,23 @@ export class LoginPageComponent {
 
     const focused = this.document.activeElement;
     const trigger = focused instanceof HTMLElement && focused !== this.document.body ? focused : null;
-    // Started before the pending state disables the focused button, which
-    // fires only `focusout`: every `focusin` from here on is a move the guest
-    // or the page made.
+    // The pending state disables the "Log in" button, and a disabled button
+    // loses focus to the document body. So when that button holds focus, it
+    // is handed now, before the disabled state renders, to the page heading,
+    // which stays rendered and focusable while the login is pending. The
+    // focus itself scrolls nothing; the heading is then scrolled only as far
+    // as it takes to show it, its focus ring included, which is not at all
+    // when it shows already, so a form scrolled past its heading still shows
+    // where focus is. Enter in a field leaves focus there.
+    const holder =
+      trigger !== null && trigger === this.submitButton?.nativeElement ? (this.heading?.nativeElement ?? null) : null;
+    if (holder !== null) {
+      holder.focus({ preventScroll: true });
+      holder.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    // Started after that hand-off and before the pending state disables the
+    // button, which fires only `focusout`: every `focusin` from here on is a
+    // move the guest or the page made.
     const focusMoves = watchFocusMoves(this.document);
     // The previous error stays on screen until this attempt's answer replaces
     // it, so nothing below it moves while the request is pending.
@@ -393,12 +414,14 @@ export class LoginPageComponent {
             .then(
               (navigated) => {
                 if (navigated) {
+                  // This page, its heading that held focus included, has left
+                  // the document, so focus is on the body.
                   focusLandingPageAfterRender(this.document, this.appInjector, this.router);
                 } else {
-                  this.showUnopenedNextPage({ trigger, focusMoves });
+                  this.showUnopenedNextPage({ trigger, holder, focusMoves });
                 }
               },
-              () => this.showUnopenedNextPage({ trigger, focusMoves }),
+              () => this.showUnopenedNextPage({ trigger, holder, focusMoves }),
             );
         },
         error: (err: unknown) => {
@@ -407,7 +430,7 @@ export class LoginPageComponent {
               ? { ...toUiError(err), title: WRONG_CREDENTIALS_TITLE, detail: null, fieldErrors: [] }
               : toUiError(err),
           );
-          this.restoreFocusAfterError(trigger, focusMoves);
+          this.restoreFocusAfterError(trigger, holder, focusMoves);
         },
       });
   }
@@ -421,21 +444,25 @@ export class LoginPageComponent {
    * could not be opened. Reload the page and log in again." renders through
    * `ErrorMessageComponent`.
    * The rejection reason is neither shown nor logged. After a submit, focus
-   * that the pending state dropped then returns as after a failed login. A
-   * page that a navigation has destroyed by then shows nothing.
+   * that the submit handed to the heading, or that the pending state dropped,
+   * then returns as after a failed login. A page that a navigation has
+   * destroyed by then shows nothing.
    *
    * @param attempt - The submit whose navigation did not open the page, with
-   *   the element focused at submit and its record of focus moves, or `null`
-   *   for the move on of a guest already signed in when the page opened.
+   *   the element focused at submit, the element it handed focus to and its
+   *   record of focus moves, or `null` for the move on of a guest already
+   *   signed in when the page opened.
    */
-  private showUnopenedNextPage(attempt: { trigger: HTMLElement | null; focusMoves: FocusMoves } | null): void {
+  private showUnopenedNextPage(
+    attempt: { trigger: HTMLElement | null; holder: HTMLElement | null; focusMoves: FocusMoves } | null,
+  ): void {
     if (this.destroyed()) {
       return;
     }
     this.redirecting.set(false);
     this.showError({ status: 0, title: NEXT_PAGE_UNOPENED_TITLE, detail: null, fieldErrors: [] });
     if (attempt !== null) {
-      this.restoreFocusAfterError(attempt.trigger, attempt.focusMoves);
+      this.restoreFocusAfterError(attempt.trigger, attempt.holder, attempt.focusMoves);
     }
   }
 
@@ -449,21 +476,28 @@ export class LoginPageComponent {
   }
 
   /**
-   * Moves focus that the pending state dropped, once the error on screen has
-   * rendered, to the first input the error marks invalid, back to `trigger`,
-   * or to the "Log in" button, as {@link restoreFocusAfterFailedSubmit} sets
-   * out. This page's own injector registers it, so a page destroyed before
-   * that render moves nothing.
+   * Moves focus that the submit handed to the heading, or that the pending
+   * state dropped, once the error on screen has rendered, to the first input
+   * the error marks invalid, back to `trigger`, or to the "Log in" button, as
+   * {@link restoreFocusAfterFailedSubmit} sets out. This page's own injector
+   * registers it, so a page destroyed before that render moves nothing.
    *
    * @param trigger - The element focused when the guest submitted, or `null`.
+   * @param holder - The heading the submit handed focus to, or `null` when it
+   *   handed none over.
    * @param focusMoves - The record, started at submit, of the focus moves
    *   made while the request was pending.
    */
-  private restoreFocusAfterError(trigger: HTMLElement | null, focusMoves: FocusMoves): void {
+  private restoreFocusAfterError(
+    trigger: HTMLElement | null,
+    holder: HTMLElement | null,
+    focusMoves: FocusMoves,
+  ): void {
     restoreFocusAfterFailedSubmit(
       this.document,
       this.injector,
       trigger,
+      holder,
       focusMoves,
       () => this.submitButton?.nativeElement ?? null,
       () => this.firstInvalidInput(),
@@ -621,7 +655,8 @@ function hasRawControlOrWhiteSpace(value: string): boolean {
 }
 
 /**
- * Whether focus moved while a submit was pending, as {@link watchFocusMoves}
+ * Whether focus moved while a submit was pending, after the submit's own
+ * hand-off of focus to the page's heading, as {@link watchFocusMoves}
  * records it; the login and register pages keep one per attempt.
  */
 export interface FocusMoves {
@@ -634,10 +669,13 @@ export interface FocusMoves {
 /**
  * Starts recording whether any element of `document` takes focus, through a
  * `focusin` listener on the document in the capture phase, so a move counts
- * whatever the focused element's own handlers do. Disabling a focused button
- * fires `focusout` only, so while a submit is pending every `focusin` is a
- * move the guest or the page made. Focus leaving the document fires no
- * `focusin`; `document.hasFocus()` tells that case.
+ * whatever the focused element's own handlers do. The login and register
+ * pages start it once a submit has handed focus from the submit button to
+ * the page's heading, so that hand-off does not count, and before the
+ * pending state disables the button. Disabling a button fires `focusout`
+ * only, so while a submit is pending every `focusin` is a move the guest or
+ * the page made. Focus leaving the document fires no `focusin`;
+ * `document.hasFocus()` tells that case.
  *
  * @param document - The document the app renders into.
  * @returns The record, which keeps listening until its `stop` is called.
@@ -686,13 +724,15 @@ export function showErrorInNewAlert(
 /**
  * Moves focus once the inline error of a failed login or registration, or of
  * the navigation after a successful one, has rendered and the answer has
- * re-enabled the page's submit button. Disabling the focused button while the
- * request is pending drops focus to the document body, and only that drop is
- * undone: focus moves only when nothing took focus while the request was
- * pending, the document still has focus, and focus is on the body, on
- * nothing, or still on that button. Anything else keeps it: the field Enter
- * was pressed in, an element the guest or the page focused meanwhile, even
- * one focus has since left, and a place outside the document, such as the
+ * re-enabled the page's submit button. The pending state disables that
+ * button, and a disabled button loses focus to the document body, so a
+ * submit from the focused button first hands focus to `holder`, the page's
+ * heading. Only that hand-off, or a drop to the body, is undone: focus moves
+ * only when nothing took focus while the request was pending, the document
+ * still has focus, and focus is still on `holder`, on the body, on nothing,
+ * or still on that button. Anything else keeps it: the field Enter was
+ * pressed in, an element the guest or the page focused meanwhile, even one
+ * focus has since left, and a place outside the document, such as the
  * browser's own controls a Tab past the page's last element reaches, where
  * the body is active but the document has no focus. It goes to the first
  * input, in form order, that the error marks invalid, and otherwise back to
@@ -703,8 +743,11 @@ export function showErrorInNewAlert(
  * @param injector - The page's own injector, which registers the move after
  *   the next render, so a page destroyed before that render moves nothing.
  * @param trigger - The element focused when the guest submitted, or `null`.
- * @param focusMoves - The record, started at submit, of the focus moves made
- *   while the request was pending.
+ * @param holder - The element the submit handed focus to, before the pending
+ *   state disabled the focused submit button, or `null` when it handed none
+ *   over, as after Enter in a field.
+ * @param focusMoves - The record, started at submit once focus was handed
+ *   over, of the focus moves made while the request was pending.
  * @param submitButton - Reads, once the error has rendered, the page's submit
  *   button, or `null` when it is not rendered.
  * @param firstInvalidInput - Reads, once the error has rendered, the first
@@ -715,6 +758,7 @@ export function restoreFocusAfterFailedSubmit(
   document: Document,
   injector: Injector,
   trigger: HTMLElement | null,
+  holder: HTMLElement | null,
   focusMoves: FocusMoves,
   submitButton: () => HTMLButtonElement | null,
   firstInvalidInput: () => HTMLInputElement | null,
@@ -726,7 +770,7 @@ export function restoreFocusAfterFailedSubmit(
       if (
         focusMoves.moved() ||
         !document.hasFocus() ||
-        (active !== null && active !== document.body && active !== button)
+        (active !== null && active !== document.body && active !== button && active !== holder)
       ) {
         return;
       }

@@ -1,4 +1,4 @@
-<h1 tabindex="-1">Find a hotel</h1>
+<h1 #heading tabindex="-1">Find a hotel</h1>
 
 <form [formGroup]="form" (ngSubmit)="submit()">
   <div class="field">
@@ -49,7 +49,7 @@
       [attr.aria-describedby]="fieldErrors().get('guests') ?? null"
     />
   </div>
-  <button type="submit" data-testid="search-submit" [disabled]="pending()">Search</button>
+  <button #searchButton type="submit" data-testid="search-submit" [disabled]="pending()">Search</button>
 </form>
 
 <app-error-message [error]="error()" [fieldErrorIdPrefix]="errorIdPrefix"></app-error-message>
@@ -76,12 +76,18 @@
   <ng-container *ngIf="results() as list">
     <ul *ngIf="list.length > 0" class="results" role="list" aria-label="Search results">
       <li *ngFor="let h of list; trackBy: trackById" [attr.data-testid]="'hotel-result-' + h.id">
-        <h2>{{ h.name }}</h2>
+        <h2 [attr.id]="'search-result-name-' + h.id">{{ h.name }}</h2>
         <p>{{ h.address }}</p>
         <p class="price">From {{ h.lowestNightlyPrice | currency: 'USD' }} / night</p>
+        <!-- Every link shows "View rooms", and its name continues with its
+             card's heading, "View rooms <hotel name>", so each link names the
+             hotel it opens even out of its card, starting with its visible
+             label. The ids come from the hotel id, unique in the one list. -->
         <a
+          [attr.id]="'search-result-link-' + h.id"
           [routerLink]="['/hotels', h.id]"
           [queryParams]="{ checkIn: s.checkIn, checkOut: s.checkOut, guests: s.guests }"
+          [attr.aria-labelledby]="'search-result-link-' + h.id + ' search-result-name-' + h.id"
           [attr.data-testid]="'view-rooms-' + h.id"
         >View rooms</a>
       </li>

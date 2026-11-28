@@ -23,6 +23,7 @@ import { AuthService } from '../../core/auth/auth.service';
 import { fieldErrorIds, toUiError, withoutFieldErrors, type UiError } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
 import {
+  focusHeadingOnInAppEntry,
   handedOverReturnUrl,
   restoreFocusAfterFailedSubmit,
   showErrorInNewAlert,
@@ -60,15 +61,22 @@ const LOGIN_PAGE_UNOPENED_TITLE =
  * returns to the hotel after registering. Without one, that link is exactly
  * `/login` and no state is passed.
  *
- * Focus: the submit button stays natively disabled while the registration is
- * pending, which drops its focus to the document body. After a failure, once
- * the error has rendered, focus that was dropped goes to the first field the
- * error marks invalid, or back to the submit button, unless the guest or the
- * page moved focus while the registration was pending or focus has left the
- * page. After the 201 the login page moves it onto its own heading once that
- * renders, as on every entry from within the app; when the login page could
- * not be opened, it returns once the inline error has rendered, as after a
- * failure.
+ * Focus: when a navigation within the app opens this page, as "Create an
+ * account" on the login page does, its heading takes focus once it renders,
+ * unless focus is on another element, such as the nav bar's "Register" link,
+ * or outside the page by then; a fresh load or reload of this page leaves focus
+ * alone. The submit button stays natively disabled while the registration is
+ * pending, and a disabled button loses focus, so a submit from the focused
+ * button first hands focus to this page's heading, which stays rendered and
+ * focusable meanwhile; Enter in a field leaves focus in that field. After a
+ * failure, once the error has rendered, focus still on the heading, or
+ * dropped to the document body, goes to the first field the error marks
+ * invalid, or back to the submit button, unless the guest or the page moved
+ * focus while the registration was pending or focus has left the page. After
+ * the 201 this page and its heading leave the document, and the login page
+ * moves focus onto its own heading once that renders, as on every entry from
+ * within the app; when the login page could not be opened, focus returns once
+ * the inline error has rendered, as after a failure.
  *
  * Validation: the page adds no validators of its own and never gates
  * submission on validity; the template's `required` attributes mark the
@@ -106,7 +114,11 @@ export class RegisterPageComponent {
   /** Tells which element has focus, at submit and once a failed registration's answer has rendered. */
   private readonly document = inject(DOCUMENT);
 
-  /** Registers the focus restore after the next render, outside an injection context. */
+  /**
+   * Registers the focus restore after the next render, outside an injection
+   * context, and the focus move onto this page's heading on entry; both end
+   * with the page.
+   */
   private readonly injector = inject(Injector);
 
   /** The email input, a target when the error marks that field invalid. */
@@ -120,6 +132,12 @@ export class RegisterPageComponent {
 
   /** The "Create account" button, which the pending state disables. */
   @ViewChild('submitButton') private submitButton?: ElementRef<HTMLButtonElement>;
+
+  /**
+   * The page's "Register" heading, which holds focus while a registration
+   * sent from the "Create account" button is pending.
+   */
+  @ViewChild('heading') private heading?: ElementRef<HTMLHeadingElement>;
 
   /**
    * The registration fields as the inputs report them; a `type="email"` input
@@ -180,13 +198,19 @@ export class RegisterPageComponent {
         this.error.update((shown) => (shown === null ? null : withoutFieldErrors(shown, field)));
       });
     }
+
+    // "Create an account" leaves with the login page, so focus is on the
+    // body; the nav bar's "Register" link stays and keeps it.
+    focusHeadingOnInAppEntry(this.document, this.injector, this.router);
   }
 
   /**
    * Sends the registration. On the 201 it hands the email to the login page
    * and navigates to `/login?registered=1`, with any held return URL in the
    * router state, or stays here with an inline error when that page cannot be
-   * opened; on failure it shows the inline error.
+   * opened; on failure it shows the inline error. A submit from the focused
+   * "Create account" button hands focus to the page heading while the
+   * registration is pending.
    */
   protected submit(): void {
     // The disabled submit button already blocks this; the guard keeps a second
@@ -197,9 +221,23 @@ export class RegisterPageComponent {
 
     const focused = this.document.activeElement;
     const trigger = focused instanceof HTMLElement && focused !== this.document.body ? focused : null;
-    // Started before the pending state disables the focused button, which
-    // fires only `focusout`: every `focusin` from here on is a move the guest
-    // or the page made.
+    // The pending state disables the "Create account" button, and a disabled
+    // button loses focus to the document body. So when that button holds
+    // focus, it is handed now, before the disabled state renders, to the page
+    // heading, which stays rendered and focusable while the registration is
+    // pending. The focus itself scrolls nothing; the heading is then scrolled
+    // only as far as it takes to show it, its focus ring included, which is
+    // not at all when it shows already, so a form scrolled past its heading
+    // still shows where focus is. Enter in a field leaves focus there.
+    const holder =
+      trigger !== null && trigger === this.submitButton?.nativeElement ? (this.heading?.nativeElement ?? null) : null;
+    if (holder !== null) {
+      holder.focus({ preventScroll: true });
+      holder.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    // Started after that hand-off and before the pending state disables the
+    // button, which fires only `focusout`: every `focusin` from here on is a
+    // move the guest or the page made.
     const focusMoves = watchFocusMoves(this.document);
     // The previous error stays on screen until this attempt's answer replaces
     // it, so nothing below it moves while the request is pending.
@@ -224,14 +262,15 @@ export class RegisterPageComponent {
           this.error.set(null);
           this.auth.pendingLoginEmail.set(email);
           const state = this.returnUrl === null ? undefined : { returnUrl: this.returnUrl };
-          // The login page moves focus onto its own heading on entry.
+          // The login page moves focus onto its own heading on entry, once
+          // this page, its heading that held focus included, has left.
           void this.router.navigate(['/login'], { queryParams: { registered: 1 }, state }).then(
             (navigated) => {
               if (!navigated) {
-                this.showUnopenedLoginPage(email, trigger, focusMoves);
+                this.showUnopenedLoginPage(email, trigger, holder, focusMoves);
               }
             },
-            () => this.showUnopenedLoginPage(email, trigger, focusMoves),
+            () => this.showUnopenedLoginPage(email, trigger, holder, focusMoves),
           );
         },
         error: (err: unknown) => {
@@ -240,7 +279,7 @@ export class RegisterPageComponent {
               ? { ...toUiError(err), title: EMAIL_TAKEN_TITLE, detail: null, fieldErrors: [] }
               : toUiError(err),
           );
-          this.restoreFocusAfterError(trigger, focusMoves);
+          this.restoreFocusAfterError(trigger, holder, focusMoves);
         },
       });
   }
@@ -257,16 +296,23 @@ export class RegisterPageComponent {
    * `ErrorMessageComponent`: the browser keeps failing a module it could not
    * load until the page reloads, after which "Already registered? Log in" and
    * the nav bar's "Log in" lead on. The rejection reason is neither shown nor
-   * logged. Focus that the pending state dropped then returns as after a
-   * failed registration. A page that a navigation has destroyed by then shows
-   * nothing.
+   * logged. Focus that the submit handed to the heading, or that the pending
+   * state dropped, then returns as after a failed registration. A page that a
+   * navigation has destroyed by then shows nothing.
    *
    * @param email - The email this registration handed to the login page.
    * @param trigger - The element focused when the guest submitted, or `null`.
+   * @param holder - The heading the submit handed focus to, or `null` when it
+   *   handed none over.
    * @param focusMoves - The record, started at submit, of the focus moves
    *   made while the request was pending.
    */
-  private showUnopenedLoginPage(email: string, trigger: HTMLElement | null, focusMoves: FocusMoves): void {
+  private showUnopenedLoginPage(
+    email: string,
+    trigger: HTMLElement | null,
+    holder: HTMLElement | null,
+    focusMoves: FocusMoves,
+  ): void {
     if (this.auth.pendingLoginEmail() === email) {
       this.auth.pendingLoginEmail.set(null);
     }
@@ -274,7 +320,7 @@ export class RegisterPageComponent {
       return;
     }
     this.showError({ status: 0, title: LOGIN_PAGE_UNOPENED_TITLE, detail: null, fieldErrors: [] });
-    this.restoreFocusAfterError(trigger, focusMoves);
+    this.restoreFocusAfterError(trigger, holder, focusMoves);
   }
 
   /**
@@ -287,21 +333,29 @@ export class RegisterPageComponent {
   }
 
   /**
-   * Moves focus that the pending state dropped, once the error on screen has
-   * rendered, to the first input the error marks invalid, back to `trigger`,
-   * or to the "Create account" button, as
-   * {@link restoreFocusAfterFailedSubmit} sets out. This page's own injector
-   * registers it, so a page destroyed before that render moves nothing.
+   * Moves focus that the submit handed to the heading, or that the pending
+   * state dropped, once the error on screen has rendered, to the first input
+   * the error marks invalid, back to `trigger`, or to the "Create account"
+   * button, as {@link restoreFocusAfterFailedSubmit} sets out. This page's
+   * own injector registers it, so a page destroyed before that render moves
+   * nothing.
    *
    * @param trigger - The element focused when the guest submitted, or `null`.
+   * @param holder - The heading the submit handed focus to, or `null` when it
+   *   handed none over.
    * @param focusMoves - The record, started at submit, of the focus moves
    *   made while the request was pending.
    */
-  private restoreFocusAfterError(trigger: HTMLElement | null, focusMoves: FocusMoves): void {
+  private restoreFocusAfterError(
+    trigger: HTMLElement | null,
+    holder: HTMLElement | null,
+    focusMoves: FocusMoves,
+  ): void {
     restoreFocusAfterFailedSubmit(
       this.document,
       this.injector,
       trigger,
+      holder,
       focusMoves,
       () => this.submitButton?.nativeElement ?? null,
       () => this.firstInvalidInput(),

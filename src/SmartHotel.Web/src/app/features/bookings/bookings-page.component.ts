@@ -764,8 +764,9 @@ export class BookingsPageComponent implements AfterViewInit {
    * Moves focus to the confirmation banner after the render that first shows
    * it, which follows the entry load, because the banner confirms the
    * handed-over booking's row in the loaded list. The "Book" button that sent
-   * the booking left the document with the hotel page, so focus is normally
-   * on the document body; it moves only from the body or from nothing, so an
+   * the booking, and the rooms region that held focus while it was pending,
+   * left the document with the hotel page, so focus is normally on the
+   * document body; it moves only from the body or from nothing, so an
    * element the guest focused meanwhile keeps focus. Does nothing when the
    * entry load shows no banner.
    */

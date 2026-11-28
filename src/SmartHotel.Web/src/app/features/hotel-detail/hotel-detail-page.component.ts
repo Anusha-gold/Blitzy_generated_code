@@ -342,10 +342,31 @@ export class HotelDetailPageComponent {
 
   /**
    * The focusable rooms region around the room table, rendered while the
-   * loaded hotel has room types; where focus lands after a booking answer when
-   * the "Book" it should return to is gone or disabled.
+   * loaded hotel has room types; where focus waits while a booking sent from
+   * a focused "Book" is pending, and where it lands after a booking answer
+   * when the "Book" it should return to is gone or disabled.
    */
   @ViewChild('roomsScroll') private roomsScroll?: ElementRef<HTMLDivElement>;
+
+  /**
+   * The rooms region while it holds the focus that the booking in flight
+   * handed it from a "Book" that the pending state disables, so that its
+   * answer can treat focus still there as handed over. `null` when that
+   * booking handed none over; once focus has left the region, for another
+   * element or out of the document, after which focus back on it is the
+   * guest's own; and once
+   * {@link HotelDetailPageComponent.restoreFocusAfterBooking} has taken it for
+   * that answer.
+   */
+  private bookingFocusHolder: HTMLElement | null = null;
+
+  /**
+   * Ends the watch that clears {@link HotelDetailPageComponent.bookingFocusHolder}
+   * when focus leaves the region: removes the region's `focusout` listener and
+   * the page-destroy callback that removes it otherwise. `null` while no watch
+   * runs.
+   */
+  private endBookingFocusWatch: (() => void) | null = null;
 
   /**
    * The heading of the load error shown in place of the content, focusable
@@ -557,7 +578,12 @@ export class HotelDetailPageComponent {
    * answer that keeps the guest on this page can move focus to "Log in again"
    * after a 401 shown above the table, back to it otherwise, or, when the
    * button is gone or disabled by then, to the rooms region, or to the load
-   * error's heading when a failed revalidation has removed the table.
+   * error's heading when a failed revalidation has removed the table. Every
+   * "Book" is disabled while the request is pending, and a disabled button
+   * loses focus, so when a "Book" holds focus as the request is sent, focus
+   * is handed at once, before the pending state renders, to the rooms
+   * region, which stays rendered and focusable meanwhile, as
+   * {@link HotelDetailPageComponent.handBookingFocusTo} sets out.
    *
    * @param rt - The room type whose "Book" button was clicked.
    */
@@ -575,6 +601,16 @@ export class HotelDetailPageComponent {
 
     const focused = this.document.activeElement;
     const trigger = focused instanceof HTMLElement && focused !== this.document.body ? focused : null;
+    // A hand-off that an earlier booking's answer never took, as when a
+    // 201's navigation to My bookings did not leave this page, ends here, so
+    // only this booking's own hand-off can count.
+    this.takeBookingFocusHolder();
+    // The only buttons in the rooms region are the "Book" buttons, all of
+    // which the pending state disables.
+    const region = this.roomsScroll?.nativeElement ?? null;
+    if (region !== null && trigger instanceof HTMLButtonElement && region.contains(trigger)) {
+      this.handBookingFocusTo(region, trigger);
+    }
     this.bookErrorShown.set(null);
     this.lateOutcomeShown.set(null);
     this.sessionEnded.set(false);
@@ -1020,7 +1056,8 @@ export class HotelDetailPageComponent {
    * the fresh counts arrive; a revalidation that fails shows its error in
    * place of the content, with "Retry", and the notice stays. Focus then moves
    * to that link when it is still on the document body, on nothing or on
-   * `trigger`, never back to the "Book" that made the booking. Once `owner`
+   * `trigger`, or on the rooms region the booking handed it to, never back to
+   * the "Book" that made the booking. Once `owner`
    * has ended, the answer is suppressed instead, as
    * {@link HotelDetailPageComponent.suppressAnswer} describes.
    *
@@ -1058,15 +1095,19 @@ export class HotelDetailPageComponent {
   /**
    * Moves focus, once the late-booking notice has rendered, to its "View it
    * in My bookings" link when focus is still on the document body, on nothing
-   * or on `trigger`; anything else the guest focused meanwhile keeps focus.
+   * or on `trigger`, or has stayed on the rooms region since the booking
+   * handed it there from a focused "Book"
+   * ({@link HotelDetailPageComponent.takeBookingFocusHolder}); anything else
+   * the guest focused meanwhile keeps focus.
    *
    * @param trigger - The element focused when the booking was sent, or `null`.
    */
   private focusLateBookingLink(trigger: HTMLElement | null): void {
+    const holder = this.takeBookingFocusHolder();
     afterNextRender(
       () => {
         const active = this.document.activeElement;
-        if (active !== null && active !== this.document.body && active !== trigger) {
+        if (active !== null && active !== this.document.body && active !== trigger && active !== holder) {
           return;
         }
         const link = this.lateBookingLink?.nativeElement;
@@ -1307,26 +1348,32 @@ export class HotelDetailPageComponent {
    * that failed and removed the hotel content, focus moves to the heading of
    * the load error shown in its place, beside which the booking error stays.
    * It never moves to another room type's "Book", where one more Enter would
-   * book a room the guest did not choose. Disabling the focused "Book" button
-   * while the request is pending can drop focus to the document body, so
-   * focus moves only when it is still on the body, on nothing, or on
-   * `trigger`; anything else the guest focused meanwhile keeps focus. With
-   * none of these targets rendered, focus stays where it is. An answer
-   * suppressed because its session ended calls this too, once the
-   * session-ended notice is shown. An answer that arrives once the page is
-   * destroyed never calls this, and a 201 for the stay on screen whose
-   * session is still live navigates to My bookings instead, or, when that
-   * page does not open, focuses the late-booking notice's link
+   * book a room the guest did not choose. A booking sent from a focused
+   * "Book" handed focus to the rooms region while it was pending, and a
+   * disabled button that still held focus, or content hidden or removed
+   * meanwhile, drops focus to the document body, so focus moves only when it
+   * has stayed on the region since that booking handed it there, or is on
+   * the body, on nothing, or on `trigger`; anything else the guest focused
+   * meanwhile keeps focus, and so does the region once focus has left it and
+   * the guest has brought it back. With none of these targets rendered, focus
+   * stays where it is. An answer suppressed because its session ended calls
+   * this too, once the session-ended notice is shown. An answer that arrives
+   * once the page is destroyed never calls this, and a 201 for the stay on
+   * screen whose session is still live navigates to My bookings instead,
+   * where the rooms region has left the document with this page, so focus is
+   * on the body there, or, when that page does not open, focuses the
+   * late-booking notice's link
    * ({@link HotelDetailPageComponent.confirmationUnopened}).
    *
    * @param trigger - The element focused when the request was sent, or `null`.
    * @param unauthorized - Whether the booking failed with 401.
    */
   private restoreFocusAfterBooking(trigger: HTMLElement | null, unauthorized: boolean): void {
+    const holder = this.takeBookingFocusHolder();
     afterNextRender(
       () => {
         const active = this.document.activeElement;
-        if (active !== null && active !== this.document.body && active !== trigger) {
+        if (active !== null && active !== this.document.body && active !== trigger && active !== holder) {
           return;
         }
 
@@ -1341,5 +1388,60 @@ export class HotelDetailPageComponent {
       },
       { injector: this.injector },
     );
+  }
+
+  /**
+   * Hands focus from `trigger`, the focused "Book" whose booking is being
+   * sent, to `region`, the rooms region around it, before the pending state
+   * disables that button, and records the region as
+   * {@link HotelDetailPageComponent.bookingFocusHolder} for as long as focus
+   * stays on it. The region holds the pressed "Book", so it shows wherever
+   * that button does: the focus itself scrolls nothing, and the pressed
+   * "Book" is then scrolled only as far as it takes to show it, which is not
+   * at all when it shows already, as after a click or a Tab to it. Scrolling
+   * to the region instead could move a region taller than the screen away
+   * from the pressed "Book". The first `focusout` from the region, for
+   * another element or out of the document, ends the record, as does the end
+   * of the page or {@link HotelDetailPageComponent.takeBookingFocusHolder};
+   * each removes the listener. Nothing is recorded when the region does not
+   * take focus.
+   *
+   * @param region - The rooms region, which takes focus.
+   * @param trigger - The focused "Book" inside it.
+   */
+  private handBookingFocusTo(region: HTMLElement, trigger: HTMLButtonElement): void {
+    region.focus({ preventScroll: true });
+    if (this.document.activeElement !== region) {
+      return;
+    }
+    trigger.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    // Added only now, so the pressed button's own focusout, fired as the
+    // region took focus, does not end the record.
+    const release = (): void => {
+      this.takeBookingFocusHolder();
+    };
+    region.addEventListener('focusout', release);
+    const unregister = this.destroyRef.onDestroy(release);
+    this.bookingFocusHolder = region;
+    this.endBookingFocusWatch = () => {
+      region.removeEventListener('focusout', release);
+      unregister();
+    };
+  }
+
+  /**
+   * Takes {@link HotelDetailPageComponent.bookingFocusHolder} and ends its
+   * watch, removing the region's listener, so a later focus on the region is
+   * the guest's own.
+   *
+   * @returns The rooms region while focus has stayed on it since a booking
+   *   handed it there, otherwise `null`.
+   */
+  private takeBookingFocusHolder(): HTMLElement | null {
+    const holder = this.bookingFocusHolder;
+    this.bookingFocusHolder = null;
+    this.endBookingFocusWatch?.();
+    this.endBookingFocusWatch = null;
+    return holder;
   }
 }

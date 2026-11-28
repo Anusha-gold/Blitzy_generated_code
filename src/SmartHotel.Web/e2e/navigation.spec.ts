@@ -183,6 +183,22 @@ test('every navigable route is reachable by clicks', async ({ page }) => {
 
   await test.step('search, then "View rooms" opens /hotels/:id', async () => {
     await searchHotels(page, { city: 'Seattle', checkIn, checkOut, guests: 1 });
+    // Every link shows "View rooms", and its name continues with its own
+    // card's heading, so the links can be told apart out of their cards. The
+    // seed has two Seattle hotels, and no test books these dates.
+    const cards = await page.locator('[data-testid^="hotel-result-"]').all();
+    expect(cards.length).toBeGreaterThan(1);
+    const linkNames: string[] = [];
+    for (const card of cards) {
+      const name = ((await card.getByRole('heading', { level: 2 }).textContent()) ?? '').trim();
+      expect(name).not.toBe('');
+      const link = card.locator('[data-testid^="view-rooms-"]');
+      await expect(link).toHaveText('View rooms');
+      await expect(link).toHaveAccessibleName(`View rooms ${name}`);
+      linkNames.push(`View rooms ${name}`);
+    }
+    expect(new Set(linkNames).size).toBe(linkNames.length);
+
     const viewRooms = page.locator('[data-testid^="view-rooms-"]').first();
     await expect(viewRooms).toHaveText('View rooms');
     await viewRooms.click();

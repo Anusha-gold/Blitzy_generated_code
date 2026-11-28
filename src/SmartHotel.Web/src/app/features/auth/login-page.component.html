@@ -3,7 +3,7 @@
      page's fresh hand-off shows it to them, for the account just created, and
      a move on that does not reach the next page, with its inline error. -->
 <section *ngIf="!redirecting()" class="auth-page">
-  <h1 tabindex="-1">Log in</h1>
+  <h1 #heading tabindex="-1">Log in</h1>
 
   <!-- The visible notice is in the page's first frame, so it never pushes the
        form down. Assistive technology skips it and hears the same text once,

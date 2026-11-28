@@ -1,4 +1,15 @@
-import { ChangeDetectionStrategy, Component, Injector, afterNextRender, computed, inject, signal } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  DestroyRef,
+  ElementRef,
+  Injector,
+  ViewChild,
+  afterNextRender,
+  computed,
+  inject,
+  signal,
+} from '@angular/core';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { CurrencyPipe, DOCUMENT, NgFor, NgIf } from '@angular/common';
 import { ActivatedRoute, ParamMap, Router, RouterLink } from '@angular/router';
@@ -7,8 +18,21 @@ import { EMPTY, Observable, Subject, catchError, finalize, map, merge, switchMap
 
 import { HotelsApiService } from '../../core/api/hotels-api.service';
 import type { HotelSearchQuery, HotelSummary } from '../../core/api/models';
-import { UiError, fieldErrorIds, toUiError } from '../../core/http/problem-details';
+import { UiError, fieldErrorIds, toUiError, withoutFieldErrors } from '../../core/http/problem-details';
 import { ErrorMessageComponent } from '../../shared/error-message/error-message.component';
+
+/**
+ * A submit's hand-off of focus from the Search button, which the pending
+ * state disables, to the page heading, which keeps it while the search runs.
+ */
+interface HeadingHandOff {
+  /** The heading that took focus. */
+  readonly heading: HTMLElement;
+  /** Whether focus has stayed on the heading since the hand-off, up to `end`. */
+  readonly holds: () => boolean;
+  /** Ends the hand-off and removes its listener; calling it again does nothing. */
+  readonly end: () => void;
+}
 
 /**
  * The hotel search screen, route `search`: a city, a stay and a party size,
@@ -39,7 +63,9 @@ import { ErrorMessageComponent } from '../../shared/error-message/error-message.
  *   read the completed search's criteria, never the live form;
  * - an inline error through `ErrorMessageComponent`, mapped by `toUiError`:
  *   the server's 400 problem with its field errors, or "The service is
- *   unreachable." for status 0.
+ *   unreachable." for status 0. Editing a field the server rejected ends
+ *   that field's messages and invalid mark before any new search, as on the
+ *   register and login pages.
  *
  * The server is the only authority on the criteria: the page adds no
  * validators and never blocks a submission, so the server's 400 reaches the
@@ -74,6 +100,23 @@ export class SearchPageComponent {
   private focusedAtSubmit: HTMLElement | null = null;
 
   /**
+   * The last submit's hand-off of focus to the page heading, which travels
+   * with {@link SearchPageComponent.focusedAtSubmit} to the search that
+   * submit starts; `null` when that submit handed none over, and once that
+   * search has taken it.
+   */
+  private headingHandOff: HeadingHandOff | null = null;
+
+  /** The Search button, which the pending state disables. */
+  @ViewChild('searchButton') private searchButton?: ElementRef<HTMLButtonElement>;
+
+  /**
+   * The page's "Find a hotel" heading, which holds focus while a search sent
+   * from the Search button is pending.
+   */
+  @ViewChild('heading') private heading?: ElementRef<HTMLHeadingElement>;
+
+  /**
    * The search criteria as entered, every one the text its input holds. The
    * date inputs yield raw `yyyy-MM-dd` strings, and the guest count is a text
    * input with a numeric keyboard hint, so a decimal, exponent, signed,
@@ -96,7 +139,12 @@ export class SearchPageComponent {
   /** `true` while this page's own search request is in flight. */
   protected readonly pending = signal(false);
 
-  /** The failed search's error, or `null` when the last search did not fail. */
+  /**
+   * The failed search's error, or `null` when the last search did not fail.
+   * Each new search clears it. Editing a field drops that field's messages,
+   * and the whole error once no field message is left; an error without field
+   * messages, such as status 0, stays until the next search.
+   */
   protected readonly error = signal<UiError | null>(null);
 
   /** Prefix of the ids the inline error gives its field messages. */
@@ -106,7 +154,8 @@ export class SearchPageComponent {
    * The ids of the server's messages per rejected field (`city`, `checkIn`,
    * `checkOut`, `guests`), which the inputs reference through
    * `aria-describedby` and mark with `aria-invalid`; empty while there is no
-   * error, so each new search clears them.
+   * error, so each new search clears them. A field's entry lasts until the
+   * guest edits that field or the next search clears the error.
    */
   protected readonly fieldErrors = computed(() => fieldErrorIds(this.error(), this.errorIdPrefix));
 
@@ -123,6 +172,16 @@ export class SearchPageComponent {
   private readonly rerun$ = new Subject<void>();
 
   constructor() {
+    // Editing a field the server rejected ends that field's error, which
+    // also removes its aria-invalid mark and description. The control names
+    // are the API's error keys. `run` refilling or resetting the form emits
+    // here too, and then clears the whole error itself.
+    for (const [field, control] of Object.entries(this.form.controls)) {
+      control.valueChanges.pipe(takeUntilDestroyed()).subscribe(() => {
+        this.error.update((shown) => (shown === null ? null : withoutFieldErrors(shown, field)));
+      });
+    }
+
     merge(this.route.queryParamMap, this.rerun$.pipe(map(() => this.route.snapshot.queryParamMap)))
       .pipe(
         switchMap((params) => {
@@ -131,14 +190,23 @@ export class SearchPageComponent {
           // for a later back/forward search to act on.
           const target = this.focusedAtSubmit;
           this.focusedAtSubmit = null;
+          const handOff = this.headingHandOff;
+          this.headingHandOff = null;
           // `complete` follows a response (`run` turns an error into a
           // completion) but never an unsubscribe, so a search that a newer
-          // one cancels never moves focus.
-          return this.run(params).pipe(tap({ complete: () => this.restoreFocusAfterSearch(target) }));
+          // one cancels never moves focus. That search, and one that ends
+          // with the page, still ends its hand-off.
+          return this.run(params).pipe(
+            tap({ complete: () => this.restoreFocusAfterSearch(target, handOff) }),
+            finalize(() => handOff?.end()),
+          );
         }),
         takeUntilDestroyed(),
       )
       .subscribe();
+
+    // A hand-off that no search has taken yet ends with the page.
+    inject(DestroyRef).onDestroy(() => this.headingHandOff?.end());
   }
 
   /**
@@ -159,11 +227,23 @@ export class SearchPageComponent {
    * submit, normally the Search button that the pending state disables, is
    * recorded for the search this submit starts, so focus can return to it
    * once that search completes with a response; a search cancelled by a
-   * newer one never moves focus.
+   * newer one never moves focus. A disabled button loses focus, so when the
+   * Search button holds it, it is handed at once, before the pending state
+   * renders, to the page heading, which stays rendered and focusable while
+   * the search runs, as {@link SearchPageComponent.handFocusToHeading} sets
+   * out; Enter in a field leaves focus in that field.
    */
   protected submit(): void {
     const focused = this.document.activeElement;
     this.focusedAtSubmit = focused instanceof HTMLElement && focused !== this.document.body ? focused : null;
+    // An earlier submit's hand-off that no search has taken ends here, as
+    // that submit's record of the focused element does.
+    this.headingHandOff?.end();
+    this.headingHandOff = null;
+    const heading = this.heading?.nativeElement;
+    if (focused !== null && focused === this.searchButton?.nativeElement && heading !== undefined) {
+      this.headingHandOff = this.handFocusToHeading(heading);
+    }
 
     const { city, checkIn, checkOut, guests } = this.form.getRawValue();
     const current = this.route.snapshot.queryParamMap;
@@ -263,19 +343,29 @@ export class SearchPageComponent {
   /**
    * Returns focus to the element recorded at submit once the search that
    * submit started has completed with a response, after the render that
-   * re-enables the Search button and shows the outcome. Disabling the focused
-   * button while the search is pending can drop focus to the document body,
-   * so focus moves only when it is still on the body, on nothing, or on that
+   * re-enables the Search button and shows the outcome. A submit from the
+   * focused Search button handed focus to the page heading while the search
+   * was pending, and a disabled button that still held focus would drop it
+   * to the document body, so focus moves only when it has stayed on that
+   * heading since such a submit, or is on the body, on nothing, or on that
    * element, and only to an element that is still in the document and
-   * enabled; anything else the guest focused meanwhile keeps focus. A
-   * cancelled search never calls this, and a search that no submit started,
-   * such as one run by back/forward navigation or a deep link, passes `null`
-   * and never moves focus.
+   * enabled; anything else the guest focused meanwhile keeps focus, and so
+   * does the heading once focus has left it and the guest has brought it
+   * back. The hand-off ends here either way. A cancelled search never calls
+   * this, and a search that no submit started, such as one run by
+   * back/forward navigation or a deep link, passes `null` and never moves
+   * focus.
    *
    * @param target - The element recorded at the submit that started the
    *   search, or `null` when no submit started it or nothing was focused.
+   * @param handOff - That submit's hand-off of focus to the page heading, or
+   *   `null` when it handed none over.
    */
-  private restoreFocusAfterSearch(target: HTMLElement | null): void {
+  private restoreFocusAfterSearch(target: HTMLElement | null, handOff: HeadingHandOff | null): void {
+    // Read as the search completes, before the render below, which no guest
+    // action can precede.
+    const holder = handOff !== null && handOff.holds() ? handOff.heading : null;
+    handOff?.end();
     if (target === null) {
       return;
     }
@@ -283,12 +373,41 @@ export class SearchPageComponent {
     afterNextRender(
       () => {
         const active = this.document.activeElement;
-        const dropped = active === null || active === this.document.body || active === target;
+        const dropped = active === null || active === this.document.body || active === target || active === holder;
         if (dropped && target.isConnected && !target.matches(':disabled')) {
           target.focus();
         }
       },
       { injector: this.injector },
     );
+  }
+
+  /**
+   * Hands focus to `heading` from the focused Search button, before the
+   * pending state disables that button, and starts watching whether it stays
+   * there. The focus itself scrolls nothing; the heading is then scrolled
+   * only as far as it takes to show it, its focus ring included, which is not
+   * at all when it shows already, so a form scrolled past its heading still
+   * shows where focus is. The first `focusout` from the heading, for another
+   * element or out of the document, ends the hand-off, after which focus
+   * back on it is the guest's own; so does the hand-off's `end`, and either
+   * removes the listener.
+   *
+   * @param heading - The page heading, which takes focus.
+   * @returns The hand-off, or `null` when the heading did not take focus.
+   */
+  private handFocusToHeading(heading: HTMLElement): HeadingHandOff | null {
+    heading.focus({ preventScroll: true });
+    if (this.document.activeElement !== heading) {
+      return null;
+    }
+    heading.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    let holds = true;
+    const end = (): void => {
+      holds = false;
+      heading.removeEventListener('focusout', end);
+    };
+    heading.addEventListener('focusout', end);
+    return { heading, holds: () => holds, end };
   }
 }
